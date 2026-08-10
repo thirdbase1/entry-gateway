@@ -136,4 +136,7 @@ async function discover() {
 }
 await discover();
 setInterval(discover, Number(process.env.DISCOVERY_REFRESH_MS || 21600000)).unref();
-app.listen(PORT, () => console.log(`Entry Gateway listening on :${PORT}; models=${[...new Set(routes().map(r => r.id))].join(",") || "none"}`));
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => console.log(`Entry Gateway listening on :${PORT}; models=${[...new Set(routes().map(r => r.id))].join(",") || "none"}`));
+}
+export default app;
