@@ -1,0 +1,16 @@
+{
+  "name": "entry-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted OpenAI-compatible AI gateway. Single API key, upstream provider + model routing config lives here (env vars), so consuming apps (Entry) never need code changes to add/remove models.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
