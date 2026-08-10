@@ -1,242 +1,139 @@
-// Entry Gateway -- self-hosted, OpenAI-compatible AI gateway.
-//
-// Purpose (owner ask, 2026-08-10): give Entry a single API key + base URL
-// that exposes "all models", so adding/removing/re-pointing models is a
-// config change here (env vars, managed from the Pxxl dashboard) and NEVER
-// requires touching or redeploying the Entry codebase.
-//
-// Endpoints:
-//   GET  /health                 - liveness check
-//   GET  /v1/models              - list of routed models with pricing/context metadata
-//   POST /v1/chat/completions    - OpenAI-compatible completions, proxied to
-//                                  whichever upstream the requested model is routed to
-//
-// Auth: Authorization: Bearer <key> must match one of GATEWAY_API_KEYS
-// (comma-separated env var, managed via the Pxxl dashboard -- never via
-// CLI/API, per owner's standing secret-management preference).
-//
-// Model routing: a default map of Entry's current 4 Opencode Zen models is
-// built in from OPENCODEZEN_BASE_URL / OPENCODEZEN_API_KEY. To add a model
-// (even from a brand-new upstream provider) WITHOUT redeploying this
-// service, set MODEL_ROUTES_JSON in the Pxxl dashboard, e.g.:
-//
-//   [
-//     {
-//       "id": "some-new-model",
-//       "name": "Some New Model",
-//       "upstreamBaseURL": "https://example-provider.com/v1",
-//       "upstreamApiKeyEnv": "SOME_PROVIDER_API_KEY",
-//       "cost": { "input": 1.0, "output": 2.0, "cache_read": 0.1 },
-//       "context_window": 128000
-//     }
-//   ]
-//
-// (the referenced upstreamApiKeyEnv, e.g. SOME_PROVIDER_API_KEY, must also
-// be set as its own env var -- that's the provider's real secret key).
 import express from "express";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
+const PORT = Number(process.env.PORT || 8787);
+let discovered = [];
 
-const PORT = process.env.PORT || 8787;
-
-function getGatewayApiKeys() {
-  const raw = process.env.GATEWAY_API_KEYS || "";
-  return new Set(
-    raw
-      .split(",")
-      .map((k) => k.trim())
-      .filter(Boolean),
-  );
-}
-
-function defaultModelRoutes() {
-  const baseURL = process.env.OPENCODEZEN_BASE_URL;
-  const apiKeyEnv = "OPENCODEZEN_API_KEY";
-
-  const opencodeZenModels = [
-    {
-      id: "kimi-k3",
-      name: "Kimi K3",
-      description: "Moonshot Kimi K3 -- premium reasoning and coding model.",
-      cost: { input: 3.0, output: 15.0, cache_read: 0.3 },
-      context_window: 256000,
-    },
-    {
-      id: "grok-4.5",
-      name: "Grok 4.5",
-      description: "xAI Grok 4.5 -- strong general-purpose reasoning model.",
-      cost: { input: 2.0, output: 6.0, cache_read: 0.3 },
-      context_window: 256000,
-    },
-    {
-      id: "ling-3.0-flash-free",
-      name: "Ling 3.0 Flash (Free)",
-      description:
-        "Free-tier fast model -- default for chat, and the soft-cutoff downgrade target once monthly credit is exhausted.",
-      cost: { input: 0, output: 0, cache_read: 0 },
-      context_window: 128000,
-    },
-    {
-      id: "mimo-v2.5-free",
-      name: "MiMo v2.5 (Free)",
-      description: "Xiaomi MiMo v2.5 -- free-tier model.",
-      cost: { input: 0, output: 0, cache_read: 0 },
-      context_window: 128000,
-    },
-  ];
-
-  if (!baseURL) return [];
-
-  return opencodeZenModels.map((m) => ({
-    ...m,
-    upstreamBaseURL: baseURL,
-    upstreamApiKeyEnv: apiKeyEnv,
-  }));
-}
-
-function getModelRoutes() {
-  const routes = new Map();
-  for (const route of defaultModelRoutes()) {
-    routes.set(route.id, route);
-  }
-
-  const overridesRaw = process.env.MODEL_ROUTES_JSON;
-  if (overridesRaw) {
-    try {
-      const overrides = JSON.parse(overridesRaw);
-      if (Array.isArray(overrides)) {
-        for (const route of overrides) {
-          if (route && typeof route.id === "string") {
-            routes.set(route.id, route);
-          }
-        }
-      }
-    } catch (err) {
-      console.error(
-        "MODEL_ROUTES_JSON is set but failed to parse as JSON -- ignoring overrides:",
-        err.message,
-      );
-    }
-  }
-
-  return routes;
-}
-
-function requireAuth(req, res, next) {
-  const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-  const validKeys = getGatewayApiKeys();
-
-  if (validKeys.size === 0) {
-    console.error(
-      "GATEWAY_API_KEYS is not set -- refusing all requests until configured in the Pxxl dashboard.",
-    );
-    return res.status(500).json({
-      error: { message: "Gateway is not configured (no API keys set)." },
-    });
-  }
-
-  if (!token || !validKeys.has(token)) {
-    return res.status(401).json({
-      error: { type: "AuthError", message: "Invalid or missing API key." },
-    });
-  }
-
+const parseJson = (name, fallback) => {
+  try { return process.env[name] ? JSON.parse(process.env[name]) : fallback; }
+  catch (e) { console.error(`${name}: invalid JSON: ${e.message}`); return fallback; }
+};
+const keys = () => new Set((process.env.GATEWAY_API_KEYS || "").split(",").map(x => x.trim()).filter(Boolean));
+const configured = () => (Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : [])
+  .filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r }));
+const routes = () => {
+  const m = new Map();
+  for (const r of [...configured(), ...discovered]) m.set(`${r.id}|${r.protocol}|${r.upstreamBaseURL}|${r.upstreamModel || r.id}`, r);
+  return [...m.values()];
+};
+const auth = (req, res, next) => {
+  const supplied = (req.headers.authorization || "").startsWith("Bearer ") ? req.headers.authorization.slice(7).trim() : "";
+  const valid = keys();
+  if (!valid.size) return res.status(500).json({ error: { type: "ConfigError", message: "GATEWAY_API_KEYS is not configured." } });
+  if (!valid.has(supplied)) return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
   next();
-}
+};
+const protocol = path => path === "/v1/messages" ? "anthropic-messages" : path.includes("generateContent") ? "gemini-generate" : "openai-chat";
+const modelFor = (req, p) => {
+  if (p !== "gemini-generate") return req.body?.model;
+  // Gemini's real path segment is "<model>:<action>" (e.g. "gemini-pro:generateContent"),
+  // joined by a colon with no "/" separator, so it can't be split into two
+  // Express route params -- captured whole as :modelAction and parsed here instead.
+  const raw = req.params.modelAction || "";
+  const idx = raw.lastIndexOf(":");
+  return idx === -1 ? raw || req.body?.model : raw.slice(0, idx);
+};
+const candidates = (model, p) => routes().filter(r => r.id === model && r.protocol === p && r.enabled !== false).sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
+const upstreamUrl = (r, p, model) => {
+  const base = r.upstreamBaseURL.replace(/\/$/, "");
+  const path = r.upstreamPath || (p === "openai-chat" ? "/chat/completions" : p === "anthropic-messages" ? "/messages" : `/models/${encodeURIComponent(r.upstreamModel || model)}:generateContent`);
+  return `${base}${path.replace("{model}", encodeURIComponent(r.upstreamModel || model))}`;
+};
+const headers = (r, p) => {
+  const key = process.env[r.upstreamApiKeyEnv];
+  const h = { "Content-Type": "application/json", ...(r.headers || {}) };
+  if (r.authStyle === "x-api-key" || p === "anthropic-messages") h["x-api-key"] = key;
+  else h.Authorization = `Bearer ${key}`;
+  if (p === "anthropic-messages" && r.anthropicVersion) h["anthropic-version"] = r.anthropicVersion;
+  return h;
+};
+const usageOf = x => {
+  const u = x?.usage || x?.response?.usage || x?.usageMetadata;
+  if (!u) return null;
+  const promptDetails = u.prompt_tokens_details || u.input_tokens_details || {};
+  const completionDetails = u.completion_tokens_details || u.output_tokens_details || {};
+  const cacheRead = u.cache_read_input_tokens ?? u.cache_read_tokens ?? u.cached_tokens ?? promptDetails.cached_tokens ?? u.cachedContentTokenCount ?? 0;
+  const cacheWrite = u.cache_creation_input_tokens ?? u.cache_write_input_tokens ?? u.cache_write_tokens ?? promptDetails.cache_write_tokens ?? 0;
+  return {
+    input: u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0,
+    output: u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? 0,
+    cache_read: cacheRead,
+    cache_write: cacheWrite,
+    reasoning: u.reasoning_tokens ?? completionDetails.reasoning_tokens ?? u.thoughtsTokenCount ?? 0
+  };
+};
+const costOf = (r, u) => {
+  if (!u || !r.cost) return null;
+  const cacheRead = Math.min(u.cache_read || 0, u.input || 0);
+  const cacheWrite = Math.min(u.cache_write || 0, Math.max(0, (u.input || 0) - cacheRead));
+  const uncachedInput = Math.max(0, (u.input || 0) - cacheRead - cacheWrite);
+  const cacheReadRate = r.cost.cache_read ?? r.cost.input ?? 0;
+  const cacheWriteRate = r.cost.cache_write ?? r.cost.input ?? 0;
+  return ((uncachedInput / 1e6) * (r.cost.input || 0) + (cacheRead / 1e6) * cacheReadRate + (cacheWrite / 1e6) * cacheWriteRate + ((u.output || 0) / 1e6) * (r.cost.output || 0)) * (r.billingMultiplier ?? 1);
+};
+const log = x => process.env.REQUEST_LOG !== "false" && console.log(JSON.stringify({ type: "request", at: new Date().toISOString(), ...x }));
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, routedModels: [...getModelRoutes().keys()] });
-});
-
-app.get("/v1/models", requireAuth, (_req, res) => {
-  const routes = getModelRoutes();
-  const data = [...routes.values()].map((route) => ({
-    id: route.id,
-    name: route.name ?? route.id,
-    description: route.description ?? undefined,
-    modelType: "language",
-    context_window: route.context_window,
-    cost: route.cost,
-  }));
-  res.json({ data, object: "list" });
-});
-
-app.post("/v1/chat/completions", requireAuth, async (req, res) => {
-  const requestedModel = req.body?.model;
-  const routes = getModelRoutes();
-  const route = typeof requestedModel === "string" ? routes.get(requestedModel) : undefined;
-
-  if (!route) {
-    return res.status(404).json({
-      error: {
-        type: "ModelError",
-        message: `Model ${requestedModel} is not routed by this gateway.`,
-      },
-    });
-  }
-
-  const upstreamApiKey = process.env[route.upstreamApiKeyEnv];
-  if (!upstreamApiKey) {
-    console.error(
-      `Model ${route.id} is routed but its upstream key env var ${route.upstreamApiKeyEnv} is not set.`,
-    );
-    return res.status(500).json({
-      error: {
-        type: "ConfigError",
-        message: `Upstream API key for model ${route.id} is not configured.`,
-      },
-    });
-  }
-
-  try {
-    const upstreamResponse = await fetch(
-      `${route.upstreamBaseURL.replace(/\/$/, "")}/chat/completions`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${upstreamApiKey}`,
-        },
-        body: JSON.stringify(req.body),
-      },
-    );
-
-    res.status(upstreamResponse.status);
-    for (const [key, value] of upstreamResponse.headers.entries()) {
-      if (
-        key.toLowerCase() === "content-encoding" ||
-        key.toLowerCase() === "content-length" ||
-        key.toLowerCase() === "connection"
-      ) {
-        continue;
-      }
-      res.setHeader(key, value);
-    }
-
-    if (!upstreamResponse.body) {
-      const text = await upstreamResponse.text();
-      return res.send(text);
-    }
-
-    for await (const chunk of upstreamResponse.body) {
-      res.write(chunk);
+async function proxy(req, res, r, p, model, id) {
+  const key = process.env[r.upstreamApiKeyEnv];
+  if (!key) throw new Error(`Missing secret ${r.upstreamApiKeyEnv}`);
+  const started = Date.now();
+  const response = await fetch(upstreamUrl(r, p, model), { method: "POST", headers: headers(r, p), body: JSON.stringify(req.body), signal: AbortSignal.timeout(Number(r.timeoutMs || 120000)) });
+  if (response.status >= 500 || response.status === 429) { const text = await response.text(); const e = new Error(`Upstream ${response.status}: ${text.slice(0, 500)}`); e.retryable = true; throw e; }
+  res.status(response.status).set("x-gateway-request-id", id);
+  for (const [k, v] of response.headers) if (!["content-encoding", "content-length", "connection", "transfer-encoding"].includes(k.toLowerCase())) res.setHeader(k, v);
+  let usage = null;
+  const contentType = response.headers.get("content-type") || "";
+  if (!response.body || !contentType.includes("text/event-stream")) {
+    const text = await response.text();
+    try { usage = usageOf(JSON.parse(text)); } catch {}
+    res.send(text);
+  } else {
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = new TextDecoder().decode(value);
+      for (const line of text.split("\n")) if (line.startsWith("data:") && line.slice(5).trim() !== "[DONE]") try { usage = usageOf(JSON.parse(line.slice(5).trim())) || usage; } catch {}
+      res.write(value);
     }
     res.end();
-  } catch (err) {
-    console.error("Upstream request failed:", err);
-    if (!res.headersSent) {
-      res.status(502).json({
-        error: { type: "UpstreamError", message: "Failed to reach upstream provider." },
-      });
-    } else {
-      res.end();
-    }
   }
-});
+  log({ requestId: id, model, protocol: p, provider: r.provider || r.upstreamApiKeyEnv, status: response.status, latencyMs: Date.now() - started, usage, estimatedCost: costOf(r, usage) });
+}
+async function handle(req, res) {
+  const p = protocol(req.path), model = modelFor(req, p), id = `gw_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  if (!model) return res.status(400).json({ error: { type: "ModelError", message: "A model is required." } });
+  const available = candidates(model, p);
+  if (!available.length) return res.status(404).json({ error: { type: "ModelError", message: `No ${p} route is configured for ${model}.` } });
+  const failures = [];
+  for (const r of available) try { await proxy(req, res, r, p, model, id); return; } catch (e) { failures.push(`${r.provider || r.upstreamBaseURL}: ${e.message}`); console.error(JSON.stringify({ type: "upstream_failure", requestId: id, model, protocol: p, error: e.message })); }
+  if (!res.headersSent) res.status(502).json({ error: { type: "UpstreamError", message: "All compatible upstream routes failed.", requestId: id, failures } });
+}
 
-app.listen(PORT, () => {
-  console.log(`Entry Gateway listening on :${PORT}`);
-  console.log(`Routed models: ${[...getModelRoutes().keys()].join(", ") || "(none -- check OPENCODEZEN_BASE_URL)"}`);
+app.get("/health", (_req, res) => res.json({ ok: true, routes: routes().length, routedModels: [...new Set(routes().map(r => r.id))] }));
+app.get("/v1/models", auth, (_req, res) => {
+  const m = new Map();
+  for (const r of routes()) { const x = m.get(r.id) || { id: r.id, object: "model", name: r.name || r.id, owned_by: "gateway", protocols: [], context_window: r.context_window, cost: r.cost }; if (!x.protocols.includes(r.protocol)) x.protocols.push(r.protocol); m.set(r.id, x); }
+  res.json({ object: "list", data: [...m.values()] });
 });
+app.post("/v1/chat/completions", auth, handle);
+app.post("/v1/messages", auth, handle);
+app.post("/v1beta/models/:modelAction", auth, handle);
+
+async function discover() {
+  const sources = parseJson("MODEL_DISCOVERY_JSON", []);
+  if (!Array.isArray(sources)) return;
+  const fresh = [];
+  for (const s of sources) try {
+    const key = process.env[s.apiKeyEnv]; if (!key) continue;
+    const response = await fetch(s.url, { headers: { Authorization: `Bearer ${key}`, "x-api-key": key }, signal: AbortSignal.timeout(15000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json(), list = Array.isArray(body) ? body : body.data || body.models || [];
+    for (const item of list) { const upstreamModel = typeof item === "string" ? item : item.id || item.name; if (!upstreamModel) continue; for (const p of s.protocols || ["openai-chat"]) fresh.push({ id: s.aliases?.[upstreamModel] || upstreamModel, upstreamModel, protocol: p, provider: s.provider, upstreamBaseURL: s.baseURL, upstreamApiKeyEnv: s.apiKeyEnv, priority: s.priority ?? 100, cost: s.cost, context_window: item.context_window || s.context_window }); }
+  } catch (e) { console.error(`Discovery failed for ${s.provider || s.url}: ${e.message}`); }
+  discovered = fresh; console.log(`Discovered ${fresh.length} model/protocol routes`);
+}
+await discover();
+setInterval(discover, Number(process.env.DISCOVERY_REFRESH_MS || 21600000)).unref();
+app.listen(PORT, () => console.log(`Entry Gateway listening on :${PORT}; models=${[...new Set(routes().map(r => r.id))].join(",") || "none"}`));
