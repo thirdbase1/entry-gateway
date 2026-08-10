@@ -25,7 +25,15 @@ const auth = (req, res, next) => {
   next();
 };
 const protocol = path => path === "/v1/messages" ? "anthropic-messages" : path.includes("generateContent") ? "gemini-generate" : "openai-chat";
-const modelFor = (req, p) => p === "gemini-generate" ? (req.params.model || req.body?.model) : req.body?.model;
+const modelFor = (req, p) => {
+  if (p !== "gemini-generate") return req.body?.model;
+  // Gemini's real path segment is "<model>:<action>" (e.g. "gemini-pro:generateContent"),
+  // joined by a colon with no "/" separator, so it can't be split into two
+  // Express route params -- captured whole as :modelAction and parsed here instead.
+  const raw = req.params.modelAction || "";
+  const idx = raw.lastIndexOf(":");
+  return idx === -1 ? raw || req.body?.model : raw.slice(0, idx);
+};
 const candidates = (model, p) => routes().filter(r => r.id === model && r.protocol === p && r.enabled !== false).sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
 const upstreamUrl = (r, p, model) => {
   const base = r.upstreamBaseURL.replace(/\/$/, "");
@@ -111,7 +119,7 @@ app.get("/v1/models", auth, (_req, res) => {
 });
 app.post("/v1/chat/completions", auth, handle);
 app.post("/v1/messages", auth, handle);
-app.post("/v1beta/models/:model:generateContent", auth, handle);
+app.post("/v1beta/models/:modelAction", auth, handle);
 
 async function discover() {
   const sources = parseJson("MODEL_DISCOVERY_JSON", []);
