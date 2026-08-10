@@ -545,3 +545,33 @@ The upstream process refuses authenticated model operations if `GATEWAY_API_KEYS
 ### Recommended next action
 
 Port the enhanced native-protocol router, timeout/fallback behavior, token/caching logger, billing multiplier, and structured request logging from `entry-gateway-custom-20260810-2009/server.js` into the fresh clone deliberately, preserving the fresh upstream baseline for comparison. Do not overwrite the backup.
+
+## Commit and pull request — 2026-08-10
+
+The enhanced gateway release was committed and pushed using the authenticated GitHub account `thirdbase1`.
+
+```text
+Branch: feat/native-protocol-gateway
+Commit: 59d2e2e53393d34dd2969b1fa01efdbce9d7b598
+Commit message: feat: add native protocol routing and token cost logging
+Base branch: main
+Pull request: https://github.com/thirdbase1/entry-gateway/pull/1
+PR state: open
+```
+
+The pull request includes the native protocol router, central-key auth, provider-specific secret references, model discovery, fallback, streaming passthrough, token/cache/reasoning logging, billing multipliers, Docker deployment files, test harnesses, and this complete research record.
+
+Validation run before commit:
+
+```text
+npm ci --ignore-scripts: passed
+npm audit --omit=dev --audit-level=high: passed; 0 vulnerabilities
+node --check server.js: passed
+bash -n soak-test.sh: passed
+bash -n vu100-test.sh: passed
+health smoke test: passed
+model-list smoke test: passed
+invalid central-key rejection: passed
+```
+
+Operational note: the first credential-aware push method was rejected by the fresh clone's Git credential handling before contacting GitHub. The push then succeeded using the securely stored GitHub token through an in-memory authenticated push URL. The token was not printed, committed, or written into project files.
