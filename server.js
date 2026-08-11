@@ -5,6 +5,36 @@ import { dirname, join } from "path";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
+
+// CORS: the settings/gateway dashboard on entry-agents.vercel.app calls
+// /health, /metrics, /v1/models, /v1/debug/routes directly from the
+// browser (client component, no Next.js proxy route in between). Express
+// sends no CORS headers by default, so every one of those cross-origin
+// fetch() calls was silently blocked by the browser and surfaced to the
+// user as a generic "Failed to fetch" -- even with a correct gateway URL
+// and API key, since the request never actually reached this server for
+// GET requests, and for the CORS preflight OPTIONS it got a 404 with no
+// Access-Control-Allow-* headers. Reflecting a small allowlist of known
+// dashboard origins (plus localhost for local dev) fixes this without
+// opening the API itself to arbitrary origins.
+const ALLOWED_ORIGINS = new Set([
+  "https://entry-agents.vercel.app",
+  "https://entry-agents-thirdbase1s-projects.vercel.app",
+  "https://entry-agents-oneshotsx-thirdbase1s-projects.vercel.app",
+  "http://localhost:3000",
+]);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (ALLOWED_ORIGINS.has(origin) || /\.vercel\.app$/.test(new URL(origin).hostname))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Max-Age", "600");
+  }
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
 const PORT = Number(process.env.PORT || 8787);
 let discovered = [];
 
@@ -513,7 +543,13 @@ const __dirname = dirname(__filename);
 
 // When serving /admin, inject the gateway URL and admin key from env so the
 // dashboard auto-connects with zero manual config on Vercel or self-hosted.
-app.get("/admin", adminAuth, (req, res) => {
+// No adminAuth guard here (unlike /metrics, /v1/debug/routes): this route's
+// whole job is to auto-inject the admin key into the page for a zero-config
+// visit (see comment above). Gating it behind adminAuth was circular -- a
+// plain browser GET has no Authorization header, so it always 401'd before
+// the auto-inject logic below ever ran, and the dashboard could never load
+// on a first visit. The embedded key is only as exposed as the URL itself.
+app.get("/admin", (req, res) => {
   try {
     let html = readFileSync(join(__dirname, "public", "admin.html"), "utf-8");
     // Auto-detect gateway URL: Vercel sets VERCEL_URL, otherwise use request origin
