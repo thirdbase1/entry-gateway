@@ -4,6 +4,14 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
 const app = express();
+// Vercel (and most PaaS) terminate TLS upstream and forward to this
+// process over plain HTTP, setting X-Forwarded-Proto: https. Without
+// trusting the proxy, Express's req.protocol always reports "http" even
+// on a real https:// request -- which made the /admin auto-inject below
+// emit an http:// gateway-url, and a browser on the https admin page
+// mixed-content-blocks any fetch() to a plain http:// URL (shows up as
+// yet another opaque "Failed to fetch").
+app.set("trust proxy", true);
 app.use(express.json({ limit: "25mb" }));
 
 // CORS: the settings/gateway dashboard on entry-agents.vercel.app calls
