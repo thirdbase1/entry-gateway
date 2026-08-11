@@ -1,0 +1,916 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Entry Gateway — Admin Dashboard</title>
+  <style>
+    :root {
+      --background: oklch(0.141 0.005 285.823);
+      --foreground: oklch(0.985 0 0);
+      --card: oklch(0.21 0.006 285.885);
+      --muted: oklch(0.274 0.006 286.033);
+      --muted-foreground: oklch(0.705 0.015 286.067);
+      --border: oklch(1 0 0 / 10%);
+      --accent: #ff8a3d;
+      --accent-dim: rgba(255, 138, 61, 0.08);
+      --radius: 0.625rem;
+      --emerald: oklch(0.696 0.17 162.48);
+      --amber: oklch(0.769 0.188 70.08);
+      --red: oklch(0.704 0.191 22.216);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: var(--background);
+      color: var(--foreground);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      padding: 24px;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px;
+    }
+    .header h1 {
+      font-size: 24px;
+      font-weight: 600;
+      letter-spacing: -0.025em;
+    }
+    .header .subtitle {
+      font-size: 14px;
+      color: var(--muted-foreground);
+      margin-top: 4px;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--card);
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    .status-dot.connected { background: var(--emerald); }
+    .status-dot.disconnected { background: var(--muted-foreground); }
+    .status-dot.error { background: var(--red); }
+
+    /* Connection bar */
+    .conn-bar {
+      display: flex;
+      gap: 12px;
+      align-items: flex-end;
+      padding: 20px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--card);
+      margin-bottom: 24px;
+    }
+    .conn-bar .field { flex: 1; }
+    .conn-bar label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--muted-foreground);
+      margin-bottom: 6px;
+    }
+    .conn-bar input {
+      width: 100%;
+      padding: 8px 12px;
+      border-radius: calc(var(--radius) - 2px);
+      border: 1px solid var(--border);
+      background: var(--background);
+      color: var(--foreground);
+      font-family: "SF Mono", "Fira Code", monospace;
+      font-size: 13px;
+      outline: none;
+    }
+    .conn-bar input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(255, 138, 61, 0.15);
+    }
+    .btn {
+      padding: 8px 16px;
+      border-radius: calc(var(--radius) - 2px);
+      border: none;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: opacity 0.15s;
+      white-space: nowrap;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary {
+      background: var(--accent);
+      color: #000;
+    }
+    .btn-outline {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--foreground);
+    }
+
+    /* Empty state */
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 80px 20px;
+      text-align: center;
+      border: 1px dashed var(--border);
+      border-radius: var(--radius);
+    }
+    .empty-state .icon {
+      width: 48px;
+      height: 48px;
+      opacity: 0.3;
+      margin-bottom: 16px;
+    }
+    .empty-state p {
+      font-size: 16px;
+      font-weight: 500;
+      color: var(--muted-foreground);
+    }
+    .empty-state .hint {
+      font-size: 13px;
+      color: var(--muted-foreground);
+      opacity: 0.6;
+      margin-top: 4px;
+    }
+
+    /* Stat grid */
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    @media (max-width: 900px) { .stat-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 500px) { .stat-grid { grid-template-columns: 1fr; } }
+
+    .stat-card {
+      padding: 20px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--card);
+    }
+    .stat-card .label {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--muted-foreground);
+    }
+    .stat-card .value {
+      font-size: 28px;
+      font-weight: 600;
+      letter-spacing: -0.025em;
+      margin-top: 8px;
+      color: var(--foreground);
+    }
+    .stat-card .value.accent { color: var(--accent); }
+    .stat-card .sublabel {
+      font-size: 12px;
+      color: var(--muted-foreground);
+      margin-top: 2px;
+    }
+    .stat-card .icon-wrap {
+      float: right;
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .stat-card .icon-wrap.accent {
+      border-color: rgba(255, 138, 61, 0.2);
+      background: var(--accent-dim);
+    }
+
+    /* Section card */
+    .section-card {
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--card);
+      margin-bottom: 24px;
+    }
+    .section-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section-header h2 {
+      font-size: 15px;
+      font-weight: 600;
+    }
+    .section-header h2 .sec-icon { color: var(--accent); margin-right: 4px; }
+    .section-header .badge {
+      margin-left: auto;
+      padding: 2px 8px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--muted-foreground);
+    }
+    .section-body { padding: 20px; }
+
+    /* Two column layout */
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+    @media (max-width: 800px) { .two-col { grid-template-columns: 1fr; } }
+
+    /* Latency bars */
+    .latency-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .latency-row .pct-label {
+      width: 36px;
+      flex-shrink: 0;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--muted-foreground);
+    }
+    .latency-row .bar-track {
+      flex: 1;
+      height: 8px;
+      border-radius: 4px;
+      background: var(--muted);
+      overflow: hidden;
+    }
+    .latency-row .bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: var(--accent);
+      transition: width 0.4s ease;
+    }
+    .latency-row .val {
+      width: 64px;
+      flex-shrink: 0;
+      text-align: right;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .latency-footer {
+      display: flex;
+      gap: 16px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--muted-foreground);
+    }
+
+    /* Status breakdown */
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .status-row .method {
+      width: 48px;
+      flex-shrink: 0;
+      font-family: monospace;
+      font-size: 12px;
+      color: var(--muted-foreground);
+    }
+    .status-row .code {
+      width: 36px;
+      flex-shrink: 0;
+      font-family: monospace;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .status-row .bar-track {
+      flex: 1;
+      height: 6px;
+      border-radius: 3px;
+      background: var(--muted);
+      overflow: hidden;
+    }
+    .status-row .bar-fill {
+      height: 100%;
+      border-radius: 3px;
+    }
+    .status-row .count {
+      width: 40px;
+      flex-shrink: 0;
+      text-align: right;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    /* Circuit breakers */
+    .cb-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    .cb-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      border-radius: calc(var(--radius) - 2px);
+      border: 1px solid var(--border);
+      background: var(--muted);
+    }
+    .cb-item .name {
+      font-family: monospace;
+      font-size: 12px;
+      color: var(--muted-foreground);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cb-item .state {
+      font-family: monospace;
+      font-size: 12px;
+      font-weight: 500;
+      flex-shrink: 0;
+      margin-left: 8px;
+    }
+    .state-closed { color: var(--emerald); }
+    .state-half_open { color: var(--amber); }
+    .state-open { color: var(--red); }
+
+    /* Provider table */
+    .provider-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .provider-table th {
+      text-align: left;
+      padding: 8px 12px;
+      font-weight: 500;
+      font-size: 12px;
+      color: var(--muted-foreground);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .provider-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .provider-table tr:last-child td { border-bottom: none; }
+    .provider-table .mono { font-family: monospace; font-size: 12px; }
+    .provider-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .provider-table .provider-name { font-weight: 500; }
+    .provider-table .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      border: 1px solid rgba(255, 138, 61, 0.2);
+      background: var(--accent-dim);
+      color: var(--accent);
+      font-family: monospace;
+      font-size: 11px;
+    }
+    .provider-table .health-dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      margin-right: 6px;
+    }
+
+    /* Models grid */
+    .model-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 8px;
+    }
+    .model-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border-radius: calc(var(--radius) - 2px);
+      border: 1px solid var(--border);
+      background: var(--muted);
+    }
+    .model-card .model-id {
+      font-family: monospace;
+      font-size: 13px;
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .model-card .model-meta {
+      font-size: 11px;
+      color: var(--muted-foreground);
+      margin-top: 2px;
+    }
+    .model-card .model-owner {
+      flex-shrink: 0;
+      margin-left: 8px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      font-family: monospace;
+      font-size: 11px;
+      color: var(--muted-foreground);
+    }
+
+    /* Routes table */
+    .routes-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .routes-table th {
+      text-align: left;
+      padding: 8px 12px;
+      font-weight: 500;
+      font-size: 12px;
+      color: var(--muted-foreground);
+      border-bottom: 1px solid var(--border);
+    }
+    .routes-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .routes-table tr:last-child td { border-bottom: none; }
+    .routes-table .mono { font-family: monospace; }
+    .routes-table .enabled-dot {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+    }
+    .routes-table .enabled-dot::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+    .routes-table .enabled-yes::before { background: var(--emerald); }
+    .routes-table .enabled-no::before { background: var(--muted-foreground); }
+    .routes-table .enabled-no { color: var(--muted-foreground); }
+
+    /* Error banner */
+    .error-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      border-radius: var(--radius);
+      border: 1px solid rgba(255, 0, 0, 0.2);
+      background: rgba(255, 0, 0, 0.05);
+      margin-bottom: 16px;
+      font-size: 13px;
+      color: var(--red);
+    }
+
+    .hidden { display: none !important; }
+
+    /* Refresh indicator */
+    .refresh-info {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--muted-foreground);
+    }
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <div>
+      <h1>Gateway Admin</h1>
+      <div class="subtitle">Real-time monitoring — per-provider and aggregate metrics</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:12px;">
+      <div id="refreshInfo" class="refresh-info hidden">
+        <div class="spinner"></div>
+        <span id="refreshTime">—</span>
+      </div>
+      <div id="statusBadge" class="status-badge">
+        <span class="status-dot disconnected"></span>
+        <span id="statusText">Disconnected</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Connection bar -->
+  <div class="conn-bar">
+    <div class="field">
+      <label>Gateway URL</label>
+      <input type="url" id="gwUrl" placeholder="https://your-gateway.example.com" value="">
+    </div>
+    <div class="field">
+      <label>Admin API Key</label>
+      <input type="password" id="gwKey" placeholder="gw_live_...">
+    </div>
+    <button class="btn btn-primary" id="connectBtn" onclick="connect()">Connect</button>
+    <button class="btn btn-outline hidden" id="refreshBtn" onclick="refresh()">↻</button>
+  </div>
+
+  <div id="errorBanner" class="error-banner hidden"></div>
+
+  <!-- Empty state -->
+  <div id="emptyState" class="empty-state">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <rect x="3" y="4" width="18" height="6" rx="2"/>
+      <rect x="3" y="14" width="18" height="6" rx="2"/>
+      <line x1="7" y1="7" x2="7.01" y2="7"/>
+      <line x1="7" y1="17" x2="7.01" y2="17"/>
+    </svg>
+    <p>Enter your gateway URL to connect</p>
+    <div class="hint">Polls /metrics, /health, /v1/models, /v1/debug/routes every 5 seconds</div>
+  </div>
+
+  <!-- Dashboard -->
+  <div id="dashboard" class="hidden">
+
+    <!-- Stat cards -->
+    <div class="stat-grid" id="statGrid"></div>
+
+    <!-- Two column: latency + status -->
+    <div class="two-col">
+      <div class="section-card">
+        <div class="section-header">
+          <h2><span class="sec-icon">⏱</span> Latency Distribution</h2>
+        </div>
+        <div class="section-body" id="latencySection"></div>
+      </div>
+      <div class="section-card">
+        <div class="section-header">
+          <h2><span class="sec-icon">📡</span> Request Status</h2>
+        </div>
+        <div class="section-body" id="statusSection"></div>
+      </div>
+    </div>
+
+    <!-- Per-provider table -->
+    <div class="section-card">
+      <div class="section-header">
+        <h2><span class="sec-icon">🔌</span> Per-Provider Breakdown</h2>
+        <span class="badge" id="providerCount">0 providers</span>
+      </div>
+      <div class="section-body" style="padding:0;overflow-x:auto;">
+        <table class="provider-table" id="providerTable"></table>
+      </div>
+    </div>
+
+    <!-- Circuit breakers -->
+    <div class="section-card">
+      <div class="section-header">
+        <h2><span class="sec-icon">⚡</span> Circuit Breakers</h2>
+      </div>
+      <div class="section-body" id="circuitSection"></div>
+    </div>
+
+    <!-- Routes -->
+    <div class="section-card">
+      <div class="section-header">
+        <h2><span class="sec-icon">🛤</span> Model Routes</h2>
+        <span class="badge" id="routeCount">0 routes</span>
+      </div>
+      <div class="section-body" style="padding:0;overflow-x:auto;">
+        <table class="routes-table" id="routesTable"></table>
+      </div>
+    </div>
+
+    <!-- Models -->
+    <div class="section-card">
+      <div class="section-header">
+        <h2><span class="sec-icon">✦</span> Available Models</h2>
+        <span class="badge" id="modelCount">0 models</span>
+      </div>
+      <div class="section-body" id="modelsSection"></div>
+    </div>
+
+  </div>
+
+  <script>
+    let baseUrl = '';
+    let apiKey = '';
+    let connected = false;
+    let pollTimer = null;
+
+    // ─── Helpers ─────────────────────────────────────────────────
+    function fmtNum(n) {
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return String(n);
+    }
+    function fmtLat(ms) {
+      if (!ms) return '—';
+      if (ms < 1) return Math.round(ms * 1000) + 'μs';
+      if (ms < 1000) return Math.round(ms) + 'ms';
+      return (ms / 1000).toFixed(2) + 's';
+    }
+    function fmtMoney(n) { return '$' + (n || 0).toFixed(4); }
+    function fmtUptime(s) {
+      if (!s) return '—';
+      const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60), sec = Math.floor(s%60);
+      const parts = [];
+      if (d) parts.push(d+'d');
+      if (h||d) parts.push(h+'h');
+      if (m||h||d) parts.push(m+'m');
+      parts.push(sec+'s');
+      return parts.join(' ');
+    }
+    function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+    function stateClass(state) {
+      if (state === 'closed') return 'state-closed';
+      if (state === 'half_open') return 'state-half_open';
+      if (state === 'open') return 'state-open';
+      return '';
+    }
+
+    // ─── Connection ──────────────────────────────────────────────
+    async function connect() {
+      const urlEl = document.getElementById('gwUrl');
+      const keyEl = document.getElementById('gwKey');
+      baseUrl = urlEl.value.trim().replace(/\/+$/, '');
+      apiKey = keyEl.value.trim();
+      if (!baseUrl) return;
+
+      document.getElementById('connectBtn').textContent = 'Connecting…';
+      document.getElementById('errorBanner').classList.add('hidden');
+
+      try {
+        await fetchAll();
+        connected = true;
+        document.getElementById('emptyState').classList.add('hidden');
+        document.getElementById('dashboard').classList.remove('hidden');
+        document.getElementById('connectBtn').textContent = 'Reconnect';
+        document.getElementById('refreshBtn').classList.remove('hidden');
+        document.getElementById('statusBadge').innerHTML = '<span class="status-dot connected"></span><span>Connected</span>';
+
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(fetchAll, 5000);
+      } catch (e) {
+        connected = false;
+        document.getElementById('errorBanner').textContent = '⚠ ' + e.message;
+        document.getElementById('errorBanner').classList.remove('hidden');
+        document.getElementById('connectBtn').textContent = 'Connect';
+        document.getElementById('statusBadge').innerHTML = '<span class="status-dot error"></span><span>Error</span>';
+      }
+    }
+
+    async function refresh() {
+      try { await fetchAll(); } catch (e) {
+        document.getElementById('errorBanner').textContent = '⚠ ' + e.message;
+        document.getElementById('errorBanner').classList.remove('hidden');
+      }
+    }
+
+    async function fetchAll() {
+      const headers = {};
+      if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+
+      document.getElementById('refreshInfo').classList.remove('hidden');
+
+      const [healthRes, metricsRes, modelsRes, routesRes] = await Promise.allSettled([
+        fetch(baseUrl + '/health', { headers }).then(r => r.ok ? r.json() : Promise.reject(new Error('Health: ' + r.status))),
+        fetch(baseUrl + '/metrics', { headers }).then(r => r.ok ? r.json() : Promise.reject(new Error('Metrics: ' + r.status))),
+        fetch(baseUrl + '/v1/models', { headers }).then(r => r.ok ? r.json() : Promise.reject(new Error('Models: ' + r.status))),
+        fetch(baseUrl + '/v1/debug/routes', { headers }).then(r => r.ok ? r.json() : Promise.reject(new Error('Routes: ' + r.status))),
+      ]);
+
+      const health = healthRes.status === 'fulfilled' ? healthRes.value : null;
+      const metrics = metricsRes.status === 'fulfilled' ? metricsRes.value : null;
+      const models = modelsRes.status === 'fulfilled' ? modelsRes.value : null;
+      const routes = routesRes.status === 'fulfilled' ? routesRes.value : null;
+
+      if (!health) throw new Error(healthRes.reason?.message || 'Failed to connect');
+
+      render(health, metrics, models, routes);
+      document.getElementById('refreshTime').textContent = new Date().toLocaleTimeString();
+      document.getElementById('refreshInfo').classList.add('hidden');
+    }
+
+    // ─── Rendering ──────────────────────────────────────────────
+    function render(health, metrics, models, routes) {
+      const g = metrics?.global || {};
+
+      // Stat cards
+      const stats = [
+        { label: 'Total Requests', value: fmtNum(g.requests || 0), sub: (metrics?.activeRequests || 0) + ' active', icon: '📡', accent: false },
+        { label: 'Avg Latency', value: g.latency ? fmtLat(g.latency.p50) : '—', sub: g.latency ? 'p95: ' + fmtLat(g.latency.p95) : '', icon: '⏱', accent: false },
+        { label: 'Total Tokens', value: fmtNum((g.tokens?.total) || 0), sub: (metrics?.activeStreams || 0) + ' active streams', icon: '📈', accent: false },
+        { label: 'Est. Spend', value: fmtMoney(g.estimatedSpend || 0), sub: (g.upstreamErrors || 0) + ' upstream errors', icon: '$', accent: true },
+      ];
+      document.getElementById('statGrid').innerHTML = stats.map(s => `
+        <div class="stat-card">
+          <div class="icon-wrap ${s.accent ? 'accent' : ''}" style="font-size:16px;">${s.icon}</div>
+          <div class="label">${s.label}</div>
+          <div class="value ${s.accent ? 'accent' : ''}">${s.value}</div>
+          ${s.sub ? `<div class="sublabel">${s.sub}</div>` : ''}
+        </div>
+      `).join('');
+
+      // Latency
+      const lat = g.latency;
+      if (lat && lat.count) {
+        const segs = [
+          { label: 'p50', val: lat.p50, max: Math.max(lat.p50, lat.p95, lat.p99, 1) },
+          { label: 'p95', val: lat.p95, max: Math.max(lat.p50, lat.p95, lat.p99, 1) },
+          { label: 'p99', val: lat.p99, max: Math.max(lat.p50, lat.p95, lat.p99, 1) },
+        ];
+        document.getElementById('latencySection').innerHTML = segs.map(s => `
+          <div class="latency-row">
+            <span class="pct-label">${s.label}</span>
+            <div class="bar-track"><div class="bar-fill" style="width:${(s.val / s.max) * 100}%"></div></div>
+            <span class="val">${fmtLat(s.val)}</span>
+          </div>
+        `).join('') + `
+          <div class="latency-footer">
+            <span>min: ${fmtLat(lat.min)}</span>
+            <span>max: ${fmtLat(lat.max)}</span>
+            <span>count: ${lat.count}</span>
+          </div>
+        `;
+      } else {
+        document.getElementById('latencySection').innerHTML = '<div style="color:var(--muted-foreground);font-size:13px;">No latency data yet</div>';
+      }
+
+      // Status breakdown
+      const sb = g.statusBreakdown || {};
+      const entries = Object.entries(sb).map(([k, v]) => ({ status: parseInt(k), count: v })).sort((a, b) => b.count - a.count);
+      const total = entries.reduce((s, e) => s + e.count, 0);
+      if (entries.length) {
+        document.getElementById('statusSection').innerHTML = entries.map(e => {
+          const pct = (e.count / total) * 100;
+          const cls = e.status >= 200 && e.status < 300 ? 'var(--emerald)' : e.status >= 400 && e.status < 500 ? 'var(--amber)' : 'var(--red)';
+          const textCls = e.status >= 200 && e.status < 300 ? 'var(--emerald)' : e.status >= 400 && e.status < 500 ? 'var(--amber)' : 'var(--red)';
+          return `
+            <div class="status-row">
+              <span class="method">GET</span>
+              <span class="code" style="color:${textCls}">${e.status}</span>
+              <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${cls}"></div></div>
+              <span class="count">${e.count}</span>
+            </div>
+          `;
+        }).join('');
+      } else {
+        document.getElementById('statusSection').innerHTML = '<div style="color:var(--muted-foreground);font-size:13px;">No request data yet</div>';
+      }
+
+      // Per-provider table
+      const byProv = metrics?.byProvider || {};
+      const provNames = Object.keys(byProv);
+      document.getElementById('providerCount').textContent = provNames.length + ' provider' + (provNames.length !== 1 ? 's' : '');
+
+      if (provNames.length) {
+        const cbStates = health.circuitBreakers || {};
+        document.getElementById('providerTable').innerHTML = `
+          <thead><tr>
+            <th>Provider</th>
+            <th class="num">Requests</th>
+            <th class="num">2xx</th>
+            <th class="num">4xx</th>
+            <th class="num">5xx</th>
+            <th class="num">Tokens In</th>
+            <th class="num">Tokens Out</th>
+            <th class="num">Spend</th>
+            <th class="num">p50</th>
+            <th class="num">Errors</th>
+            <th>Health</th>
+          </tr></thead>
+          <tbody>
+            ${provNames.map(name => {
+              const p = byProv[name];
+              const cbKey = Object.keys(cbStates).find(k => k.startsWith(name + ':'));
+              const cbState = cbKey ? cbStates[cbKey] : 'closed';
+              const healthColor = cbState === 'closed' ? 'var(--emerald)' : cbState === 'half_open' ? 'var(--amber)' : 'var(--red)';
+              return `
+                <tr>
+                  <td class="provider-name">${escapeHtml(name)}</td>
+                  <td class="num">${p.requests || 0}</td>
+                  <td class="num" style="color:var(--emerald)">${p.requests2xx || 0}</td>
+                  <td class="num" style="color:var(--amber)">${p.requests4xx || 0}</td>
+                  <td class="num" style="color:var(--red)">${p.requests5xx || 0}</td>
+                  <td class="num">${fmtNum(p.tokens?.input || 0)}</td>
+                  <td class="num">${fmtNum(p.tokens?.output || 0)}</td>
+                  <td class="num" style="color:var(--accent)">${fmtMoney(p.estimatedSpend || 0)}</td>
+                  <td class="num">${p.latency ? fmtLat(p.latency.p50) : '—'}</td>
+                  <td class="num">${p.upstreamErrors || 0}</td>
+                  <td><span class="health-dot" style="background:${healthColor}"></span>${cbState}</td>
+                </tr>
+              `;
+            }).join('')}
+          </tbody>
+        `;
+      } else {
+        document.getElementById('providerTable').innerHTML = '<tbody><tr><td style="padding:20px;color:var(--muted-foreground);">No provider data yet</td></tr></tbody>';
+      }
+
+      // Circuit breakers
+      const cbEntries = Object.entries(health.circuitBreakers || {});
+      if (cbEntries.length === 0) {
+        document.getElementById('circuitSection').innerHTML = '<div style="color:var(--emerald);font-size:13px;display:flex;align-items:center;gap:8px;">✓ No circuit breakers tripped</div>';
+      } else {
+        document.getElementById('circuitSection').innerHTML = `
+          <div class="cb-grid">
+            ${cbEntries.map(([key, state]) => `
+              <div class="cb-item">
+                <span class="name">${escapeHtml(key)}</span>
+                <span class="state ${stateClass(state)}">${state}</span>
+              </div>
+            `).join('')}
+          </div>
+        `;
+      }
+
+      // Routes
+      const routeList = routes?.routes || [];
+      document.getElementById('routeCount').textContent = routeList.length + ' route' + (routeList.length !== 1 ? 's' : '');
+      if (routeList.length) {
+        document.getElementById('routesTable').innerHTML = `
+          <thead><tr><th>ID</th><th>Protocol</th><th>Provider</th><th>Priority</th><th>Status</th></tr></thead>
+          <tbody>
+            ${routeList.map(r => `
+              <tr>
+                <td class="mono">${escapeHtml(r.id)}</td>
+                <td><span class="pill">${escapeHtml(r.protocol)}</span></td>
+                <td class="mono" style="color:var(--muted-foreground)">${escapeHtml(r.provider || '—')}</td>
+                <td class="mono">${r.priority ?? '—'}</td>
+                <td><span class="enabled-dot ${r.enabled ? 'enabled-yes' : 'enabled-no'}">${r.enabled ? 'Enabled' : 'Disabled'}</span></td>
+              </tr>
+            `).join('')}
+          </tbody>
+        `;
+      } else {
+        document.getElementById('routesTable').innerHTML = '<tbody><tr><td style="padding:20px;color:var(--muted-foreground);">No routes configured</td></tr></tbody>';
+      }
+
+      // Models
+      const modelList = models?.data || [];
+      document.getElementById('modelCount').textContent = modelList.length + ' model' + (modelList.length !== 1 ? 's' : '');
+      if (modelList.length) {
+        document.getElementById('modelsSection').innerHTML = `
+          <div class="model-grid">
+            ${modelList.map(m => `
+              <div class="model-card">
+                <div style="min-width:0;overflow:hidden;">
+                  <div class="model-id">${escapeHtml(m.id)}</div>
+                  <div class="model-meta">${escapeHtml((m.protocols || ['openai-chat']).join(', '))}</div>
+                </div>
+                <span class="model-owner">${escapeHtml(m.owned_by || 'gateway')}</span>
+              </div>
+            `).join('')}
+          </div>
+        `;
+      } else {
+        document.getElementById('modelsSection').innerHTML = '<div style="color:var(--muted-foreground);font-size:13px;">No models available</div>';
+      }
+    }
+
+    // Auto-detect if served from the gateway itself
+    if (window.location.pathname === '/admin' || window.location.pathname === '/admin/') {
+      baseUrl = window.location.origin;
+      document.getElementById('gwUrl').value = baseUrl;
+      // Auto-connect if key is in URL hash
+      if (window.location.hash) {
+        apiKey = window.location.hash.slice(1);
+        document.getElementById('gwKey').value = apiKey;
+      }
+    }
+  </script>
+</body>
+</html>
