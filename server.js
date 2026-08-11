@@ -557,7 +557,7 @@ const __dirname = dirname(__filename);
 // plain browser GET has no Authorization header, so it always 401'd before
 // the auto-inject logic below ever ran, and the dashboard could never load
 // on a first visit. The embedded key is only as exposed as the URL itself.
-app.get("/admin", (req, res) => {
+const serveAdminDashboard = (req, res) => {
   try {
     let html = readFileSync(join(__dirname, "public", "admin.html"), "utf-8");
     // Auto-detect gateway URL: always prefer the actual request host, not
@@ -578,7 +578,14 @@ app.get("/admin", (req, res) => {
   } catch {
     res.status(404).send("Admin dashboard not found.");
   }
-});
+};
+
+// Serve the dashboard at the bare domain root, not just /admin -- so you
+// can just visit the gateway's normal URL and land straight on the
+// credentials/dashboard screen instead of having to remember and type
+// "/admin" every time. /admin is kept as an alias for old bookmarks/links.
+app.get("/", serveAdminDashboard);
+app.get("/admin", serveAdminDashboard);
 
 // ─── Discovery ───────────────────────────────────────────────────────────────
 
