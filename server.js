@@ -121,6 +121,25 @@ app.post("/v1/chat/completions", auth, handle);
 app.post("/v1/messages", auth, handle);
 app.post("/v1beta/models/:modelAction", auth, handle);
 
+app.get("/v1/debug/routes", auth, (_req, res) => {
+  res.json({
+    routes: routes().map(r => ({
+      id: r.id,
+      protocol: r.protocol,
+      provider: r.provider,
+      upstreamBaseURL: r.upstreamBaseURL,
+      upstreamModel: r.upstreamModel || r.id,
+      upstreamApiKeyEnv: r.upstreamApiKeyEnv,
+      priority: r.priority ?? 100,
+      enabled: r.enabled !== false,
+      cost: r.cost,
+      context_window: r.context_window,
+      source: discovered.includes(r) ? "discovered" : "configured",
+    })),
+  });
+});
+
+
 async function discover() {
   const sources = parseJson("MODEL_DISCOVERY_JSON", []);
   if (!Array.isArray(sources)) return;
