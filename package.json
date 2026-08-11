@@ -11,6 +11,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.2",
     "express": "^4.19.2"
   }
 }
