@@ -552,10 +552,14 @@ const __dirname = dirname(__filename);
 app.get("/admin", (req, res) => {
   try {
     let html = readFileSync(join(__dirname, "public", "admin.html"), "utf-8");
-    // Auto-detect gateway URL: Vercel sets VERCEL_URL, otherwise use request origin
-    const gatewayUrl = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : `${req.protocol}://${req.get("host")}`;
+    // Auto-detect gateway URL: always prefer the actual request host, not
+    // process.env.VERCEL_URL. VERCEL_URL resolves to this specific
+    // deployment's unique hash subdomain (e.g. entry-gateway-abc123...),
+    // which differs from the friendly alias (entry-gateway-six.vercel.app)
+    // the browser is actually on -- injecting the hash URL made every
+    // fetch() below a cross-origin request depending on CORS, when it
+    // could just be same-origin and need no CORS at all.
+    const gatewayUrl = `${req.protocol}://${req.get("host")}`;
     // Auto-detect admin key from env (ADMIN_API_KEYS takes priority, then GATEWAY_API_KEYS)
     const adminKey = (process.env.ADMIN_API_KEYS || process.env.GATEWAY_API_KEYS || "").split(",").map(x => x.trim()).filter(Boolean)[0] || "";
     // Inject into HTML as meta tags the frontend reads
