@@ -17,15 +17,41 @@ No payload translation is performed. A request is routed only to upstreams confi
 
 ## Admin Dashboard
 
-To access the gateway dashboard, just hit `https://your-gateway.example.com/admin` with your admin API key as a Bearer token. It auto-detects when it's served from the gateway itself.
+The dashboard auto-detects the gateway URL and API key from environment variables — **zero manual config needed** on Vercel or any self-hosted deployment.
+
+### Auto-detection
+
+When the server serves `/admin`, it injects two meta tags into the HTML:
+
+| Meta tag | Source | Description |
+|---|---|---|
+| `gateway-url` | `VERCEL_URL` env var (prepended with `https://`) or request origin | The gateway's public URL |
+| `gateway-key` | First key from `ADMIN_API_KEYS` (falls back to `GATEWAY_API_KEYS`) | Bearer token for API calls |
+
+If both are present, the dashboard **auto-connects immediately** — no manual URL or key entry needed. If only the URL is detected, the key field is shown for manual entry.
+
+### Accessing the dashboard
 
 ```bash
-# With admin key
-curl https://your-gateway.example.com/admin \
-  -H "Authorization: Bearer your-admin-key"
+# On Vercel — auto-connects, just open in browser
+open https://your-gateway.vercel.app/admin
+
+# Self-hosted — also auto-connects
+open https://your-gateway.example.com/admin
+
+# Manual connection (if auto-detect is unavailable)
+# Enter gateway URL and API key in the connection bar
 ```
 
-The dashboard shows real-time metrics polling every 5 seconds:
+Auth is required to access `/admin` — you need a valid `ADMIN_API_KEYS` or `GATEWAY_API_KEYS` Bearer token. In a browser, pass the key as a URL hash:
+
+```bash
+open https://your-gateway.vercel.app/admin#your-admin-key
+```
+
+### What the dashboard shows
+
+Real-time metrics polling every 5 seconds:
 - **Stat cards** — total requests, avg latency, total tokens, estimated spend
 - **Per-provider breakdown** — requests, 2xx/4xx/5xx, tokens in/out, spend, p50 latency, errors, and circuit breaker state for each provider
 - **Latency distribution** — p50/p95/p99 percentile bars
@@ -78,6 +104,8 @@ Each `provider:model` pair has a circuit breaker that:
 GATEWAY_API_KEYS=one-or-more-comma-separated-client-keys
 ADMIN_API_KEYS=optional-separate-admin-keys
 MODEL_ROUTES_JSON=[...]
+# VERCEL_URL is set automatically by Vercel — no action needed
+# For self-hosted, the dashboard auto-detects from the request origin
 ```
 
 Example route configuration:
