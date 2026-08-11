@@ -1,4 +1,7 @@
 import express from "express";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -502,6 +505,19 @@ app.get("/v1/debug/routes", adminAuth, (_req, res) => {
       source: discovered.includes(r) ? "discovered" : "configured",
     })),
   });
+});
+
+// ─── Admin Dashboard ──────────────────────────────────────────────────────────
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+app.get("/admin", adminAuth, (_req, res) => {
+  try {
+    const html = readFileSync(join(__dirname, "public", "admin.html"), "utf-8");
+    res.set("Content-Type", "text/html").send(html);
+  } catch {
+    res.status(404).send("Admin dashboard not found.");
+  }
 });
 
 // ─── Discovery ───────────────────────────────────────────────────────────────
