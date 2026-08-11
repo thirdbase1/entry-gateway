@@ -901,15 +901,25 @@
       }
     }
 
-    // Auto-detect if served from the gateway itself
-    if (window.location.pathname === '/admin' || window.location.pathname === '/admin/') {
-      baseUrl = window.location.origin;
+    // Auto-detect gateway URL and API key from meta tags injected by the server.
+    // Works on Vercel (VERCEL_URL) and self-hosted (request origin) with zero config.
+    const metaUrl = document.querySelector('meta[name="gateway-url"]');
+    const metaKey = document.querySelector('meta[name="gateway-key"]');
+    if (metaUrl && metaUrl.content) {
+      baseUrl = metaUrl.content;
       document.getElementById('gwUrl').value = baseUrl;
-      // Auto-connect if key is in URL hash
-      if (window.location.hash) {
-        apiKey = window.location.hash.slice(1);
-        document.getElementById('gwKey').value = apiKey;
-      }
+    }
+    if (metaKey && metaKey.content) {
+      apiKey = metaKey.content;
+      document.getElementById('gwKey').value = apiKey;
+    }
+    // If both are present, auto-connect immediately
+    if (baseUrl && apiKey) {
+      document.getElementById('conn-bar').style.display = 'none';
+      connect();
+    } else if (baseUrl) {
+      // Pre-fill URL but show the bar for manual key entry
+      document.getElementById('gwUrl').value = baseUrl;
     }
   </script>
 </body>
