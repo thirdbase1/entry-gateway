@@ -4,18 +4,79 @@ Self-hosted, config-driven native-protocol AI gateway. Clients use one gateway A
 
 ## Routes
 
-- `GET /health`
+- `GET /health` — gateway status, uptime, providers, circuit breakers, active requests
+- `GET /metrics` — per-provider and aggregate metrics (admin-auth protected)
+- `GET /admin` — built-in admin dashboard UI (admin-auth protected)
 - `GET /v1/models` — deduplicated public models with protocol metadata
 - `POST /v1/chat/completions` — OpenAI-compatible passthrough
 - `POST /v1/messages` — Anthropic Messages passthrough
 - `POST /v1beta/models/:model:generateContent` — Gemini-style passthrough
+- `GET /v1/debug/routes` — route configuration debug view (admin-auth protected)
 
 No payload translation is performed. A request is routed only to upstreams configured for the same native protocol. Duplicate models use ascending `priority` and fall back to the next compatible upstream after retryable upstream failures.
+
+## Admin Dashboard
+
+To access the gateway dashboard, just hit `https://your-gateway.example.com/admin` with your admin API key as a Bearer token. It auto-detects when it's served from the gateway itself.
+
+```bash
+# With admin key
+curl https://your-gateway.example.com/admin \
+  -H "Authorization: Bearer your-admin-key"
+```
+
+The dashboard shows real-time metrics polling every 5 seconds:
+- **Stat cards** — total requests, avg latency, total tokens, estimated spend
+- **Per-provider breakdown** — requests, 2xx/4xx/5xx, tokens in/out, spend, p50 latency, errors, and circuit breaker state for each provider
+- **Latency distribution** — p50/p95/p99 percentile bars
+- **Request status** — color-coded 2xx/4xx/5xx bars
+- **Circuit breakers** — closed (green), half_open (amber), open (red)
+- **Model routes** and **available models** tables
+
+Set `ADMIN_API_KEYS` for separate admin-only access. Falls back to `GATEWAY_API_KEYS` if not set.
+
+## Metrics API
+
+`GET /metrics` returns per-provider and aggregate tracking:
+
+```json
+{
+  "global": {
+    "requests": 42,
+    "requests2xx": 40,
+    "tokens": { "input": 500, "output": 200, "total": 700, "cacheRead": 0, "cacheWrite": 0, "reasoning": 0 },
+    "estimatedSpend": 0.0042,
+    "latency": { "p50": 340, "p95": 1200,"p99": 1800,"min": 50,"max": 2000, "count": 42 },
+    "upstreamErrors": 2,
+    "fallbacks": 1
+  },
+  "byProvider": {
+    "freemodel": { "requests": 20, "tokens": { "total": 300 }, "estimatedSpend": 0.002, ... },
+    "unimodel":  { "requests": 22, "tokens": { "total": 400 }, "estimatedSpend": 0.0022, ... }
+  },
+  "byModel": {
+    "claude-sonnet": { "requests": 42, "tokens": { "total": 700 }, ... }
+  },
+  "circuitBreakers": { "freemodel:claude-sonnet": { "state": "closed", "failures": 0 } },
+  "activeRequests": 0,
+  "activeStreams": 0
+}
+```
+
+## Circuit Breakers
+
+Each `provider:model` pair has a circuit breaker that:
+- Opens after 5 consecutive upstream failures (5xx, 429, timeout)
+- Transitions to half-open after 30s cooldown, allowing a probe request
+- Closes on success, resets failure count
+- Skips open circuits during fallback when alternatives exist
+- Logs state transitions as `circuit_opened` / `circuit_recovered`
 
 ## Required environment
 
 ```text
 GATEWAY_API_KEYS=one-or-more-comma-separated-client-keys
+ADMIN_API_KEYS=optional-separate-admin-keys
 MODEL_ROUTES_JSON=[...]
 ```
 
@@ -75,7 +136,7 @@ Use `DISCOVERY_REFRESH_MS` to change the interval. Discovery normalizes only the
 
 ## Logging and cost tracking
 
-Successful requests log JSON with request ID, model, protocol, provider, latency, token usage, and estimated cost. Costs are per-million-token values in each route's `cost` object. Set `billingMultiplier` when a provider dashboard applies a markup such as UniModel's default 5x; it defaults to 1. Unknown usage or pricing is logged without an estimate. Streaming usage is captured when the upstream emits usage in an SSE event.
+Successful requests log JSON with request ID, model, protocol, provider, latency, TTFT (for streams), token usage, and estimated cost. Costs are per-million-token values in each route's `cost` object. Set `billingMultiplier` when a provider dashboard applies a markup such as UniModel's default 5x; it defaults to 1. Unknown usage or pricing is logged without an estimate. Streaming usage is captured when the upstream emits usage in an SSE event.
 
 ## Run
 
