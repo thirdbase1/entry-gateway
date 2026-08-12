@@ -171,11 +171,24 @@ async function proxy(req, res, r, p, model, id, isFallback) {
   let streaming = false;
   await incrGauge("activeRequests", 1);
 
+  // CRITICAL: the client sends OUR public model id (e.g. "hy3"), but the
+  // upstream provider may expose that model under a different literal
+  // string (e.g. Opencode Zen's real id is "hy3-free"). r.upstreamModel
+  // carries that real id, but it was previously only used for the gemini
+  // URL-path template -- for openai-chat/anthropic-messages the body was
+  // forwarded completely unchanged, silently leaking our internal id to
+  // the upstream instead. Substitute it into the outgoing body whenever
+  // the two differ, for every protocol that carries model in the body.
+  const outgoingBody =
+    p !== "gemini-generate" && r.upstreamModel && r.upstreamModel !== model
+      ? { ...req.body, model: r.upstreamModel }
+      : req.body;
+
   try {
     const response = await fetch(upstreamUrl(r, p, model), {
       method: "POST",
       headers: headers(r, p),
-      body: JSON.stringify(req.body),
+      body: JSON.stringify(outgoingBody),
       signal: AbortSignal.timeout(Number(r.timeoutMs || 120000)),
     });
 
