@@ -157,7 +157,12 @@ async function proxy(req, res, r, p, model, id, isFallback) {
 
   // Circuit breaker check
   if (await isCircuitOpen(provider, model)) {
-    await recordUpstreamError(provider);
+    // Record both the provider-level error counter AND a per-model request
+    // (status 0 = failed before any upstream response) so this attempt is
+    // visible in that model's own row, not just an orphaned provider-level
+    // error number that doesn't reconcile against any visible request.
+    await recordUpstreamError(provider, model);
+    await recordRequest(provider, model, 0, null, null, null, null, isFallback);
     throw new Error(`Circuit breaker open for ${provider}:${model}`);
   }
 
@@ -177,7 +182,12 @@ async function proxy(req, res, r, p, model, id, isFallback) {
     if (response.status >= 500 || response.status === 429) {
       const text = await response.text();
       await recordBreakerFailure(provider, model);
-      await recordUpstreamError(provider);
+      // Record the real upstream status against this model (not just an
+      // anonymous provider-level error) so failed attempts on one model
+      // (e.g. a circuit-tripping route) don't show up as unexplained
+      // provider errors sitting next to a different model's clean 2xx row.
+      await recordUpstreamError(provider, model);
+      await recordRequest(provider, model, response.status, Date.now() - started, ttft, null, null, isFallback);
       const e = new Error(`Upstream ${response.status}: ${text.slice(0, 500)}`);
       e.retryable = true;
       throw e;
@@ -199,17 +209,32 @@ async function proxy(req, res, r, p, model, id, isFallback) {
       streaming = true;
       await incrGauge("activeStreams", 1);
       const reader = response.body.getReader();
-      const firstChunk = true;
+      // Persistent decoder + carry-over buffer: an SSE "data: {...}" frame
+      // (especially the final one carrying usage) can land split across two
+      // separate reader.read() chunks at the TCP level. Decoding each chunk
+      // in isolation and splitting on \n without keeping the trailing
+      // partial line meant that split frame silently failed JSON.parse and
+      // got swallowed by the catch -- usage (and any other data in that
+      // frame) was just lost. Buffering the leftover across iterations and
+      // using {stream:true} on the decoder for multi-byte-safe decoding
+      // fixes this.
+      const decoder = new TextDecoder();
+      let buffer = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (firstChunk && ttft === null) ttft = Date.now() - started;
-        const text = new TextDecoder().decode(value);
-        for (const line of text.split("\n"))
+        if (ttft === null) ttft = Date.now() - started;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? ""; // keep the last (possibly incomplete) line for next round
+        for (const line of lines)
           if (line.startsWith("data:") && line.slice(5).trim() !== "[DONE]")
             try { usage = usageOf(JSON.parse(line.slice(5).trim())) || usage; } catch {}
         res.write(value);
       }
+      // Flush any trailing partial line left in the buffer after the stream ends.
+      if (buffer.startsWith("data:") && buffer.slice(5).trim() !== "[DONE]")
+        try { usage = usageOf(JSON.parse(buffer.slice(5).trim())) || usage; } catch {}
       res.end();
     }
 
@@ -221,7 +246,13 @@ async function proxy(req, res, r, p, model, id, isFallback) {
     log({ requestId: id, model, protocol: p, provider, status: response.status, latencyMs, ttftMs: ttft, usage, estimatedCost, isFallback });
   } catch (e) {
     await recordBreakerFailure(provider, model);
-    await recordUpstreamError(provider);
+    await recordUpstreamError(provider, model);
+    // Only record here if we haven't already recorded this exact attempt
+    // above (the 5xx/429 branch records before throwing). e.retryable is
+    // only set by that branch, so its absence means this is a genuine
+    // network-level failure (timeout, DNS, abort, missing key, etc.) that
+    // never got a recordRequest call yet.
+    if (!e.retryable) await recordRequest(provider, model, 0, Date.now() - started, ttft, null, null, isFallback);
     throw e;
   } finally {
     await incrGauge("activeRequests", -1);

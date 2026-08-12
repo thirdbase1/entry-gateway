@@ -174,18 +174,23 @@ export async function recordRequest(provider, model, status, latencyMs, ttftMs, 
   await pipeline.exec();
 }
 
-export async function recordUpstreamError(provider) {
+export async function recordUpstreamError(provider, model) {
   provider = provider || "unknown";
   if (!redis) {
     const pb = memBucket(`provider:${provider}`);
     pb.counters.upstreamErrors = (pb.counters.upstreamErrors || 0) + 1;
     const gb = memBucket("global:_");
     gb.counters.upstreamErrors = (gb.counters.upstreamErrors || 0) + 1;
+    if (model) {
+      const mb = memBucket(`model:${model}`);
+      mb.counters.upstreamErrors = (mb.counters.upstreamErrors || 0) + 1;
+    }
     return;
   }
   const pipeline = redis.pipeline();
   pipeline.hincrby(bucketKey("provider", provider), "upstreamErrors", 1);
   pipeline.hincrby(bucketKey("global", "_"), "upstreamErrors", 1);
+  if (model) pipeline.hincrby(bucketKey("model", model), "upstreamErrors", 1);
   pipeline.sadd(providersSetKey(), provider);
   await pipeline.exec();
 }
