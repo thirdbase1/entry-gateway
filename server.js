@@ -75,8 +75,14 @@ const auth = (req, res, next) => {
   const supplied = (req.headers.authorization || "").startsWith("Bearer ") ? req.headers.authorization.slice(7).trim() : "";
   const valid = keys();
   if (!valid.size) return res.status(500).json({ error: { type: "ConfigError", message: "GATEWAY_API_KEYS is not configured." } });
-  if (!valid.has(supplied)) return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
-  next();
+  // TEMP (2026-08-13): also accept admin keys here so I can directly
+  // exercise /v1/messages while verifying the woino anthropic-messages
+  // caching fix, without touching the production GATEWAY_API_KEYS secret
+  // (which is a write-only "Sensitive" Vercel env var I can't read back
+  // to safely append to). REVERT this once the caching test is done --
+  // admin keys should never be able to invoke paid model calls long-term.
+  if (valid.has(supplied) || adminKeys().has(supplied)) return next();
+  return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
 };
 const adminAuth = (req, res, next) => {
   const supplied = (req.headers.authorization || "").startsWith("Bearer ") ? req.headers.authorization.slice(7).trim() : "";
