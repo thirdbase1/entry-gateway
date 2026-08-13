@@ -88,7 +88,17 @@ const adminAuth = (req, res, next) => {
   if (valid.has(supplied)) return next();
   return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
 };
-const protocol = path => path === "/v1/messages" ? "anthropic-messages" : path.includes("generateContent") ? "gemini-generate" : "openai-chat";
+// Case-insensitive match: Google's two action names differ only in the
+// capitalization of the shared "GenerateContent" tail --
+// ":generateContent" (non-streaming, lowercase g) vs
+// ":streamGenerateContent" (streaming, uppercase G, since it's
+// stream+Generate+Content). A case-SENSITIVE path.includes("generateContent")
+// only ever matched the non-streaming action -- every streaming Gemini
+// call (i.e. every real chat turn, since the app always streams) fell
+// through to the "openai-chat" branch instead, which then 400'd with "A
+// model is required" because Gemini-shaped bodies have no top-level
+// `model` field. Found 2026-08-13 while validating explicit caching.
+const protocol = path => path === "/v1/messages" ? "anthropic-messages" : /generatecontent/i.test(path) ? "gemini-generate" : "openai-chat";
 const modelFor = (req, p) => {
   if (p !== "gemini-generate") return req.body?.model;
   const raw = req.params.modelAction || "";
