@@ -94,16 +94,44 @@ const modelFor = (req, p) => {
   const idx = raw.lastIndexOf(":");
   return idx === -1 ? raw || req.body?.model : raw.slice(0, idx);
 };
+// Gemini-generate action ("generateContent" vs "streamGenerateContent") --
+// the AI SDK's Google provider calls :streamGenerateContent?alt=sse for
+// streaming requests, encoded in the same :modelAction path segment as the
+// model id (e.g. "gemini-3.5-flash:streamGenerateContent"). modelFor()
+// above only extracts the model half; this extracts the action half so
+// upstreamUrl() can forward the *same* action upstream instead of always
+// hardcoding :generateContent, which silently broke Gemini streaming (the
+// upstream would return a single JSON blob instead of an SSE stream, with
+// no error -- just a client-side parse failure on the caller's side).
+const actionFor = (req, p) => {
+  if (p !== "gemini-generate") return null;
+  const raw = req.params.modelAction || "";
+  const idx = raw.lastIndexOf(":");
+  return idx === -1 ? "generateContent" : raw.slice(idx + 1);
+};
 const candidates = (model, p) => routes().filter(r => r.id === model && r.protocol === p && r.enabled !== false).sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
-const upstreamUrl = (r, p, model) => {
+const upstreamUrl = (r, p, model, action) => {
   const base = r.upstreamBaseURL.replace(/\/$/, "");
-  const path = r.upstreamPath || (p === "openai-chat" ? "/chat/completions" : p === "anthropic-messages" ? "/messages" : `/models/${encodeURIComponent(r.upstreamModel || model)}:generateContent`);
-  return `${base}${path.replace("{model}", encodeURIComponent(r.upstreamModel || model))}`;
+  const geminiAction = action || "generateContent";
+  const path = r.upstreamPath || (p === "openai-chat" ? "/chat/completions" : p === "anthropic-messages" ? "/messages" : `/models/${encodeURIComponent(r.upstreamModel || model)}:${geminiAction}`);
+  const url = `${base}${path.replace("{model}", encodeURIComponent(r.upstreamModel || model))}`;
+  // Gemini's SSE framing (data: {...} lines, matching the OpenAI/Anthropic
+  // shape this gateway's SSE parsing loop already understands) is opt-in
+  // via ?alt=sse -- without it, streamGenerateContent returns a bare JSON
+  // array instead.
+  return p === "gemini-generate" && geminiAction === "streamGenerateContent" ? `${url}?alt=sse` : url;
 };
 const headers = (r, p) => {
   const key = process.env[r.upstreamApiKeyEnv];
   const h = { "Content-Type": "application/json", ...(r.headers || {}) };
   if (r.authStyle === "x-api-key" || p === "anthropic-messages") h["x-api-key"] = key;
+  // Google's Generative Language API rejects `Authorization: Bearer` for
+  // API-key auth (401 API_KEY_SERVICE_BLOCKED) and doesn't accept
+  // `x-api-key` either (403 PERMISSION_DENIED) -- it needs its own
+  // `x-goog-api-key` header (or a `?key=` query param, which would leak
+  // the key into logs/URLs, so the header is used instead). Confirmed via
+  // live probe against generativelanguage.googleapis.com, 2026-08-13.
+  else if (r.authStyle === "x-goog-api-key") h["x-goog-api-key"] = key;
   else h.Authorization = `Bearer ${key}`;
   if (p === "anthropic-messages" && r.anthropicVersion) h["anthropic-version"] = r.anthropicVersion;
   return h;
@@ -150,7 +178,7 @@ const log = x => process.env.REQUEST_LOG !== "false" && console.log(JSON.stringi
 
 // ─── Proxy ────────────────────────────────────────────────────────────────────
 
-async function proxy(req, res, r, p, model, id, isFallback) {
+async function proxy(req, res, r, p, model, action, id, isFallback) {
   const key = process.env[r.upstreamApiKeyEnv];
   if (!key) throw new Error(`Missing secret ${r.upstreamApiKeyEnv}`);
   const provider = r.provider || r.upstreamApiKeyEnv || "unknown";
@@ -185,7 +213,7 @@ async function proxy(req, res, r, p, model, id, isFallback) {
       : req.body;
 
   try {
-    const response = await fetch(upstreamUrl(r, p, model), {
+    const response = await fetch(upstreamUrl(r, p, model, action), {
       method: "POST",
       headers: headers(r, p),
       body: JSON.stringify(outgoingBody),
@@ -274,7 +302,7 @@ async function proxy(req, res, r, p, model, id, isFallback) {
 }
 
 async function handle(req, res) {
-  const p = protocol(req.path), model = modelFor(req, p), id = `gw_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const p = protocol(req.path), model = modelFor(req, p), action = actionFor(req, p), id = `gw_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   if (!model) return res.status(400).json({ error: { type: "ModelError", message: "A model is required." } });
   const available = candidates(model, p);
   if (!available.length) return res.status(404).json({ error: { type: "ModelError", message: `No ${p} route is configured for ${model}.` } });
@@ -284,7 +312,7 @@ async function handle(req, res) {
     const provider = r.provider || r.upstreamApiKeyEnv || "unknown";
     if (available.length > 1 && (await isCircuitOpen(provider, model))) continue; // skip open circuits if alternatives exist
     try {
-      await proxy(req, res, r, p, model, id, i > 0);
+      await proxy(req, res, r, p, model, action, id, i > 0);
       return;
     } catch (e) {
       failures.push(`${provider}: ${e.message}`);
