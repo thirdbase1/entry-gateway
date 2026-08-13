@@ -14,6 +14,7 @@ import {
   getAllCircuitBreakers,
   usingRedis,
 } from "./metrics-store.js";
+import { getOrCreateCachedContent } from "./gemini-cache.js";
 
 const app = express();
 // Vercel (and most PaaS) terminate TLS upstream and forward to this
@@ -207,10 +208,33 @@ async function proxy(req, res, r, p, model, action, id, isFallback) {
   // forwarded completely unchanged, silently leaking our internal id to
   // the upstream instead. Substitute it into the outgoing body whenever
   // the two differ, for every protocol that carries model in the body.
-  const outgoingBody =
+  let outgoingBody =
     p !== "gemini-generate" && r.upstreamModel && r.upstreamModel !== model
       ? { ...req.body, model: r.upstreamModel }
       : req.body;
+
+  // Transparent Gemini explicit context caching (see gemini-cache.js for
+  // the full rationale): if this request carries a systemInstruction big
+  // enough to be cache-eligible, swap it out for a `cachedContent`
+  // reference so the (large, byte-identical-every-turn) system prompt gets
+  // Google's *guaranteed* cache-read discount instead of relying on
+  // best-effort implicit caching. Any failure here is swallowed --
+  // outgoingBody just falls back to the original, unmodified body.
+  if (p === "gemini-generate" && outgoingBody?.systemInstruction) {
+    try {
+      const cachedContentName = await getOrCreateCachedContent({
+        model: r.upstreamModel || model,
+        systemInstruction: outgoingBody.systemInstruction,
+        apiKey: key,
+      });
+      if (cachedContentName) {
+        const { systemInstruction: _drop, ...rest } = outgoingBody;
+        outgoingBody = { ...rest, cachedContent: cachedContentName };
+      }
+    } catch (e) {
+      console.error(JSON.stringify({ type: "gemini_cache_wire_error", model, message: e.message }));
+    }
+  }
 
   try {
     const response = await fetch(upstreamUrl(r, p, model, action), {
