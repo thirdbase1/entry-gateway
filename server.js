@@ -65,8 +65,15 @@ const parseJson = (name, fallback) => {
 };
 const keys = () => new Set((process.env.GATEWAY_API_KEYS || "").split(",").map(x => x.trim()).filter(Boolean));
 const adminKeys = () => new Set((process.env.ADMIN_API_KEYS || "").split(",").map(x => x.trim()).filter(Boolean));
-const configured = () => (Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : [])
-  .filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r }));
+// EXTRA_MODEL_ROUTES_JSON is a second, additive routes list -- kept
+// separate from MODEL_ROUTES_JSON (a Vercel "Sensitive" env var, which
+// Vercel makes permanently write-only/unreadable once set, by design) so
+// new one-off routes can be added without ever needing to read back and
+// re-paste the existing list. Same shape as MODEL_ROUTES_JSON entries.
+const configured = () => [
+  ...(Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : []),
+  ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON", []) : []),
+].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r }));
 const routes = () => {
   const m = new Map();
   for (const r of [...configured(), ...discovered]) m.set(`${r.id}|${r.protocol}|${r.upstreamBaseURL}|${r.upstreamModel || r.id}`, r);
