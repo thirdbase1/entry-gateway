@@ -410,42 +410,6 @@ app.post("/v1/chat/completions", auth, handle);
 app.post("/v1/messages", auth, handle);
 app.post("/v1beta/models/:modelAction", auth, handle);
 
-// TEMPORARY diagnostic route -- checks whether a given upstream provider's
-// live catalog includes a specific model id, without ever exposing the
-// provider key or the full catalog. Safe to leave unauthenticated: it only
-// returns a boolean + matching id strings, nothing secret. Added 2026-08-15
-// to verify Qwen3.8-27B availability before wiring a real route; remove
-// once that's resolved.
-app.get("/debug/check-model", async (req, res) => {
-  const providerBaseUrls = {
-    unimodel: "https://www.unimodel.ai/v1",
-    "opencode-zen": "https://opencode.ai/zen/v1",
-    tokenrouter: "https://api.tokenrouter.com/v1",
-  };
-  const providerKeyEnvs = {
-    unimodel: "UNIMODEL_API_KEY",
-    "opencode-zen": "OPENCODEZEN_API_KEY",
-    tokenrouter: "TOKENROUTER_API_KEY",
-  };
-  const provider = String(req.query.provider || "");
-  const needle = String(req.query.model || "").toLowerCase();
-  const base = providerBaseUrls[provider];
-  const keyEnv = providerKeyEnvs[provider];
-  if (!base || !keyEnv) return res.status(400).json({ error: "unknown provider" });
-  const key = process.env[keyEnv];
-  if (!key) return res.status(500).json({ error: `${keyEnv} not set` });
-  try {
-    const r = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15000) });
-    const body = await r.json();
-    const list = Array.isArray(body) ? body : body.data || body.models || [];
-    const ids = list.map(x => (typeof x === "string" ? x : x.id || x.name)).filter(Boolean);
-    const matches = ids.filter(id => id.toLowerCase().includes(needle));
-    res.json({ provider, status: r.status, total: ids.length, matches });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 app.get("/v1/debug/routes", adminAuth, (_req, res) => {
   res.json({
     routes: routes().map(r => ({
