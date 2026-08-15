@@ -70,9 +70,19 @@ const adminKeys = () => new Set((process.env.ADMIN_API_KEYS || "").split(",").ma
 // Vercel makes permanently write-only/unreadable once set, by design) so
 // new one-off routes can be added without ever needing to read back and
 // re-paste the existing list. Same shape as MODEL_ROUTES_JSON entries.
+//
+// EXTRA_MODEL_ROUTES_JSON_2: turns out EXTRA_MODEL_ROUTES_JSON itself got
+// created as Vercel type "sensitive" at some point too (confirmed via the
+// API decrypt=true param returning decrypted:false for it), defeating the
+// whole point of keeping a *readable* additive list. Rather than delete
+// it blindly -- which would silently drop whatever routes are already in
+// there with no way to recover them -- this adds a second slot, created
+// as type "encrypted" (still hidden by default in the dashboard, but
+// actually decryptable via the API), for all future one-off additions.
 const configured = () => [
   ...(Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON", []) : []),
+  ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_2", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_2", []) : []),
 ].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r }));
 const routes = () => {
   const m = new Map();
