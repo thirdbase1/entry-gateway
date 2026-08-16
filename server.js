@@ -443,6 +443,7 @@ app.get("/v1/debug/routes", adminAuth, (_req, res) => {
       source: discovered.includes(r) ? "discovered" : "configured",
     })),
   });
+});
 
 // TEMP DIAGNOSTIC -- remove after use. Guarded by a fresh throwaway key
 // (TEMP_DEBUG_TOKEN) so it doesn't ride on any existing sensitive key.
@@ -491,8 +492,6 @@ app.get("/v1/debug/temp-dump", async (req, res) => {
   }
 
   res.json({ routes: allRoutes, orcaTest });
-});
-
 });
 
 // ─── Admin Dashboard ──────────────────────────────────────────────────────────
