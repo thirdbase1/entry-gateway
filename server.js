@@ -424,7 +424,7 @@ app.get("/metrics", adminAuth, async (_req, res) => {
 
 app.get("/v1/models", auth, (_req, res) => {
   const m = new Map();
-  for (const r of routes()) {
+  for (const r of routes().filter((r) => r.enabled !== false)) {
     const x = m.get(r.id) || { id: r.id, object: "model", name: r.name || r.id, owned_by: r.provider || "gateway", protocols: [], context_window: r.context_window, cost: r.cost };
     if (!x.protocols.includes(r.protocol)) x.protocols.push(r.protocol);
     m.set(r.id, x);
