@@ -86,7 +86,16 @@ const configured = () => [
 ].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r }));
 const routes = () => {
   const m = new Map();
-  for (const r of [...configured(), ...discovered]) m.set(`${r.id}|${r.protocol}|${r.upstreamBaseURL}|${r.upstreamModel || r.id}`, r);
+  // NOTE: upstreamApiKeyEnv is part of the dedup key -- without it, two
+  // routes for the same id+protocol+baseURL+model but *different*
+  // credentials (e.g. two OrcaRouter accounts used as primary/fallback
+  // for the same model) silently collapsed into one, with whichever
+  // entry appeared last in the configured() array clobbering the other.
+  // Found 2026-08-16 wiring a second OrcaRouter key for qwen3.8-27b: the
+  // fallback entry silently replaced the primary instead of coexisting
+  // as a second candidates() entry, so handle()'s priority-ordered
+  // fallback loop never actually got two routes to try.
+  for (const r of [...configured(), ...discovered]) m.set(`${r.id}|${r.protocol}|${r.upstreamBaseURL}|${r.upstreamModel || r.id}|${r.upstreamApiKeyEnv || ""}`, r);
   return [...m.values()];
 };
 const auth = (req, res, next) => {
