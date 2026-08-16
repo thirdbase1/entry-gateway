@@ -456,14 +456,14 @@ app.get("/v1/debug/temp-dump", async (req, res) => {
   if (!process.env.TEMP_DEBUG_TOKEN || supplied !== process.env.TEMP_DEBUG_TOKEN) {
     return res.status(401).json({ error: "unauthorized" });
   }
-  const allRoutes = routes().map(r => ({
-    id: r.id, protocol: r.protocol, provider: r.provider,
-    upstreamBaseURL: r.upstreamBaseURL, upstreamModel: r.upstreamModel || r.id,
-    upstreamApiKeyEnv: r.upstreamApiKeyEnv, priority: r.priority ?? 100,
-    enabled: r.enabled !== false, cost: r.cost, context_window: r.context_window,
-    authStyle: r.authStyle, upstreamPath: r.upstreamPath,
-    source: discovered.includes(r) ? "discovered" : "configured",
-  }));
+  // Full raw route object (minus nothing -- no key VALUES ever appear here,
+  // only the upstreamApiKeyEnv *name*) so reconstruction never drops a
+  // field like headers/anthropicVersion that only some protocols need.
+  const allRoutes = routes().map(r => ({ ...r, source: discovered.includes(r) ? "discovered" : "configured" }));
+  const rawConfigured = [
+    { name: "MODEL_ROUTES_JSON", raw: process.env.MODEL_ROUTES_JSON ? "present-but-write-only" : "unset" },
+    { name: "EXTRA_MODEL_ROUTES_JSON", raw: process.env.EXTRA_MODEL_ROUTES_JSON ? "present-but-write-only" : "unset" },
+  ];
 
   let orcaTest = null;
   const orcaRoute = routes().find(r => r.id === "qwen3.8-27b" && r.provider === "orcarouter");
@@ -491,7 +491,7 @@ app.get("/v1/debug/temp-dump", async (req, res) => {
     }
   }
 
-  res.json({ routes: allRoutes, orcaTest });
+  res.json({ routes: allRoutes, orcaTest, rawConfigured });
 });
 
 // ─── Admin Dashboard ──────────────────────────────────────────────────────────
