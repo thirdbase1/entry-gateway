@@ -445,6 +445,58 @@ app.get("/v1/debug/routes", adminAuth, (_req, res) => {
   });
 });
 
+// TEMPORARY diagnostic: owner-requested 3x latency check against the live
+// qwen3.8-27b -> orcarouter route, using this process's own decrypted
+// runtime env access (ORCAROUTER_API_KEY is a Vercel "sensitive" var, so
+// it can't be read back via the Vercel API/CLI -- this route is the only
+// way to actually exercise it). Guarded by a one-off secret (not
+// GATEWAY_API_KEYS/ADMIN_API_KEYS) so it's safe to leave world-reachable
+// for the few minutes this takes; remove this route + LATENCY_TEST_SECRET
+// once the check is done (see git log for the same pattern used before,
+// e.g. the temp-dump route).
+app.get("/v1/debug/latency-test", async (req, res) => {
+  if (!process.env.LATENCY_TEST_SECRET || req.query.secret !== process.env.LATENCY_TEST_SECRET) {
+    return res.status(404).end();
+  }
+  const model = "qwen3.8-27b";
+  const candidates_ = candidates(model, "openai-chat");
+  if (!candidates_.length) {
+    return res.status(404).json({ error: `No route configured for ${model}` });
+  }
+  const results = [];
+  for (let i = 0; i < 3; i++) {
+    const r = candidates_[0];
+    const key = process.env[r.upstreamApiKeyEnv];
+    const started = Date.now();
+    try {
+      const upstreamRes = await fetch(`${r.upstreamBaseURL}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model: r.upstreamModel || model,
+          messages: [{ role: "user", content: "Reply with just the word: pong" }],
+          max_tokens: 8,
+          stream: false,
+        }),
+      });
+      const bodyText = await upstreamRes.text();
+      results.push({
+        attempt: i + 1,
+        provider: r.provider,
+        upstreamBaseURL: r.upstreamBaseURL,
+        upstreamModel: r.upstreamModel || model,
+        status: upstreamRes.status,
+        ms: Date.now() - started,
+        ok: upstreamRes.ok,
+        bodyPreview: bodyText.slice(0, 300),
+      });
+    } catch (e) {
+      results.push({ attempt: i + 1, provider: r.provider, error: e.message, ms: Date.now() - started });
+    }
+  }
+  res.json({ model, routeCount: candidates_.length, results });
+});
+
 // ─── Admin Dashboard ──────────────────────────────────────────────────────────
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
