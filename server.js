@@ -443,6 +443,56 @@ app.get("/v1/debug/routes", adminAuth, (_req, res) => {
       source: discovered.includes(r) ? "discovered" : "configured",
     })),
   });
+
+// TEMP DIAGNOSTIC -- remove after use. Guarded by a fresh throwaway key
+// (TEMP_DEBUG_TOKEN) so it doesn't ride on any existing sensitive key.
+// Dumps the exact merged routes (safe -- no key values, just env var
+// names) so the write-only MODEL_ROUTES_JSON/EXTRA_MODEL_ROUTES_JSON
+// contents can be inspected without ever decrypting them, and live-tests
+// OrcaRouter's qwen3.8-27b response to check for cached_tokens support.
+app.get("/v1/debug/temp-dump", async (req, res) => {
+  const supplied = (req.headers.authorization || "").startsWith("Bearer ") ? req.headers.authorization.slice(7).trim() : "";
+  if (!process.env.TEMP_DEBUG_TOKEN || supplied !== process.env.TEMP_DEBUG_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const allRoutes = routes().map(r => ({
+    id: r.id, protocol: r.protocol, provider: r.provider,
+    upstreamBaseURL: r.upstreamBaseURL, upstreamModel: r.upstreamModel || r.id,
+    upstreamApiKeyEnv: r.upstreamApiKeyEnv, priority: r.priority ?? 100,
+    enabled: r.enabled !== false, cost: r.cost, context_window: r.context_window,
+    authStyle: r.authStyle, upstreamPath: r.upstreamPath,
+    source: discovered.includes(r) ? "discovered" : "configured",
+  }));
+
+  let orcaTest = null;
+  const orcaRoute = routes().find(r => r.id === "qwen3.8-27b" && r.provider === "orcarouter");
+  if (orcaRoute) {
+    try {
+      const key = process.env[orcaRoute.upstreamApiKeyEnv];
+      const r = await fetch(`${orcaRoute.upstreamBaseURL.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify({
+          model: orcaRoute.upstreamModel,
+          messages: [
+            { role: "system", content: "Reply with exactly one word." },
+            { role: "user", content: "Say hi." },
+          ],
+          max_tokens: 10,
+        }),
+      });
+      const bodyText = await r.text();
+      let parsed;
+      try { parsed = JSON.parse(bodyText); } catch { parsed = null; }
+      orcaTest = { status: r.status, usage: parsed?.usage ?? null, raw: bodyText.slice(0, 800) };
+    } catch (e) {
+      orcaTest = { error: e.message };
+    }
+  }
+
+  res.json({ routes: allRoutes, orcaTest });
+});
+
 });
 
 // ─── Admin Dashboard ──────────────────────────────────────────────────────────
