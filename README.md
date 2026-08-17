@@ -1,6 +1,6 @@
 # Entry Gateway
 
-Self-hosted, config-driven native-protocol AI gateway. Clients use one gateway API key; provider keys stay in server-side environment variables managed by Pxxl.
+Self-hosted, config-driven native-protocol AI gateway. Clients use one gateway API key; provider keys stay in server-side environment variables managed by Vercel.
 
 ## Routes
 
@@ -173,7 +173,7 @@ npm ci
 GATEWAY_API_KEYS=local-secret MODEL_ROUTES_JSON='[...]' node server.js
 ```
 
-Docker/Pxxl:
+Docker/Vercel:
 
 ```bash
 docker build -t entry-gateway .

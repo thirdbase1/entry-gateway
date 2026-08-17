@@ -91,3 +91,9 @@ Implement persistent JSONL logs, `/metrics`, request cancellation, circuit break
 - Xiaomi's official MiMo V2.5 page shows $0.14 uncached input / $0.0028 cache-hit input / $0.28 output.
 - Usage normalization now keeps cache-read, cache-write, and reasoning tokens.
 - The cache-aware cost formula separates uncached input from cached input. Add provider-specific cache-write semantics when a provider documents them.
+
+## Lessons learned (2026-08-17)
+
+- FreeModel API key rotated (`FREEMODEL_API_KEY`, Sensitive-type Vercel env var on this project). Sensitive vars are write-only once set -- `vercel env pull`/`ls` always shows `[SENSITIVE]`, never the real value. To rotate: `vercel env rm FREEMODEL_API_KEY production`, then pipe the new key into `vercel env add FREEMODEL_API_KEY production --sensitive`, then `vercel deploy --prod` (existing deployments keep the old value baked in until redeployed).
+- Verified a rotated upstream key directly against the provider (e.g. `POST https://vip-sg.freemodel.dev/v1/chat/completions` with the new bearer token) before trusting it end-to-end through the gateway -- useful when the gateway's own client-facing `GATEWAY_API_KEY` is also Sensitive-type and thus unavailable locally to build a full round-trip test.
+- Found and fixed stale "Pxxl" hosting references left over in rule.md, gateway.md, and README.md from before the Vercel migration -- when migrating hosting providers, grep every doc file in the repo for the old provider name, not just the deploy scripts/configs.

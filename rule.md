@@ -4,7 +4,7 @@ This file is part of the gateway project. Read it before changing the gateway or
 
 ## Core product rules
 
-1. The gateway is a self-hosted smart proxy on Pxxl.
+1. The gateway is a self-hosted smart proxy on Vercel.
 2. Incoming clients use one central gateway API key.
 3. Provider API keys stay private in server-side environment variables and must never be committed, printed, returned, or copied into documentation.
 4. Route requests by both model and native protocol.

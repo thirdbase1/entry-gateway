@@ -1,6 +1,6 @@
 # Entry Gateway — Build and Test Record
 
-**Project:** self-hosted native-protocol AI gateway on Pxxl
+**Project:** self-hosted native-protocol AI gateway on Vercel
 **Repository:** `thirdbase1/entry-gateway`
 **Test date:** 2026-08-10
 **Timezone:** Africa/Lagos (gateway console timestamps were emitted in UTC)
@@ -460,7 +460,7 @@ fe28d87 README: add deploy command and provider setup walkthrough
 306fbc4 Initial entry-gateway: OpenAI-compatible self-hosted AI gateway
 ```
 
-The upstream README describes a Pxxl deployment with:
+The upstream README describes a Vercel deployment with:
 
 - `GATEWAY_API_KEYS`
 - `OPENCODEZEN_BASE_URL`
