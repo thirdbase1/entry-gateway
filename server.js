@@ -178,7 +178,13 @@ const usageOf = x => {
   if (!u) return null;
   const promptDetails = u.prompt_tokens_details || u.input_tokens_details || {};
   const completionDetails = u.completion_tokens_details || u.output_tokens_details || {};
-  const cacheRead = u.cache_read_input_tokens ?? u.cache_read_tokens ?? u.cached_tokens ?? promptDetails.cached_tokens ?? u.cachedContentTokenCount ?? 0;
+  // prompt_cache_hit_tokens/prompt_cache_miss_tokens is DeepSeek's own
+  // field naming for the same concept (their OpenAI-compat endpoint
+  // doesn't use cached_tokens) -- added 2026-08-17 alongside the
+  // OpenAI-style fields already handled below, so any DeepSeek route
+  // reports cache hits correctly too, not just OpenAI/Anthropic-shaped
+  // ones.
+  const cacheRead = u.cache_read_input_tokens ?? u.cache_read_tokens ?? u.cached_tokens ?? promptDetails.cached_tokens ?? u.cachedContentTokenCount ?? u.prompt_cache_hit_tokens ?? 0;
   const cacheWrite = u.cache_creation_input_tokens ?? u.cache_write_input_tokens ?? u.cache_write_tokens ?? promptDetails.cache_write_tokens ?? 0;
   return {
     input: u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0,
@@ -188,13 +194,43 @@ const usageOf = x => {
     reasoning: u.reasoning_tokens ?? completionDetails.reasoning_tokens ?? u.thoughtsTokenCount ?? 0
   };
 };
+
+// Fallback cache-pricing MULTIPLIERS (relative to a route's own `cost.input`)
+// for model families that support prompt caching but don't have explicit
+// cost.cache_read/cost.cache_write set in the MODEL_ROUTES_JSON* route
+// config. Added 2026-08-17: found gpt-5.6-sol/terra/luna's usage responses
+// already report real cache hits via prompt_tokens_details.cached_tokens
+// (OpenAI's standard automatic prompt-caching field, parsed by usageOf
+// above), but the routes had no cost.cache_read/cache_write set, so those
+// cached tokens were being silently billed at the FULL input rate --
+// caching was working upstream, we just weren't passing the discount
+// through. Ratios below are OpenAI's own official cached-token pricing
+// ratio, confirmed by cross-checking developers.openai.com/api/docs/pricing
+// against openai.com's gpt-5.6-sol prices ($5.00 input / $0.50 cached
+// input / $6.25 cache write / $30.00 output -- 0.50/5.00 = 0.1x,
+// 6.25/5.00 = 1.25x) and independently corroborated on the OpenAI
+// community forum for gpt-5.6-luna post price-cut ("1.25x for write
+// cache and 0.1x for read cache"). Only applied when the route's own
+// static cost config doesn't already specify a rate, so any
+// intentionally-configured route (e.g. Claude's, which already has real
+// cost.cache_read/cache_write) is completely unaffected.
+const CACHE_RATE_MULTIPLIERS_BY_PREFIX = [
+  ["gpt-5.6-", { cacheRead: 0.1, cacheWrite: 1.25 }],
+];
+function cacheRateMultipliersFor(routeId) {
+  for (const [prefix, multipliers] of CACHE_RATE_MULTIPLIERS_BY_PREFIX) {
+    if (routeId && routeId.startsWith(prefix)) return multipliers;
+  }
+  return null;
+}
 const costOf = (r, u) => {
   if (!u || !r.cost) return null;
   const cacheRead = Math.min(u.cache_read || 0, u.input || 0);
   const cacheWrite = Math.min(u.cache_write || 0, Math.max(0, (u.input || 0) - cacheRead));
   const uncachedInput = Math.max(0, (u.input || 0) - cacheRead - cacheWrite);
-  const cacheReadRate = r.cost.cache_read ?? r.cost.input ?? 0;
-  const cacheWriteRate = r.cost.cache_write ?? r.cost.input ?? 0;
+  const fallbackMultipliers = cacheRateMultipliersFor(r.id);
+  const cacheReadRate = r.cost.cache_read ?? (fallbackMultipliers ? (r.cost.input || 0) * fallbackMultipliers.cacheRead : (r.cost.input || 0));
+  const cacheWriteRate = r.cost.cache_write ?? (fallbackMultipliers ? (r.cost.input || 0) * fallbackMultipliers.cacheWrite : (r.cost.input || 0));
   return ((uncachedInput / 1e6) * (r.cost.input || 0) + (cacheRead / 1e6) * cacheReadRate + (cacheWrite / 1e6) * cacheWriteRate + ((u.output || 0) / 1e6) * (r.cost.output || 0)) * (r.billingMultiplier ?? 1);
 };
 
