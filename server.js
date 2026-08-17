@@ -79,10 +79,18 @@ const adminKeys = () => new Set((process.env.ADMIN_API_KEYS || "").split(",").ma
 // there with no way to recover them -- this adds a second slot, created
 // as type "encrypted" (still hidden by default in the dashboard, but
 // actually decryptable via the API), for all future one-off additions.
+// EXTRA_MODEL_ROUTES_JSON_3: same story again -- checked 2026-08-17 via
+// the API's decrypt=true param and EXTRA_MODEL_ROUTES_JSON_2 also came
+// back type "sensitive"/decrypted:false, so it's just as unreadable as
+// the first one now (whether it got re-typed at some point or was never
+// actually "encrypted" as the comment above hoped). Same fix: a third
+// slot for new additions, verified as type "encrypted" (readable via
+// the API) when it was created this time.
 const configured = () => [
   ...(Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_2", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_2", []) : []),
+  ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_3", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_3", []) : []),
 ].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r }));
 const routes = () => {
   const m = new Map();
