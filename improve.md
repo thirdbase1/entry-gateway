@@ -169,3 +169,11 @@ the longer a session runs) and normal churn from tool results/workspace
 state changing the prefix. Worth measuring with the new per-request
 cacheRatio field over a real traffic sample before deciding whether a
 Gemini-style explicit layer is even justified for OpenAI-compat routes.
+
+## 2026-08-18: Reverted FreeModel cc./api. fast-failover addition
+
+Owner asked to revert the same-day FreeModel fast-failover route addition
+(commits 0f1a5af + 8af0670) -- reverted via `git revert 8af0670 0f1a5af`
+(commits c4c1a1a, addeaa7), pushed, redeployed. `/health` route count
+back to 46 (pre-change baseline), confirmed live. No other changes in
+this session were touched by the revert.
