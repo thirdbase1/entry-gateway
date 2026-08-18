@@ -307,15 +307,35 @@ function tieredCost(baseCost, totalInputTokens) {
 
 const costOf = (r, u) => {
   if (!u || !r.cost) return null;
-  // u.input from usageOf() is the request's TOTAL prompt token count
-  // (OpenAI/Anthropic/Gemini all report cached tokens as a SUBSET of this,
-  // not an addition to it), so it's already the right value to compare
-  // against a model's total-context pricing tier -- no need to add
-  // cache_read/cache_write back in.
-  const cost = tieredCost(r.cost, u.input || 0);
-  const cacheRead = Math.min(u.cache_read || 0, u.input || 0);
-  const cacheWrite = Math.min(u.cache_write || 0, Math.max(0, (u.input || 0) - cacheRead));
-  const uncachedInput = Math.max(0, (u.input || 0) - cacheRead - cacheWrite);
+  // CORRECTED 2026-08-18: this used to assume input_tokens is the TOTAL
+  // prompt size with cache_read/cache_write as a SUBSET of it, for every
+  // protocol. That's true for OpenAI/DeepSeek/Gemini, but FALSE for
+  // Anthropic -- its Messages API reports input_tokens,
+  // cache_creation_input_tokens, and cache_read_input_tokens as three
+  // mutually exclusive, ADDITIVE buckets (confirmed via Anthropic's own
+  // prompt-caching docs). This was dormant and harmless while
+  // cache_read/cache_write were always captured as 0 for Anthropic (see
+  // the usageOf() fix above) -- now that real cache counts are captured,
+  // the old Math.min(cache_read, input) clamp would have thrown away
+  // almost the entire cache_read/cache_write count whenever the new
+  // turn's uncached input was small, which is the common case for a
+  // coding agent (most of the prompt is cached system/tool defs).
+  // Confirmed against real production data: claude-opus-5 showed
+  // input=8, cache_read=12684 -- the old clamp would bill for 8 cached
+  // tokens instead of 12684.
+  const isAnthropic = r.protocol === "anthropic-messages";
+  const totalTokensForTiering = isAnthropic ? (u.input || 0) + (u.cache_read || 0) + (u.cache_write || 0) : (u.input || 0);
+  const cost = tieredCost(r.cost, totalTokensForTiering);
+  let cacheRead, cacheWrite, uncachedInput;
+  if (isAnthropic) {
+    cacheRead = u.cache_read || 0;
+    cacheWrite = u.cache_write || 0;
+    uncachedInput = u.input || 0;
+  } else {
+    cacheRead = Math.min(u.cache_read || 0, u.input || 0);
+    cacheWrite = Math.min(u.cache_write || 0, Math.max(0, (u.input || 0) - cacheRead));
+    uncachedInput = Math.max(0, (u.input || 0) - cacheRead - cacheWrite);
+  }
   const fallbackMultipliers = cacheRateMultipliersFor(r.id);
   const cacheReadRate = cost.cache_read ?? (fallbackMultipliers ? (cost.input || 0) * fallbackMultipliers.cacheRead : (cost.input || 0));
   const cacheWriteRate = cost.cache_write ?? (fallbackMultipliers ? (cost.input || 0) * fallbackMultipliers.cacheWrite : (cost.input || 0));

@@ -339,12 +339,19 @@ function serializeFromRedis(c, status, lat, ttft) {
       cacheWrite: Number(c.tokensCacheWrite) || 0,
       reasoning: Number(c.tokensReasoning) || 0,
       total: (Number(c.tokensInput) || 0) + (Number(c.tokensOutput) || 0),
-      // input already includes cache_read as a subset (every provider's usage
-      // schema reports it that way -- see the comment above cacheOf in
-      // server.js), so this is a true hit-rate over total input, not over
-      // uncached input only. 0 when there's no input yet, not NaN/Infinity.
-      cacheHitRate: (Number(c.tokensInput) || 0) > 0
-        ? Number(((Number(c.tokensCacheRead) || 0) / (Number(c.tokensInput) || 0)).toFixed(4))
+      // CORRECTED 2026-08-18: "input includes cache_read as a subset" is
+      // only true for OpenAI/DeepSeek/Gemini -- Anthropic reports
+      // input_tokens, cache_creation_input_tokens, and
+      // cache_read_input_tokens as three separate ADDITIVE buckets (see
+      // costOf()'s comment in server.js), so cacheRead can legitimately
+      // exceed input for a Claude route, which produced nonsensical >100%
+      // hit rates here before this fix. This aggregate bucket has no
+      // per-request protocol tag, so use a denominator that's correct
+      // either way (input + cacheRead + cacheWrite) and clamp to [0,1] as
+      // a belt-and-suspenders guard against any other provider-specific
+      // surprise.
+      cacheHitRate: (Number(c.tokensInput) || 0) + (Number(c.tokensCacheRead) || 0) + (Number(c.tokensCacheWrite) || 0) > 0
+        ? Number(Math.min(1, (Number(c.tokensCacheRead) || 0) / ((Number(c.tokensInput) || 0) + (Number(c.tokensCacheRead) || 0) + (Number(c.tokensCacheWrite) || 0))).toFixed(4))
         : 0,
     },
     estimatedSpend: Number(Number(c.estimatedSpend || 0).toFixed(6)),
@@ -370,8 +377,8 @@ function serializeFromMem(b) {
       cacheWrite: c.tokensCacheWrite || 0,
       reasoning: c.tokensReasoning || 0,
       total: (c.tokensInput || 0) + (c.tokensOutput || 0),
-      cacheHitRate: (c.tokensInput || 0) > 0
-        ? Number(((c.tokensCacheRead || 0) / (c.tokensInput || 0)).toFixed(4))
+      cacheHitRate: (c.tokensInput || 0) + (c.tokensCacheRead || 0) + (c.tokensCacheWrite || 0) > 0
+        ? Number(Math.min(1, (c.tokensCacheRead || 0) / ((c.tokensInput || 0) + (c.tokensCacheRead || 0) + (c.tokensCacheWrite || 0))).toFixed(4))
         : 0,
     },
     estimatedSpend: Number((c.estimatedSpend || 0).toFixed(6)),
