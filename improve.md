@@ -130,3 +130,42 @@ it's safe regardless of what's actually configured there.
 Lesson: when a route config has a field, grep the actual billing code to
 confirm it's read, not just that it parses as valid JSON. Config and code
 can silently drift apart.
+
+## 2026-08-18: Cache observability added; prefix-optimization is a real, separate follow-up
+
+External review (accurate) pointed out: the gateway correctly bills
+whatever cache hits an upstream reports, but for OpenAI-compatible routes
+(GPT-5.6 sol/terra/luna) it has no explicit cache-control/prefix-management
+layer -- unlike Gemini, which has gemini-cache.js actively creating and
+reusing a persistent cachedContents resource. GPT-5.6 caching is entirely
+upstream-automatic; the gateway just forwards the request as-is and reads
+whatever prompt_tokens_details.cached_tokens comes back.
+
+Verdict after checking the actual code: correct. This was cache-price
+*accounting*, not cache-hit *optimization* -- confirmed by re-reading
+today's own tiered-pricing commit.
+
+Shipped now (cheap, uses data already being collected, no new tracking):
+- Per-request `cache: {inputTokens, cachedTokens, cacheWriteTokens,
+  cacheRatio, cacheStatus}` on every request log line (server.js).
+- `tokens.cacheHitRate` on every /metrics bucket (global/provider/model) --
+  metrics-store.js already tracked cacheRead/input counters, this just
+  exposes the ratio instead of making callers compute it themselves.
+- `estimatedCacheSavingsUsd` per model in /metrics -- reuses
+  cacheRateMultipliersFor so it can never drift from what costOf() actually
+  billed.
+
+NOT done (deliberately, needs its own dedicated investigation): actively
+guaranteeing a maximally-reusable prompt prefix for OpenAI-compatible
+routes. Checked entry-agents' prompt construction (buildSystemPrompt +
+addCacheControl in packages/agent/open-agent.ts) -- system prompt is
+static, dynamic content appended after, and addCacheControl only inserts
+explicit cache_control breakpoints for Anthropic's protocol (correct,
+since OpenAI's caching is automatic-only, no client-side control exists
+to set). So there's no obvious client-side bug causing the low cache
+ratio -- more likely causes are conversation length distribution
+(automatic caching only pays off past ~1024 stable tokens and gets better
+the longer a session runs) and normal churn from tool results/workspace
+state changing the prefix. Worth measuring with the new per-request
+cacheRatio field over a real traffic sample before deciding whether a
+Gemini-style explicit layer is even justified for OpenAI-compat routes.

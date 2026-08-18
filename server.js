@@ -304,6 +304,31 @@ const startTime = Date.now();
 
 const log = x => process.env.REQUEST_LOG !== "false" && console.log(JSON.stringify({ type: "request", at: new Date().toISOString(), ...x }));
 
+// Per-request cache summary attached to the request log line (see the
+// call site in handle() below) -- input already includes cache_read as a
+// subset (every provider's usage schema reports it that way, see the
+// comment in usageOf above), so cacheRatio is share-of-total-input, not
+// share-of-uncached-input. Returns null when there's no usage at all
+// (failed/aborted requests) so log lines for those don't carry a
+// misleading cache: {ratio: 0} that looks like a real cache miss.
+function cacheSummary(usage) {
+  if (!usage) return null;
+  const input = usage.input || 0;
+  const cacheRead = usage.cache_read || 0;
+  const ratio = input > 0 ? cacheRead / input : 0;
+  return {
+    inputTokens: input,
+    cachedTokens: cacheRead,
+    cacheWriteTokens: usage.cache_write || 0,
+    cacheRatio: Number(ratio.toFixed(4)),
+    // "hit" if any meaningful fraction of input came from cache, "miss" if
+    // there was cacheable-looking input (i.e. any input at all) but none of
+    // it hit, "n/a" for the (rare) zero-input case. Threshold is loose on
+    // purpose -- this is a human-scannable log tag, not a billing figure.
+    cacheStatus: input === 0 ? "n/a" : cacheRead > 0 ? "hit" : "miss",
+  };
+}
+
 // ─── Proxy ────────────────────────────────────────────────────────────────────
 
 async function proxy(req, res, r, p, model, action, id, isFallback) {
@@ -435,7 +460,7 @@ async function proxy(req, res, r, p, model, action, id, isFallback) {
 
     await recordBreakerSuccess(provider, model);
     await recordRequest(provider, model, response.status, latencyMs, ttft, usage, estimatedCost, isFallback);
-    log({ requestId: id, model, protocol: p, provider, status: response.status, latencyMs, ttftMs: ttft, usage, estimatedCost, isFallback });
+    log({ requestId: id, model, protocol: p, provider, status: response.status, latencyMs, ttftMs: ttft, usage, cache: cacheSummary(usage), estimatedCost, isFallback });
   } catch (e) {
     await recordBreakerFailure(provider, model);
     await recordUpstreamError(provider, model);
@@ -505,6 +530,27 @@ app.get("/metrics", adminAuth, async (_req, res) => {
   const configuredModels = [...new Set(allRoutes.map(r => r.id))];
 
   const snapshot = await getMetricsSnapshot(configuredProviders, configuredModels);
+
+  // Attach estimatedCacheSavingsUsd per model: what those cacheRead tokens
+  // WOULD have cost at the route's full input rate, minus what they
+  // actually cost at the route's real cache-read rate (same precedence --
+  // explicit cost.cache_read first, else the CACHE_RATE_MULTIPLIERS_BY_PREFIX
+  // fallback, else full input rate / no discount at all) -- reuses
+  // cacheRateMultipliersFor so this can never drift from what costOf()
+  // actually billed. Only meaningful per-model (a single, known cost
+  // config); global/byProvider mix models with different rates, so no
+  // savings figure is attached there.
+  for (const [modelId, bucket] of Object.entries(snapshot.byModel)) {
+    const route = allRoutes.find(r => r.id === modelId);
+    const cacheRead = bucket.tokens.cacheRead || 0;
+    if (!route?.cost?.input || cacheRead === 0) {
+      bucket.estimatedCacheSavingsUsd = 0;
+      continue;
+    }
+    const fallback = cacheRateMultipliersFor(route.id);
+    const cacheReadRate = route.cost.cache_read ?? (fallback ? route.cost.input * fallback.cacheRead : route.cost.input);
+    bucket.estimatedCacheSavingsUsd = Number((((route.cost.input - cacheReadRate) * cacheRead) / 1e6).toFixed(6));
+  }
 
   res.json({
     uptime: Math.floor((Date.now() - startTime) / 1000),

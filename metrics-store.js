@@ -339,6 +339,13 @@ function serializeFromRedis(c, status, lat, ttft) {
       cacheWrite: Number(c.tokensCacheWrite) || 0,
       reasoning: Number(c.tokensReasoning) || 0,
       total: (Number(c.tokensInput) || 0) + (Number(c.tokensOutput) || 0),
+      // input already includes cache_read as a subset (every provider's usage
+      // schema reports it that way -- see the comment above cacheOf in
+      // server.js), so this is a true hit-rate over total input, not over
+      // uncached input only. 0 when there's no input yet, not NaN/Infinity.
+      cacheHitRate: (Number(c.tokensInput) || 0) > 0
+        ? Number(((Number(c.tokensCacheRead) || 0) / (Number(c.tokensInput) || 0)).toFixed(4))
+        : 0,
     },
     estimatedSpend: Number(Number(c.estimatedSpend || 0).toFixed(6)),
     latency: percentiles(lat),
@@ -363,6 +370,9 @@ function serializeFromMem(b) {
       cacheWrite: c.tokensCacheWrite || 0,
       reasoning: c.tokensReasoning || 0,
       total: (c.tokensInput || 0) + (c.tokensOutput || 0),
+      cacheHitRate: (c.tokensInput || 0) > 0
+        ? Number(((c.tokensCacheRead || 0) / (c.tokensInput || 0)).toFixed(4))
+        : 0,
     },
     estimatedSpend: Number((c.estimatedSpend || 0).toFixed(6)),
     latency: percentiles(b.lat),
