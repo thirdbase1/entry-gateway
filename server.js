@@ -182,7 +182,20 @@ const headers = (r, p) => {
   return h;
 };
 const usageOf = x => {
-  const u = x?.usage || x?.response?.usage || x?.usageMetadata;
+  // Anthropic's streaming Messages API only reports cache_creation_input_tokens
+  // and cache_read_input_tokens on the message_start event, and there they're
+  // nested at message_start.message.usage -- NOT top-level x.usage like every
+  // other event (message_delta) or non-streaming response. Without checking
+  // x.message?.usage here, message_start's usage object was never found, so
+  // every Claude cache_read/cache_write count was silently lost for ANY
+  // streaming Claude call (confirmed 2026-08-18: claude-sonnet-4.5 showed
+  // 30.5M input tokens but a flat 0 cache_read across all of it in
+  // production /metrics, despite the app's own addCacheControl() correctly
+  // requesting prompt caching on every request -- caching was genuinely
+  // happening upstream, this gateway just never read the field reporting it).
+  // Confirmed against Anthropic's docs: cache fields only ever appear on
+  // message_start (streaming) or the single response.usage (non-streaming).
+  const u = x?.usage || x?.response?.usage || x?.usageMetadata || x?.message?.usage;
   if (!u) return null;
   const promptDetails = u.prompt_tokens_details || u.input_tokens_details || {};
   const completionDetails = u.completion_tokens_details || u.output_tokens_details || {};
@@ -202,6 +215,26 @@ const usageOf = x => {
     reasoning: u.reasoning_tokens ?? completionDetails.reasoning_tokens ?? u.thoughtsTokenCount ?? 0
   };
 };
+
+// Merges usage across SSE events instead of last-non-null-wins. Anthropic's
+// message_start (has real cache_read/cache_creation, only output_tokens=1)
+// arrives BEFORE message_delta (cumulative output_tokens, but no cache
+// fields at all -- see usageOf's comment above), so simply overwriting with
+// the latest non-null usageOf() result clobbered message_start's real cache
+// counts with message_delta's zeroed-out ones. Every field only grows or
+// stays flat across one response's events, so taking the max per-field
+// across all events seen is always correct and never double-counts.
+function mergeUsage(prev, next) {
+  if (!next) return prev;
+  if (!prev) return next;
+  return {
+    input: Math.max(prev.input || 0, next.input || 0),
+    output: Math.max(prev.output || 0, next.output || 0),
+    cache_read: Math.max(prev.cache_read || 0, next.cache_read || 0),
+    cache_write: Math.max(prev.cache_write || 0, next.cache_write || 0),
+    reasoning: Math.max(prev.reasoning || 0, next.reasoning || 0),
+  };
+}
 
 // Fallback cache-pricing MULTIPLIERS (relative to a route's own `cost.input`)
 // for model families that support prompt caching but don't have explicit
@@ -446,12 +479,12 @@ async function proxy(req, res, r, p, model, action, id, isFallback) {
         buffer = lines.pop() ?? ""; // keep the last (possibly incomplete) line for next round
         for (const line of lines)
           if (line.startsWith("data:") && line.slice(5).trim() !== "[DONE]")
-            try { usage = usageOf(JSON.parse(line.slice(5).trim())) || usage; } catch {}
+            try { usage = mergeUsage(usage, usageOf(JSON.parse(line.slice(5).trim()))); } catch {}
         res.write(value);
       }
       // Flush any trailing partial line left in the buffer after the stream ends.
       if (buffer.startsWith("data:") && buffer.slice(5).trim() !== "[DONE]")
-        try { usage = usageOf(JSON.parse(buffer.slice(5).trim())) || usage; } catch {}
+        try { usage = mergeUsage(usage, usageOf(JSON.parse(buffer.slice(5).trim()))); } catch {}
       res.end();
     }
 
