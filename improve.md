@@ -169,3 +169,42 @@ the longer a session runs) and normal churn from tool results/workspace
 state changing the prefix. Worth measuring with the new per-request
 cacheRatio field over a real traffic sample before deciding whether a
 Gemini-style explicit layer is even justified for OpenAI-compat routes.
+
+## 2026-08-18: FreeModel cc./api. endpoints added as fast-failover routes
+
+Added `EXTRA_MODEL_ROUTES_JSON_4` (encrypted, readable) as a 4th additive
+routes slot, per owner request to wire in two new FreeModel endpoints:
+
+- `https://cc.freemodel.dev/v1` -- all 7 live Claude model ids
+  (claude-opus-5, claude-opus-4-6/4-7/4-8, claude-sonnet-5,
+  claude-sonnet-4-6, claude-haiku-4-5-20251001), priority 10,
+  `timeoutMs: 5000`.
+- `https://api.freemodel.dev/v1` -- gpt-5.6-sol/terra/luna, as a second
+  candidate alongside the existing `vip-sg.freemodel.dev` one already in
+  slot 3, priority 50, `timeoutMs: 5000`.
+
+All entries `protocol: "openai-chat"` -- confirmed entry-agents' single
+`createOpenAI()` client always calls the gateway's OpenAI-chat-shaped
+endpoint regardless of underlying model (see model-reasoning.ts), so an
+`anthropic-messages` route would never actually get selected for these
+ids even for Claude.
+
+This is purely additive -- whatever currently serves each model in the
+unreadable MODEL_ROUTES_JSON/_2/_3 stays untouched and simply becomes
+the automatic fallback via `handle()`'s existing priority-sorted retry
+loop. The `timeoutMs: 5000` on the new routes (vs. the 120s default) is
+what makes a hung/dead endpoint fail over fast -- plain connection
+refusals already fail near-instantly at the TCP layer regardless.
+
+Cost figures for the Claude entries are Anthropic's official published
+per-model pricing (platform.claude.com/docs/en/about-claude/pricing,
+checked 2026-08-18) -- opus-5/4-6/4-7/4-8 $5/$25 ($0.50 cache read/$6.25
+cache write), sonnet-5 $2/$10 ($0.20/$2.50), sonnet-4-6 $3/$15
+($0.30/$3.75), haiku-4-5 $1/$5 ($0.10/$1.25) -- copied verbatim so
+billing stays correct regardless of which candidate actually serves a
+given request. gpt-5.6 cost figures copied as-is from the existing
+slot-3 entries.
+
+Verified live via `/health`: `routes` count went from 46 to 56 (+10,
+exactly the new entries) and all 7 claude-* ids still show in
+`routedModels`. Deployed commit 0f1a5af.
