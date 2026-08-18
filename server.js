@@ -224,6 +224,19 @@ const usageOf = x => {
 // cost.cache_read/cache_write) is completely unaffected.
 const CACHE_RATE_MULTIPLIERS_BY_PREFIX = [
   ["gpt-5.6-", { cacheRead: 0.1, cacheWrite: 1.25 }],
+  // Added 2026-08-18: Gemini models on OpenCode Zen bill cached reads at a
+  // flat 10% of the input rate across every variant (3.7/3.6/3.5/3.5-lite/
+  // 3.1-pro/3-flash all show this exact ratio on opencode.ai/docs/zen's own
+  // pricing table), and never report cache_write tokens at all (Gemini's
+  // caching is automatic/implicit -- there's no explicit cache-creation
+  // step like Anthropic's, so u.cache_write is always 0 for this family
+  // regardless of what rate we'd apply to it). This is a safety-net
+  // default for any gemini-*/gemma-* route that doesn't have its own
+  // explicit cost.cache_read set in MODEL_ROUTES_JSON*; routes that
+  // already carry a real cache_read are unaffected (same precedence rule
+  // as the gpt-5.6- entry above).
+  ["gemini-", { cacheRead: 0.1, cacheWrite: 0 }],
+  ["gemma-", { cacheRead: 0.1, cacheWrite: 0 }],
 ];
 function cacheRateMultipliersFor(routeId) {
   for (const [prefix, multipliers] of CACHE_RATE_MULTIPLIERS_BY_PREFIX) {
@@ -231,15 +244,49 @@ function cacheRateMultipliersFor(routeId) {
   }
   return null;
 }
+
+// Matches cost-object keys like "context_over_200k" or "context_over_272k".
+// Added 2026-08-18: found this convention already present in live route
+// data (grok-4.5's context_over_200k) but costOf() below never actually
+// read it -- so that tier was configured and completely inert since
+// whenever it was added. Generalized here instead of hardcoding one
+// model's threshold, since gpt-5.6-sol/terra/luna need the same treatment
+// at a different cutoff (272K, per opencode.ai/docs/zen's own pricing
+// table) and any future tiered model can just add its own
+// context_over_Nk key to cost{} with no code change.
+const CONTEXT_TIER_KEY_RE = /^context_over_(\d+)k$/i;
+function tieredCost(baseCost, totalInputTokens) {
+  let winningThreshold = -1;
+  let winningTier = null;
+  for (const key of Object.keys(baseCost)) {
+    const m = CONTEXT_TIER_KEY_RE.exec(key);
+    if (!m) continue;
+    const thresholdTokens = Number(m[1]) * 1000;
+    if (totalInputTokens > thresholdTokens && thresholdTokens > winningThreshold) {
+      winningThreshold = thresholdTokens;
+      winningTier = baseCost[key];
+    }
+  }
+  // Tier objects only need to override what changes (e.g. just input/output);
+  // anything they omit (like cache_read) falls back to the base rate.
+  return winningTier ? { ...baseCost, ...winningTier } : baseCost;
+}
+
 const costOf = (r, u) => {
   if (!u || !r.cost) return null;
+  // u.input from usageOf() is the request's TOTAL prompt token count
+  // (OpenAI/Anthropic/Gemini all report cached tokens as a SUBSET of this,
+  // not an addition to it), so it's already the right value to compare
+  // against a model's total-context pricing tier -- no need to add
+  // cache_read/cache_write back in.
+  const cost = tieredCost(r.cost, u.input || 0);
   const cacheRead = Math.min(u.cache_read || 0, u.input || 0);
   const cacheWrite = Math.min(u.cache_write || 0, Math.max(0, (u.input || 0) - cacheRead));
   const uncachedInput = Math.max(0, (u.input || 0) - cacheRead - cacheWrite);
   const fallbackMultipliers = cacheRateMultipliersFor(r.id);
-  const cacheReadRate = r.cost.cache_read ?? (fallbackMultipliers ? (r.cost.input || 0) * fallbackMultipliers.cacheRead : (r.cost.input || 0));
-  const cacheWriteRate = r.cost.cache_write ?? (fallbackMultipliers ? (r.cost.input || 0) * fallbackMultipliers.cacheWrite : (r.cost.input || 0));
-  return ((uncachedInput / 1e6) * (r.cost.input || 0) + (cacheRead / 1e6) * cacheReadRate + (cacheWrite / 1e6) * cacheWriteRate + ((u.output || 0) / 1e6) * (r.cost.output || 0)) * (r.billingMultiplier ?? 1);
+  const cacheReadRate = cost.cache_read ?? (fallbackMultipliers ? (cost.input || 0) * fallbackMultipliers.cacheRead : (cost.input || 0));
+  const cacheWriteRate = cost.cache_write ?? (fallbackMultipliers ? (cost.input || 0) * fallbackMultipliers.cacheWrite : (cost.input || 0));
+  return ((uncachedInput / 1e6) * (cost.input || 0) + (cacheRead / 1e6) * cacheReadRate + (cacheWrite / 1e6) * cacheWriteRate + ((u.output || 0) / 1e6) * (cost.output || 0)) * (r.billingMultiplier ?? 1);
 };
 
 // ─── Metrics + circuit breakers ──────────────────────────────────────────────
