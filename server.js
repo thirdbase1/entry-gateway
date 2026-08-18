@@ -86,19 +86,11 @@ const adminKeys = () => new Set((process.env.ADMIN_API_KEYS || "").split(",").ma
 // actually "encrypted" as the comment above hoped). Same fix: a third
 // slot for new additions, verified as type "encrypted" (readable via
 // the API) when it was created this time.
-// EXTRA_MODEL_ROUTES_JSON_4: added 2026-08-18 for FreeModel's dedicated
-// per-protocol endpoints (cc.freemodel.dev for Claude models,
-// api.freemodel.dev as a second OpenAI-compatible endpoint alongside the
-// existing vip-sg.freemodel.dev one) so a hung/slow endpoint fails over
-// to the other within the route's own timeoutMs instead of the 120s
-// default -- see the low timeoutMs on those route entries. Verified type
-// "encrypted" (readable) at creation time, same as slot 3.
 const configured = () => [
   ...(Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_2", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_2", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_3", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_3", []) : []),
-  ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_4", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_4", []) : []),
 ].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r }));
 const routes = () => {
   const m = new Map();
