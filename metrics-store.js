@@ -339,17 +339,19 @@ function serializeFromRedis(c, status, lat, ttft) {
       cacheWrite: Number(c.tokensCacheWrite) || 0,
       reasoning: Number(c.tokensReasoning) || 0,
       total: (Number(c.tokensInput) || 0) + (Number(c.tokensOutput) || 0),
-      // CORRECTED 2026-08-18: "input includes cache_read as a subset" is
-      // only true for OpenAI/DeepSeek/Gemini -- Anthropic reports
-      // input_tokens, cache_creation_input_tokens, and
-      // cache_read_input_tokens as three separate ADDITIVE buckets (see
-      // costOf()'s comment in server.js), so cacheRead can legitimately
-      // exceed input for a Claude route, which produced nonsensical >100%
-      // hit rates here before this fix. This aggregate bucket has no
-      // per-request protocol tag, so use a denominator that's correct
-      // either way (input + cacheRead + cacheWrite) and clamp to [0,1] as
-      // a belt-and-suspenders guard against any other provider-specific
-      // surprise.
+      // CORRECTED 2026-08-18 (twice): the caller (server.js) now feeds this
+      // store an already-normalized usage object where tokensInput is
+      // TRUE uncached-only input for every protocol (see cacheBreakdownOf()
+      // in server.js) -- Anthropic's additive-vs-subset distinction is
+      // resolved BEFORE it reaches here, not re-derived at read time. That
+      // first attempt at a protocol-agnostic formula here
+      // (Math.min(1, cacheRead / (input+cacheRead+cacheWrite))) silently
+      // broke DeepSeek's real hit rate (89.94% -> 47.35%) by adding
+      // cacheRead into the denominator on top of an input that (at the
+      // time) still included it as a subset -- double-counting it. Now
+      // that input is guaranteed uncached-only at the source, this same
+      // formula is simply correct for every protocol, no clamp needed
+      // (kept as a defensive guard only).
       cacheHitRate: (Number(c.tokensInput) || 0) + (Number(c.tokensCacheRead) || 0) + (Number(c.tokensCacheWrite) || 0) > 0
         ? Number(Math.min(1, (Number(c.tokensCacheRead) || 0) / ((Number(c.tokensInput) || 0) + (Number(c.tokensCacheRead) || 0) + (Number(c.tokensCacheWrite) || 0))).toFixed(4))
         : 0,

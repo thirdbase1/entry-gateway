@@ -305,37 +305,48 @@ function tieredCost(baseCost, totalInputTokens) {
   return winningTier ? { ...baseCost, ...winningTier } : baseCost;
 }
 
+// Normalizes a route's raw usageOf() output into TRUE, mutually-exclusive
+// buckets: uncachedInput (never includes cache_read/cache_write),
+// cacheRead, cacheWrite. CORRECTED 2026-08-18: this used to assume
+// input_tokens is the TOTAL prompt size with cache_read/cache_write as a
+// SUBSET of it, for every protocol. That's true for OpenAI/DeepSeek/Gemini
+// (confirmed against DeepSeek's real 89.94% hit rate and Gemini's own
+// context-caching docs: promptTokenCount already includes
+// cachedContentTokenCount), but FALSE for Anthropic -- its Messages API
+// reports input_tokens, cache_creation_input_tokens, and
+// cache_read_input_tokens as three mutually exclusive, ADDITIVE buckets
+// (confirmed via Anthropic's own prompt-caching docs). This was dormant
+// and harmless while cache_read/cache_write were always captured as 0 for
+// Anthropic (see the usageOf() fix above) -- now that real cache counts
+// are captured, the old Math.min(cache_read, input) clamp would have
+// thrown away almost the entire cache_read/cache_write count whenever the
+// new turn's uncached input was small, which is the common case for a
+// coding agent (most of the prompt is cached system/tool defs). Confirmed
+// against real production data: claude-opus-5 showed input=8,
+// cache_read=12684 -- the old clamp would bill for 8 cached tokens
+// instead of 12684.
+//
+// Both costOf() (billing) and recordRequest() (metrics/cacheHitRate) now
+// consume THIS normalized breakdown instead of raw usage, so the two
+// never disagree and metrics-store.js's cacheHitRate formula can stay a
+// single, protocol-agnostic cacheRead/(uncachedInput+cacheRead+cacheWrite)
+// without re-deriving protocol assumptions at read time.
+function cacheBreakdownOf(r, u) {
+  if (!u) return { uncachedInput: 0, cacheRead: 0, cacheWrite: 0 };
+  const isAnthropic = r.protocol === "anthropic-messages";
+  if (isAnthropic) {
+    return { uncachedInput: u.input || 0, cacheRead: u.cache_read || 0, cacheWrite: u.cache_write || 0 };
+  }
+  const cacheRead = Math.min(u.cache_read || 0, u.input || 0);
+  const cacheWrite = Math.min(u.cache_write || 0, Math.max(0, (u.input || 0) - cacheRead));
+  const uncachedInput = Math.max(0, (u.input || 0) - cacheRead - cacheWrite);
+  return { uncachedInput, cacheRead, cacheWrite };
+}
+
 const costOf = (r, u) => {
   if (!u || !r.cost) return null;
-  // CORRECTED 2026-08-18: this used to assume input_tokens is the TOTAL
-  // prompt size with cache_read/cache_write as a SUBSET of it, for every
-  // protocol. That's true for OpenAI/DeepSeek/Gemini, but FALSE for
-  // Anthropic -- its Messages API reports input_tokens,
-  // cache_creation_input_tokens, and cache_read_input_tokens as three
-  // mutually exclusive, ADDITIVE buckets (confirmed via Anthropic's own
-  // prompt-caching docs). This was dormant and harmless while
-  // cache_read/cache_write were always captured as 0 for Anthropic (see
-  // the usageOf() fix above) -- now that real cache counts are captured,
-  // the old Math.min(cache_read, input) clamp would have thrown away
-  // almost the entire cache_read/cache_write count whenever the new
-  // turn's uncached input was small, which is the common case for a
-  // coding agent (most of the prompt is cached system/tool defs).
-  // Confirmed against real production data: claude-opus-5 showed
-  // input=8, cache_read=12684 -- the old clamp would bill for 8 cached
-  // tokens instead of 12684.
-  const isAnthropic = r.protocol === "anthropic-messages";
-  const totalTokensForTiering = isAnthropic ? (u.input || 0) + (u.cache_read || 0) + (u.cache_write || 0) : (u.input || 0);
-  const cost = tieredCost(r.cost, totalTokensForTiering);
-  let cacheRead, cacheWrite, uncachedInput;
-  if (isAnthropic) {
-    cacheRead = u.cache_read || 0;
-    cacheWrite = u.cache_write || 0;
-    uncachedInput = u.input || 0;
-  } else {
-    cacheRead = Math.min(u.cache_read || 0, u.input || 0);
-    cacheWrite = Math.min(u.cache_write || 0, Math.max(0, (u.input || 0) - cacheRead));
-    uncachedInput = Math.max(0, (u.input || 0) - cacheRead - cacheWrite);
-  }
+  const { uncachedInput, cacheRead, cacheWrite } = cacheBreakdownOf(r, u);
+  const cost = tieredCost(r.cost, uncachedInput + cacheRead + cacheWrite);
   const fallbackMultipliers = cacheRateMultipliersFor(r.id);
   const cacheReadRate = cost.cache_read ?? (fallbackMultipliers ? (cost.input || 0) * fallbackMultipliers.cacheRead : (cost.input || 0));
   const cacheWriteRate = cost.cache_write ?? (fallbackMultipliers ? (cost.input || 0) * fallbackMultipliers.cacheWrite : (cost.input || 0));
@@ -510,10 +521,18 @@ async function proxy(req, res, r, p, model, action, id, isFallback) {
 
     const latencyMs = Date.now() - started;
     const estimatedCost = costOf(r, usage);
+    // Feed metrics the SAME normalized (protocol-corrected) token
+    // breakdown costOf() just billed against, not the raw usageOf()
+    // output -- otherwise metrics-store's cacheHitRate would need to
+    // re-derive the Anthropic-additive-vs-subset distinction itself at
+    // read time with no protocol info available, which is exactly the
+    // bug that regressed DeepSeek's hit rate (89.94% -> 47.35%) when
+    // cacheHitRate's formula was first generalized. See cacheBreakdownOf().
+    const normalizedUsage = usage ? { ...usage, input: cacheBreakdownOf(r, usage).uncachedInput, cache_read: cacheBreakdownOf(r, usage).cacheRead, cache_write: cacheBreakdownOf(r, usage).cacheWrite } : usage;
 
     await recordBreakerSuccess(provider, model);
-    await recordRequest(provider, model, response.status, latencyMs, ttft, usage, estimatedCost, isFallback);
-    log({ requestId: id, model, protocol: p, provider, status: response.status, latencyMs, ttftMs: ttft, usage, cache: cacheSummary(usage), estimatedCost, isFallback });
+    await recordRequest(provider, model, response.status, latencyMs, ttft, normalizedUsage, estimatedCost, isFallback);
+    log({ requestId: id, model, protocol: p, provider, status: response.status, latencyMs, ttftMs: ttft, usage: normalizedUsage, cache: cacheSummary(normalizedUsage), estimatedCost, isFallback });
   } catch (e) {
     await recordBreakerFailure(provider, model);
     await recordUpstreamError(provider, model);
