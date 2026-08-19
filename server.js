@@ -714,11 +714,34 @@ function resolvedCostFor(r) {
   if (!r.cost) return r.cost;
   const fallback = cacheRateMultipliersFor(r.id);
   if (!fallback) return r.cost;
-  return {
+  const resolved = {
     ...r.cost,
     cache_read: r.cost.cache_read ?? (r.cost.input || 0) * fallback.cacheRead,
     cache_write: r.cost.cache_write ?? (r.cost.input || 0) * fallback.cacheWrite,
   };
+  // Also resolve cache_read/cache_write inside every context_over_Nk tier
+  // object, using THAT TIER's own (possibly higher) input rate -- not the
+  // base rate -- for the fallback multiplier. Added 2026-08-19 alongside
+  // the app-side fix that made resolveCostTier() (apps/web/lib/models.ts)
+  // actually match tiers other than the hardcoded 200k one: without this,
+  // a large-context gpt-5.6 request crossing into its 272k tier would
+  // apply the tier's higher input/output rate but still get the BASE
+  // tier's cache_read rate (e.g. luna's $0.02, from 0.1x of the $0.20
+  // base input) instead of the correct $0.04 (0.1x of the tier's $0.40
+  // input) -- a smaller, second-order version of the same
+  // undiscounted-relative-to-the-right-rate class of bug.
+  for (const key of Object.keys(resolved)) {
+    if (!CONTEXT_TIER_KEY_RE.test(key)) continue;
+    const tier = resolved[key];
+    if (!tier || (typeof tier.input !== "number" && typeof tier.output !== "number")) continue;
+    const tierInput = typeof tier.input === "number" ? tier.input : r.cost.input || 0;
+    resolved[key] = {
+      ...tier,
+      cache_read: tier.cache_read ?? (tierInput * fallback.cacheRead),
+      cache_write: tier.cache_write ?? (tierInput * fallback.cacheWrite),
+    };
+  }
+  return resolved;
 }
 
 app.get("/v1/models", auth, (_req, res) => {
