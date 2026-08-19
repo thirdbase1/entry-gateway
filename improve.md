@@ -177,3 +177,58 @@ Owner asked to revert the same-day FreeModel fast-failover route addition
 (commits c4c1a1a, addeaa7), pushed, redeployed. `/health` route count
 back to 46 (pre-change baseline), confirmed live. No other changes in
 this session were touched by the revert.
+
+## 2026-08-19: prompt_cache_key for gpt-5.6 FreeModel routes (stable cache affinity)
+
+Triggered by real production usage data from an 88-step gpt-5.6-luna
+session: overall cache hit rate was ~80%, but several consecutive steps
+showed ZERO cached tokens even though the immediately preceding step's
+full context should have been a cache hit (e.g. step 6 cached 67,072 of
+68,336 in; step 7's in only grew to 69,545 yet cached was 0 -- the whole
+67K-token prefix that was cached one step earlier should still have
+matched). Ruled out gateway-side load balancing first: `candidates()` is
+deterministic (sorted by `priority`, same route picked every time absent
+a circuit-breaker trip), so this isn't the gateway routing to different
+endpoints.
+
+Root cause: OpenAI's implicit/automatic prompt caching (used by
+gpt-5.6-family models, no explicit cache_control needed) is best-effort
+and depends on the request landing on the same backend machine that
+already holds the KV cache for that prefix. OpenAI's own docs describe
+`prompt_cache_key` (top-level Chat Completions param, common values are
+session/user IDs) as the mechanism for pinning that -- and nothing in
+the stack was ever sending it. Checked packages/agent/models.ts in
+entry-agents: `attributionHeaders` only carries app name/url, no
+session/chat id, so there was no existing identifier to forward even if
+the gateway wanted to pass one through as-is.
+
+Fix (server.js, `proxy()`): added `derivePromptCacheKey()`, which hashes
+the first user-role message's content (sha1, first 500 chars, truncated
+to 32 hex chars) as a synthetic session key -- stable across every step
+of one session (that message never changes/moves once the session
+starts) and differs across unrelated sessions. Injected into
+`outgoingBody.prompt_cache_key` only when: protocol is `openai-chat`,
+`route.provider === "freemodel"`, model id starts with `gpt-5.6`, and the
+caller hasn't already set one. Deliberately NOT derived from the system
+message -- that's byte-identical across every session of the same agent
+type, so keying on it would've collapsed all concurrent unrelated
+sessions onto one shard instead of giving each session its own affinity.
+Deliberately scoped narrowly (freemodel + gpt-5.6-* only, not the whole
+openai-chat protocol) since that protocol label is shared with Claude
+routes proxied through a translation layer that may not tolerate an
+OpenAI-specific field.
+
+Verified: `node --check` clean, and locally simulated the hash function
+against synthetic multi-step/multi-session message arrays to confirm the
+key is stable within a session (including across a multimodal
+content-array shape) and differs across sessions, plus null-safe when no
+user message exists (falls back to sending nothing, not throwing).
+Could not fire a real paid smoke-test call before shipping --
+`GATEWAY_API_KEYS`/`FREEMODEL_API_KEY` are both Vercel "Sensitive" type
+vars (write-only, unreadable via any API even to the project owner, same
+limitation hit before -- see the 2026-08-18 gpt-5.6 pricing entry above).
+Deployed via direct `vercel deploy --prod` (commit 9c17c91, dpl_9yPxuAk8);
+health check 200. Follow-up: watch cache-hit-rate metrics and the
+freemodel/gpt-5.6-* error rate over the next real traffic to confirm (a)
+FreeModel's upstream tolerates the extra field with no new errors and
+(b) the intermittent no-cache pattern actually goes away.
