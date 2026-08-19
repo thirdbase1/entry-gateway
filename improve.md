@@ -232,3 +232,58 @@ health check 200. Follow-up: watch cache-hit-rate metrics and the
 freemodel/gpt-5.6-* error rate over the next real traffic to confirm (a)
 FreeModel's upstream tolerates the extra field with no new errors and
 (b) the intermittent no-cache pattern actually goes away.
+
+## 2026-08-19: /v1/models exposed raw cost, silently overcharging real credit balances on gpt-5.6-*
+
+User did the manual math on the same usage-breakdown session used for
+the prompt_cache_key fix above and got $0.75 (with the 0.1x cache
+discount OpenAI publishes for gpt-5.6) vs the $2.43 the app actually
+showed/charged -- a ~3.2x overcharge, matching almost exactly what full
+undiscounted pricing on the same tokens would produce (~$2.46).
+
+Traced it: costOf() in this file (real gateway-side billing) already
+resolves CACHE_RATE_MULTIPLIERS_BY_PREFIX's fallback for gpt-5.6-*/
+gemini-*/gemma-* routes lacking an explicit cost.cache_read (added
+2026-08-17, see that entry above) -- but that resolution only happened
+*inside* costOf(). The `/v1/models` endpoint returned `route.cost`
+completely raw. entry-agents' own cost estimator
+(apps/web/lib/models.ts estimateModelUsageCost) fetches this exact
+endpoint as its ONLY pricing source, for both: (1) the UI's displayed
+"Usage breakdown" popover, and (2) the REAL credit-ledger debit
+(apps/web/app/workflows/chat-post-finish.ts, debitForModelUsage) --
+there's no separate real-billing path on the app side, both read the
+same catalog fetch. With cache_read undefined there, the estimator's
+`costTier?.cache_read ?? inputPrice` fallback billed 100% of cached
+tokens at the full input rate for real, out of users' actual account
+balance -- not a cosmetic display bug.
+
+Fix: added resolvedCostFor() in the /v1/models handler, reusing the same
+cacheRateMultipliersFor() fallback costOf() already applies, so the
+exposed catalog's cache_read/cache_write are never left undefined when
+only the fallback multiplier (not an explicit rate) applies. Fixes both
+the display and the real debit with one change since they share the
+same source. Deployed commit 53af209, dpl (entry-gateway-5lvdxw844),
+health check 200.
+
+Scope/impact: this has been live (mis-billing) since 2026-08-17, when
+the cache-discount fallback was added to costOf() but never mirrored
+into /v1/models -- i.e. since that date, EVERY gpt-5.6-sol/terra/luna
+request with a cache hit was overcharged, not just an edge case. Have
+NOT reconciled historical ledger entries yet -- unlike the tiny 2-account
+$15 case from 2026-08-18, this one likely spans many more real user
+accounts and a ~2-day window; needs the owner's decision on whether/how
+to look at scope and reconcile, same as the earlier "owner chose not to
+auto-adjust" precedent but potentially much larger $ this time.
+
+Also found (NOT fixed, separate follow-up): apps/web/lib/models.ts's
+`resolveCostTier` hardcodes the literal key `context_over_200k` (built
+for grok-4.5's threshold) instead of matching any `context_over_Nk` key
+generically the way this gateway's own tieredCost() does. gpt-5.6-sol/
+terra/luna's large-context tier lives under `context_over_272k`, so the
+app-side estimator/debit currently never applies it at all -- it always
+uses the base rate regardless of context size for those three models.
+Direction of error is the opposite of the cache bug (undercharges large-
+context gpt-5.6 requests, doesn't overcharge), and the hardcoded key
+appears in several more files (admin-usage.ts, admin-user-detail.ts,
+models-with-context.ts, settings/profile/page.tsx) -- a wider, separate
+change, deliberately not bundled into this fix.
