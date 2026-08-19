@@ -690,10 +690,41 @@ app.get("/metrics", adminAuth, async (_req, res) => {
   });
 });
 
+// Resolves a route's exposed `cost` so cache_read/cache_write are never
+// left undefined when a route only qualifies for the FALLBACK multiplier
+// (see CACHE_RATE_MULTIPLIERS_BY_PREFIX above) instead of its own explicit
+// rate. CRITICAL FIX 2026-08-19: this endpoint used to return `r.cost`
+// completely raw -- costOf() (real billing, this file) resolves the
+// fallback internally, but the entry-agents app's OWN cost estimator
+// (apps/web/lib/models.ts, `estimateModelUsageCost`) fetches this exact
+// /v1/models response as its pricing source, for BOTH the UI's displayed
+// "Usage breakdown" estimate AND the actual credit-ledger debit
+// (apps/web/app/workflows/chat-post-finish.ts, debitForModelUsage) --
+// there is no separate real-billing path on the app side. With
+// cache_read left undefined for gpt-5.6-*, its estimator's own
+// `costTier?.cache_read ?? inputPrice` fallback silently billed 100% of
+// cached tokens at the FULL input rate, for real, out of users' actual
+// credit balance -- not just a display glitch. Confirmed against real
+// usage data: an 88-step gpt-5.6-luna session with 9.5M of 11.9M input
+// tokens cache-hit was billed ~$2.43 (full-price-equivalent) instead of
+// the correct ~$0.75 with the discount applied. Baking the resolved rate
+// in here fixes both call sites (display + real debit) with one change,
+// without touching either of the app's cost-estimation functions.
+function resolvedCostFor(r) {
+  if (!r.cost) return r.cost;
+  const fallback = cacheRateMultipliersFor(r.id);
+  if (!fallback) return r.cost;
+  return {
+    ...r.cost,
+    cache_read: r.cost.cache_read ?? (r.cost.input || 0) * fallback.cacheRead,
+    cache_write: r.cost.cache_write ?? (r.cost.input || 0) * fallback.cacheWrite,
+  };
+}
+
 app.get("/v1/models", auth, (_req, res) => {
   const m = new Map();
   for (const r of routes().filter((r) => r.enabled !== false)) {
-    const x = m.get(r.id) || { id: r.id, object: "model", name: r.name || r.id, owned_by: r.provider || "gateway", protocols: [], context_window: r.context_window, cost: r.cost };
+    const x = m.get(r.id) || { id: r.id, object: "model", name: r.name || r.id, owned_by: r.provider || "gateway", protocols: [], context_window: r.context_window, cost: resolvedCostFor(r) };
     if (!x.protocols.includes(r.protocol)) x.protocols.push(r.protocol);
     m.set(r.id, x);
   }
