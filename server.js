@@ -1,5 +1,6 @@
 import express from "express";
 import { readFileSync } from "fs";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import {
@@ -393,6 +394,52 @@ function cacheSummary(usage) {
   };
 }
 
+
+// Derive a stable-per-conversation `prompt_cache_key` for OpenAI-family
+// routes. OpenAI's implicit/automatic caching for gpt-5.6+ models is
+// best-effort and depends on repeat requests landing on the SAME backend
+// machine that already holds the KV cache -- prompt_cache_key is OpenAI's
+// own documented mechanism for that ("common values include session IDs
+// and user IDs"), but nothing upstream of this gateway currently sends
+// any session identifier at all, so every request relies purely on luck.
+// Found via production usage data showing intermittent full-cache-misses
+// on gpt-5.6-luna even between consecutive steps of the same session
+// where the prior step's entire prefix should have been cacheable.
+//
+// We don't have a real session/chat id forwarded from the agent (nothing
+// upstream sends one -- see packages/agent/models.ts attributionHeaders,
+// which only carries app name/url, not anything session-scoped), so this
+// derives a synthetic one from the conversation's own content instead:
+// the first user-role message never changes for the life of a session
+// (it's the original task/turn-1 prompt, always present at the same
+// position in every subsequent request's message array since the agent
+// resends full history each step) and differs across unrelated sessions.
+// Hashing it gives a stable-per-session, differs-across-sessions key
+// without requiring any agent-side plumbing changes.
+//
+// Deliberately NOT derived from the system message: that's byte-identical
+// across EVERY session of the same agent type, so keying on it would
+// collapse all concurrent unrelated sessions onto one shard instead of
+// giving each session its own affinity.
+function derivePromptCacheKey(body) {
+  try {
+    const messages = Array.isArray(body?.messages) ? body.messages : [];
+    const firstUserMsg = messages.find(m => m?.role === "user");
+    if (!firstUserMsg) return null;
+    const raw = typeof firstUserMsg.content === "string"
+      ? firstUserMsg.content
+      : Array.isArray(firstUserMsg.content)
+        ? firstUserMsg.content.map(part => (typeof part?.text === "string" ? part.text : "")).join("")
+        : "";
+    if (!raw) return null;
+    // First 500 chars is plenty of entropy to disambiguate sessions while
+    // staying cheap to hash on every request.
+    return createHash("sha1").update(raw.slice(0, 500)).digest("hex").slice(0, 32);
+  } catch {
+    return null; // never let a derivation failure break the actual request
+  }
+}
+
 // ─── Proxy ────────────────────────────────────────────────────────────────────
 
 async function proxy(req, res, r, p, model, action, id, isFallback) {
@@ -428,6 +475,18 @@ async function proxy(req, res, r, p, model, action, id, isFallback) {
     p !== "gemini-generate" && r.upstreamModel && r.upstreamModel !== model
       ? { ...req.body, model: r.upstreamModel }
       : req.body;
+
+  // Pin gpt-5.6-family FreeModel requests to a stable per-session cache
+  // key so OpenAI's best-effort implicit caching has a real chance of
+  // hitting on every step, not just when luck lands us on the same
+  // backend machine. Scoped narrowly (freemodel + gpt-5.6-*) rather than
+  // blanket-applied to the whole openai-chat protocol, since that protocol
+  // label is also used for Claude routes proxied through a translation
+  // layer that may not tolerate -- or even want -- an OpenAI-specific field.
+  if (p === "openai-chat" && r.provider === "freemodel" && model.startsWith("gpt-5.6") && !outgoingBody.prompt_cache_key) {
+    const cacheKey = derivePromptCacheKey(req.body);
+    if (cacheKey) outgoingBody = { ...outgoingBody, prompt_cache_key: cacheKey };
+  }
 
   // Transparent Gemini explicit context caching (see gemini-cache.js for
   // the full rationale): if this request carries a systemInstruction big
