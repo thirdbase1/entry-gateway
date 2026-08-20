@@ -9,7 +9,9 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test *.test.js"
+    "test": "node --test *.test.js",
+    "test:abort": "node upstream-abort.test.js",
+    "test:fallback": "node --test fallback.test.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.38.2",
