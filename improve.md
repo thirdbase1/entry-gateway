@@ -288,7 +288,7 @@ appears in several more files (admin-usage.ts, admin-user-detail.ts,
 models-with-context.ts, settings/profile/page.tsx) -- a wider, separate
 change, deliberately not bundled into this fix.
 
-## Found 2026-08-20 (NOT fixed, open) — fallback loop doesn't check res.headersSent before retrying
+## Fixed 2026-08-20 — fallback loop didn't check res.headersSent before retrying
 
 While grounding a Base44-agent-authored architecture-review doc against
 the real code (entry-agents PR #8, docs/ENTRY_HARNESS_REVIEW.md), found a
@@ -341,6 +341,14 @@ if (!res.headersSent) res.status(502).json({ ... });
 else res.end(); // close the half-written stream cleanly
 ```
 
-Open follow-up, not bundled into any other change -- needs its own test
-(simulate a mid-stream upstream drop with 2+ configured candidates for
-the same model) before shipping.
+Fixed same day: handle()'s loop now checks `res.headersSent` at the top
+of each iteration and `break`s instead of attempting the next candidate;
+falls through to `res.end()` (clean close) instead of a 502 when headers
+were already sent. Added `fallback.test.js` (Node built-in `node:test`,
+zero new deps) -- spins up two fake local upstreams, one that sends SSE
+headers + a partial chunk then destroys the socket mid-stream, one
+healthy. Confirmed the test fails against the pre-fix code (`providerB:
+Cannot set headers after they are sent to the client`, connection hangs
+forever past a 5s safety timeout) and passes against the fix (candidate
+#2 receives zero requests, connection closes cleanly, client sees only
+candidate #1's partial data). `npm test` now runs this suite.

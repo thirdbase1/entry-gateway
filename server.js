@@ -615,6 +615,17 @@ async function handle(req, res) {
   if (!available.length) return res.status(404).json({ error: { type: "ModelError", message: `No ${p} route is configured for ${model}.` } });
   const failures = [];
   for (let i = 0; i < available.length; i++) {
+    // A previous candidate already sent headers (and possibly streamed
+    // partial body bytes) to the real client before failing mid-stream.
+    // Retrying here would call res.setHeader() on an already-sent
+    // response and throw ERR_HTTP_HEADERS_SENT, which used to get
+    // silently swallowed by the catch below as "just another failure" --
+    // leaving the client connection half-written and never closed. Fail
+    // closed instead: stop trying candidates and cleanly end the stream.
+    if (res.headersSent) {
+      console.error(JSON.stringify({ type: "upstream_mid_stream_failure", requestId: id, model, protocol: p, failures }));
+      break;
+    }
     const r = available[i];
     const provider = r.provider || r.upstreamApiKeyEnv || "unknown";
     if (available.length > 1 && (await isCircuitOpen(provider, model))) continue; // skip open circuits if alternatives exist
@@ -626,7 +637,16 @@ async function handle(req, res) {
       console.error(JSON.stringify({ type: "upstream_failure", requestId: id, model, protocol: p, provider, error: e.message }));
     }
   }
-  if (!res.headersSent) res.status(502).json({ error: { type: "UpstreamError", message: "All compatible upstream routes failed.", requestId: id, failures } });
+  if (!res.headersSent) {
+    res.status(502).json({ error: { type: "UpstreamError", message: "All compatible upstream routes failed.", requestId: id, failures } });
+  } else if (!res.writableEnded) {
+    // Headers (and likely partial body) already went out on a prior
+    // candidate that then failed mid-stream. There is no way to signal
+    // an error to the client inside an already-started SSE/JSON stream,
+    // so the best we can do is close the connection cleanly instead of
+    // leaving it hanging open forever.
+    res.end();
+  }
 }
 
 // ─── Endpoints ───────────────────────────────────────────────────────────────
