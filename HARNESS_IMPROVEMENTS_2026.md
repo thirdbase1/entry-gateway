@@ -8,32 +8,29 @@ Research-backed changes against current agent-harness practice (identity, durabl
 
 **Problem.** Upstream `fetch` used only `AbortSignal.timeout(...)`. A client that navigated away mid-SSE left the provider call running until the hard timeout (default 120s). That wastes tokens, burns rate-limit budget, and keeps `activeStreams` inflated under load.
 
-**Fix.** In `proxy()`:
+**Fix.**
 
-1. Build a single `AbortController` for both timeout and client disconnect.
-2. Attach `req`/`res` `"close"` listeners that abort with a structured `client_disconnect` log line.
-3. Pass `ac.signal` to upstream `fetch` instead of a bare timeout signal.
-4. In the SSE read loop, cancel the upstream reader when already aborted (no point draining).
-5. Clear the timeout and remove listeners in `finally`.
+1. New module `upstream-abort.js` exports `createUpstreamAbort()` — single `AbortController` for timeout **and** client disconnect (`req`/`res` `"close"`), with structured `client_disconnect` logging and `cleanup()`.
+2. `server.js` imports the helper, wires `upstreamAbort.signal` into upstream `fetch`, bails the SSE reader when aborted, and always calls `cleanup()` in `finally`.
+3. `upstream-abort.test.js` covers disconnect → aborted signal.
+4. Apply with: `bash scripts/apply-client-disconnect-abort.sh`
 
-**Compatibility.** The existing mid-stream fallback guard (`if (res.headersSent)`) is unchanged and remains the correct fail-closed behavior when a candidate already wrote bytes.
-
-**Apply:** `bash scripts/apply-client-disconnect-abort.sh` (or `patch -p1 < patches/client-disconnect-abort.patch`).
+**Compatibility.** The existing mid-stream fallback guard (`if (res.headersSent)`) is unchanged.
 
 ## Prior (already on main)
 
-- Fail closed after `headersSent` so priority fallback never retries once the client has received stream bytes (`ERR_HTTP_HEADERS_SENT` fixed).
+- Fail closed after `headersSent` so priority fallback never retries once the client has received stream bytes.
 
-## Recommended follow-ups (not in this PR)
+## Recommended follow-ups
 
-1. **Idempotency keys** on mutating tools + in-run result cache (Workflow step retries must not double-apply side effects).
-2. **Verification as a first-class step** after model “done” (test/typecheck/health gates; model self-report ≠ task complete).
-3. **Cost-aware routing hints** in agent `prepareCall` (exploration/subagents → cheaper tier; recovery → frontier).
-4. **Structured JSONL persistence** of the existing `log()` lines (request id, usage, cost, disconnect vs timeout).
-5. **Canonical model registry** so `/v1/models`, costing, and analytics share one pricing source.
+1. Idempotency keys on mutating tools + in-run result cache
+2. Verification as a first-class harness step
+3. Cost-aware routing hints in agent `prepareCall`
+4. Structured JSONL persistence of gateway `log()` lines
+5. Canonical model registry for pricing
 
 ## References
 
-- Datadog: AI gateway best practices (failover, circuit breakers, cancel abandoned work)
-- Vercel Workflow / WorkflowAgent: durable steps, client disconnect / resumable streams
-- Agent harness surveys 2026 (ETCLOVG; identity, durable state, tool policy, verification, audit)
+- Datadog: AI gateway best practices
+- Vercel Workflow / WorkflowAgent: durable steps, client disconnect
+- Agent harness surveys 2026 (ETCLOVG)
