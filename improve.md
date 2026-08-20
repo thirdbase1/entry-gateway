@@ -287,3 +287,60 @@ context gpt-5.6 requests, doesn't overcharge), and the hardcoded key
 appears in several more files (admin-usage.ts, admin-user-detail.ts,
 models-with-context.ts, settings/profile/page.tsx) -- a wider, separate
 change, deliberately not bundled into this fix.
+
+## Found 2026-08-20 (NOT fixed, open) — fallback loop doesn't check res.headersSent before retrying
+
+While grounding a Base44-agent-authored architecture-review doc against
+the real code (entry-agents PR #8, docs/ENTRY_HARNESS_REVIEW.md), found a
+real, reproducible reliability gap in `handle()`'s candidate-fallback
+loop:
+
+```js
+for (let i = 0; i < available.length; i++) {
+  try {
+    await proxy(req, res, r, p, model, action, id, i > 0);
+    return;
+  } catch (e) {
+    failures.push(`${provider}: ${e.message}`);
+  }
+}
+if (!res.headersSent) res.status(502).json({ ... });
+```
+
+`res.headersSent` is only checked on the final failure response, never
+before attempting the next candidate. `proxy()` calls
+`res.status(response.status).set("x-gateway-request-id", id)` then copies
+upstream headers via `res.setHeader(k, v)` before streaming the body. If
+candidate #1 fails partway through an SSE stream (headers already sent,
+some `res.write()` already flushed to the real client) and the loop falls
+through to candidate #2, that `proxy()` call hits `res.setHeader()` on an
+already-sent response -- Node throws `ERR_HTTP_HEADERS_SENT` synchronously.
+That throw gets caught by `handle()`'s own try/catch and recorded as just
+another failure; the loop keeps trying remaining candidates, each hitting
+the same error, until candidates are exhausted. At that point
+`res.headersSent` is `true` so the 502 branch is correctly skipped, but
+`res.end()` is never called either -- net effect: the real end user's
+connection is left half-written and never cleanly closed.
+
+Fix shape (not yet implemented): guard the retry attempt itself, not just
+the final failure response --
+
+```js
+for (let i = 0; i < available.length; i++) {
+  if (res.headersSent) break; // a previous candidate already started
+                               // streaming to the real client; fail
+                               // closed instead of corrupting the stream
+  try {
+    await proxy(req, res, r, p, model, action, id, i > 0);
+    return;
+  } catch (e) {
+    failures.push(`${provider}: ${e.message}`);
+  }
+}
+if (!res.headersSent) res.status(502).json({ ... });
+else res.end(); // close the half-written stream cleanly
+```
+
+Open follow-up, not bundled into any other change -- needs its own test
+(simulate a mid-stream upstream drop with 2+ configured candidates for
+the same model) before shipping.
