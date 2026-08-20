@@ -1,0 +1,60 @@
+--- a/server.js
++++ b/server.js
+@@ -511,12 +511,34 @@
+     }
+   }
+ 
++  // Combine upstream timeout with client disconnect so abandoned streams
++  // stop consuming provider tokens. Without this, a user who navigates away
++  // mid-SSE leaves the upstream fetch running until the hard timeout (default
++  // 120s), which is pure waste under load and can trip rate limits. Industry
++  // practice (Datadog AI gateway guidance, Vercel Workflow agent patterns):
++  // fail the upstream as soon as the client is gone.
++  const timeoutMs = Number(r.timeoutMs || 120000);
++  const ac = new AbortController();
++  const timeoutId = setTimeout(() => ac.abort(new Error(`Upstream timeout after ${timeoutMs}ms`)), timeoutMs);
++  const onClientClose = () => {
++    if (!ac.signal.aborted) {
++      console.error(JSON.stringify({ type: "client_disconnect", requestId: id, model, protocol: p, provider }));
++      ac.abort(new Error("Client disconnected"));
++    }
++  };
++  // req is the inbound Express request; "close" fires when the TCP connection
++  // ends for any reason (client nav-away, network drop, explicit abort).
++  req.on("close", onClientClose);
++  // Also watch the response side — if the client half-closes while we still
++  // hold the upstream, treat it the same way.
++  res.on("close", onClientClose);
++
+   try {
+     const response = await fetch(upstreamUrl(r, p, model, action), {
+       method: "POST",
+       headers: headers(r, p),
+       body: JSON.stringify(outgoingBody),
+-      signal: AbortSignal.timeout(Number(r.timeoutMs || 120000)),
++      signal: ac.signal,
+     });
+ 
+     if (response.status >= 500 || response.status === 429) {
+@@ -561,6 +583,11 @@
+       const decoder = new TextDecoder();
+       let buffer = "";
+       while (true) {
++        // Bail early if the client already left — no point draining upstream.
++        if (ac.signal.aborted) {
++          try { await reader.cancel("Client disconnected"); } catch {}
++          break;
++        }
+         const { done, value } = await reader.read();
+         if (done) break;
+         if (ttft === null) ttft = Date.now() - started;
+@@ -603,6 +630,9 @@
+     if (!e.retryable) await recordRequest(provider, model, 0, Date.now() - started, ttft, null, null, isFallback);
+     throw e;
+   } finally {
++    clearTimeout(timeoutId);
++    req.off("close", onClientClose);
++    res.off("close", onClientClose);
+     await incrGauge("activeRequests", -1);
+     if (streaming) await incrGauge("activeStreams", -1);
+   }
