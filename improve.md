@@ -352,3 +352,35 @@ Cannot set headers after they are sent to the client`, connection hangs
 forever past a 5s safety timeout) and passes against the fix (candidate
 #2 receives zero requests, connection closes cleanly, client sees only
 candidate #1's partial data). `npm test` now runs this suite.
+
+## 2026-08-21: Smart routing for FreeModel models across two base URLs
+
+Owner asked to wire both `https://api.freemodel.dev` and
+`https://vip-sg.freemodel.dev` in with "smart routing" for gpt-5.6-sol/
+terra/luna. No server.js code change needed -- `candidates()` already
+sorts ascending by `priority` and `handle()`'s fallback loop already
+tries each candidate until one succeeds; this only needed a route-config
+change in `EXTRA_MODEL_ROUTES_JSON_3` (Vercel env var):
+
+- Added `api.freemodel.dev/v1` as a priority-1 candidate for all three
+  models (`timeoutMs: 5000` for fast failover).
+- Kept the existing `vip-sg.freemodel.dev/v1` candidates as priority-100
+  fallback, untouched.
+- Dedup key in `routes()` includes `upstreamBaseURL`, so both candidates
+  coexist correctly rather than clobbering each other (see the
+  `upstreamApiKeyEnv`-in-dedup-key note earlier in this file for the same
+  class of gotcha).
+
+Verified live via direct probe: gpt-5.6-sol and gpt-5.6-terra both
+return 200 through the new `api.freemodel.dev` candidate. gpt-5.6-luna
+still fails on BOTH domains -- the error payloads carry the identical
+upstream distributor-group/pool id either way, confirming the two
+domains share the same backend pool for Luna specifically. So this
+smart-routing change *does* add real redundancy for Sol/Terra, but
+cannot route around Luna's current outage since there's no second
+underlying pool to fail over to for that model.
+
+Separately, this same edit also folded in the ling-3.0-flash-free fix
+from earlier today (moved from the disconnected EXTRA_MODEL_ROUTES_JSON_4
+slot into this live one) and deduped an accidental double gpt-5.6-luna
+entry left over from an earlier pass.
