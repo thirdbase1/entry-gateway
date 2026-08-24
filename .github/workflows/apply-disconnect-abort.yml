@@ -1,0 +1,26 @@
+name: Apply client-disconnect abort
+on:
+  workflow_dispatch:
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/client-disconnect-abort-v2
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Apply patch if needed
+        run: bash scripts/apply-client-disconnect-abort.sh
+      - name: Commit applied server.js
+        run: |
+          if git diff --quiet server.js; then
+            echo "No changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          git commit -m "apply: client-disconnect abort to server.js"
+          git push
