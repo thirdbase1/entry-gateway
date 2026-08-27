@@ -4,107 +4,162 @@
 // (see api/index.js + vercel.json rewrite). Serverless functions are
 // stateless between invocations -- there is no guarantee the request that
 // proxies a chat completion and the later request that reads /metrics (or
-// even two concurrent chat requests) land on the same warm instance. The
-// original implementation kept `metrics` and `circuitBreakers` as plain
-// module-level JS objects, which only ever reflected whatever traffic
+// even two concurrent chat requests) land on the same warm instance. A
+// plain module-level JS object only ever reflects whatever traffic
 // happened to hit *that one* instance since its last cold start -- so real
 // production traffic could rack up hundreds of requests while /metrics
 // (hit by a different, fresher instance) kept reporting 0, and circuit
 // breakers never reliably tripped either since each instance had its own
 // isolated failure count.
 //
-// Fix: persist every counter, status-code breakdown, and latency/ttft
-// sample in Upstash Redis (REST-based, so no persistent TCP connection is
-// needed -- perfect for serverless) via the same KV_REST_API_URL /
-// KV_REST_API_TOKEN already provisioned for entry-agents. All instances
-// read and write the same backing store, so metrics and circuit-breaker
-// state are finally consistent no matter which instance handles which
-// request.
+// Fix: persist every counter, status-code breakdown, latency/ttft sample,
+// and circuit-breaker state in Postgres (Neon, via the same database
+// entry-agents already runs on -- @neondatabase/serverless's HTTP driver
+// needs no persistent connection/pool, so it's just as serverless-friendly
+// as a REST-based store). All instances read and write the same tables,
+// so metrics and circuit-breaker state stay consistent no matter which
+// instance handles which request.
+//
+// HISTORY: this used to be backed by Upstash Redis (KV_REST_API_URL/
+// KV_REST_API_TOKEN). Migrated off it entirely 2026-08-27 after Upstash
+// rate-limited this project's Redis instance in production, which (on top
+// of the missing-try/catch bug fixed earlier that same day) was the
+// second real incident traced back to Upstash-side throttling in about a
+// week (the first hit entry-agents' own separate Redis instance). Postgres
+// isn't immune to outages either, so every function here still fails open
+// to an in-memory fallback exactly like the old Redis version did -- see
+// the "DB health circuit breaker" section below -- but at least it's no
+// longer the SAME shared Upstash account/quota as everything else.
 //
 // Falls back to an in-memory store (old behavior, single-instance-only)
-// if no Redis credentials are configured, so local dev without Upstash
-// still works -- it just won't be cross-instance consistent, which is
-// fine for a single local `node server.js` process.
+// if GATEWAY_METRICS_DATABASE_URL isn't configured, so local dev still
+// works without a real database -- it just won't be cross-instance
+// consistent, which is fine for a single local `node server.js` process.
 
-import { Redis } from "@upstash/redis";
+import { neon } from "@neondatabase/serverless";
 
-const MAX_SAMPLES = 500; // capped list length per latency/ttft series in Redis
-const PREFIX = "gw:m:"; // namespaced so it never collides with entry-agents' own KV keys
+const MAX_SAMPLES = 500; // capped list length per latency/ttft series
 
-let redis = null;
-if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
-  redis = new Redis({
-    url: process.env.KV_REST_API_URL,
-    token: process.env.KV_REST_API_TOKEN,
-  });
+let sql = null;
+if (process.env.GATEWAY_METRICS_DATABASE_URL) {
+  sql = neon(process.env.GATEWAY_METRICS_DATABASE_URL);
 } else {
   console.error(JSON.stringify({
     type: "metrics_store_fallback",
-    message: "KV_REST_API_URL/KV_REST_API_TOKEN not set -- metrics and circuit breakers will be IN-MEMORY ONLY and will not be consistent across serverless instances.",
+    message: "GATEWAY_METRICS_DATABASE_URL not set -- metrics and circuit breakers will be IN-MEMORY ONLY and will not be consistent across serverless instances.",
   }));
 }
 
-export const usingRedis = () => redis !== null;
+export const usingDb = () => sql !== null;
 
-// ─── Redis health circuit breaker (in-process, NOT the Redis-backed
-// per-model circuit breaker below -- this one protects access to Redis
+// ─── DB health circuit breaker (in-process, NOT the DB-backed per-model
+// circuit breaker below -- this one protects access to the database
 // itself) ──────────────────────────────────────────────────────────────────
 //
-// Found 2026-08-27: every function below either threw straight out of an
-// unguarded `await redis.xxx()`/`await pipeline.exec()`, or (for
-// isCircuitOpen specifically) was called with NO try/catch at all at one
-// of its two call sites in server.js's fallback loop (the bare-await one
-// outside proxy()'s own try block). When Upstash rate-limited this
-// project's Redis instance, that meant real chat requests either (a) got
-// a fast but misleading 502 whose error message looked like an upstream
-// model failure when it was actually our own metrics/circuit-breaker
-// store, or (b) for multi-candidate models, hung completely unguarded
-// until Vercel's hard 300s function timeout killed them with no response
-// ever sent. Metrics and circuit-breaking are both non-critical secondary
-// concerns -- they must never be able to block or slow down the actual
-// proxy request. Fixed the same way entry-agents' own rate limiter
-// (lib/rate-limit.ts) already fails open against this exact failure
-// class: catch every real Redis error, fall back to the existing
+// Same fail-open + short-cooldown pattern already used for entry-agents'
+// own rate limiter (lib/rate-limit.ts) and for this gateway's earlier
+// Upstash incident: catch every real DB error, fall back to the existing
 // in-memory path for that one call, and open a short in-process circuit
-// so a sustained outage doesn't force every subsequent request to pay a
-// doomed round-trip to Redis before giving up.
-const REDIS_CIRCUIT_COOLDOWN_MS = 15_000;
-let redisCircuitOpenedAt = null;
+// so a sustained DB outage doesn't force every subsequent request to pay
+// a doomed round-trip before giving up. Metrics and circuit-breaking are
+// both non-critical secondary concerns -- they must never be able to
+// block or slow down the actual proxy request.
+const DB_CIRCUIT_COOLDOWN_MS = 15_000;
+let dbCircuitOpenedAt = null;
+let schemaEnsuredAt = null; // re-checked once per cooldown window too
 
-function isRedisCircuitOpen() {
-  if (redisCircuitOpenedAt === null) return false;
-  if (Date.now() - redisCircuitOpenedAt > REDIS_CIRCUIT_COOLDOWN_MS) {
-    // Cooldown elapsed -- let the next call make a fresh real attempt.
-    redisCircuitOpenedAt = null;
+function isDbCircuitOpen() {
+  if (dbCircuitOpenedAt === null) return false;
+  if (Date.now() - dbCircuitOpenedAt > DB_CIRCUIT_COOLDOWN_MS) {
+    dbCircuitOpenedAt = null;
     return false;
   }
   return true;
 }
 
-function recordRedisFailure(error) {
-  const wasAlreadyOpen = redisCircuitOpenedAt !== null;
-  redisCircuitOpenedAt = Date.now();
+function recordDbFailure(error) {
+  const wasAlreadyOpen = dbCircuitOpenedAt !== null;
+  dbCircuitOpenedAt = Date.now();
   if (!wasAlreadyOpen) {
     console.error(JSON.stringify({
-      type: "metrics_store_redis_degraded",
-      message: "A Redis call failed -- metrics and circuit-breaker checks are temporarily fail-open/in-memory-only on this instance so requests keep flowing.",
+      type: "metrics_store_db_degraded",
+      message: "A database call failed -- metrics and circuit-breaker checks are temporarily fail-open/in-memory-only on this instance so requests keep flowing.",
       error: error instanceof Error ? error.message : String(error),
     }));
   }
 }
 
-// True when it's worth even trying a real Redis call right now.
-function redisUsable() {
-  return redis !== null && !isRedisCircuitOpen();
+// True when it's worth even trying a real DB call right now.
+function dbUsable() {
+  return sql !== null && !isDbCircuitOpen();
 }
 
-// ─── In-memory fallback (dev only, and Redis-outage fail-open) ──────────────
+// CREATE TABLE IF NOT EXISTS is idempotent and cheap, so this is safe to
+// re-run on every cold start (memoized per warm instance) and to retry
+// again after a DB-circuit cooldown elapses.
+async function ensureSchema() {
+  if (schemaEnsuredAt !== null) return;
+  await sql`
+    CREATE TABLE IF NOT EXISTS gw_metrics_buckets (
+      scope TEXT NOT NULL,
+      name TEXT NOT NULL,
+      requests BIGINT NOT NULL DEFAULT 0,
+      requests_2xx BIGINT NOT NULL DEFAULT 0,
+      requests_4xx BIGINT NOT NULL DEFAULT 0,
+      requests_5xx BIGINT NOT NULL DEFAULT 0,
+      upstream_errors BIGINT NOT NULL DEFAULT 0,
+      fallbacks BIGINT NOT NULL DEFAULT 0,
+      tokens_input BIGINT NOT NULL DEFAULT 0,
+      tokens_output BIGINT NOT NULL DEFAULT 0,
+      tokens_cache_read BIGINT NOT NULL DEFAULT 0,
+      tokens_cache_write BIGINT NOT NULL DEFAULT 0,
+      tokens_reasoning BIGINT NOT NULL DEFAULT 0,
+      estimated_spend DOUBLE PRECISION NOT NULL DEFAULT 0,
+      status_breakdown JSONB NOT NULL DEFAULT '{}'::jsonb,
+      lat DOUBLE PRECISION[] NOT NULL DEFAULT '{}',
+      ttft DOUBLE PRECISION[] NOT NULL DEFAULT '{}',
+      PRIMARY KEY (scope, name)
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS gw_metrics_gauges (
+      name TEXT PRIMARY KEY,
+      value BIGINT NOT NULL DEFAULT 0
+    )
+  `;
+  await sql`
+    CREATE TABLE IF NOT EXISTS gw_circuit_breakers (
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'closed',
+      failures INT NOT NULL DEFAULT 0,
+      opened_at BIGINT,
+      PRIMARY KEY (provider, model)
+    )
+  `;
+  // Generic small TTL-keyed cache table -- shared with gemini-cache.js so
+  // that module doesn't need its own separate DB dependency. TTL is
+  // enforced in application code (expires_at_ms check on read), matching
+  // how it already worked against Redis (no cron eviction needed at this
+  // volume; a stale row is just a few hundred bytes).
+  await sql`
+    CREATE TABLE IF NOT EXISTS gw_kv (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      expires_at_ms BIGINT
+    )
+  `;
+  schemaEnsuredAt = Date.now();
+}
+
+// ─── In-memory fallback (dev only, and DB-outage fail-open) ─────────────────
 
 const mem = {
   buckets: new Map(), // key -> { counters, status, lat[], ttft[] }
   sets: new Map(), // key -> Set
   gauges: new Map(), // key -> number
   cbs: new Map(), // key -> {state,failures,openedAt,threshold,cooldownMs}
+  kv: new Map(), // key -> { value, expiresAtMs }
 };
 function memBucket(key) {
   if (!mem.buckets.has(key)) {
@@ -118,19 +173,6 @@ function memBucket(key) {
   }
   return mem.buckets.get(key);
 }
-
-// ─── Key helpers ──────────────────────────────────────────────────────────────
-
-const bucketKey = (scope, name) => `${PREFIX}${scope}:${name ?? "_"}`;
-const statusKey = (scope, name) => `${bucketKey(scope, name)}:status`;
-const latKey = (scope, name) => `${bucketKey(scope, name)}:lat`;
-const ttftKey = (scope, name) => `${bucketKey(scope, name)}:ttft`;
-const modelsOfProviderKey = (name) => `${PREFIX}provider:${name}:models`;
-const providersSetKey = () => `${PREFIX}providers`;
-const modelsSetKey = () => `${PREFIX}models`;
-const gaugeKey = (name) => `${PREFIX}gauge:${name}`;
-const cbKey = (provider, model) => `${PREFIX}cb:${provider || "unknown"}:${model || "unknown"}`;
-const cbSetKey = () => `${PREFIX}cbkeys`;
 
 function percentiles(arr) {
   if (!arr.length) return { p50: 0, p95: 0, p99: 0, min: 0, max: 0, count: 0 };
@@ -147,38 +189,6 @@ function percentiles(arr) {
 }
 
 // ─── Recording ────────────────────────────────────────────────────────────────
-
-async function bumpBucket(pipeline, scope, name, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
-  const bk = bucketKey(scope, name);
-  const sk = statusKey(scope, name);
-  const lk = latKey(scope, name);
-  const tk = ttftKey(scope, name);
-
-  pipeline.hincrby(bk, "requests", 1);
-  if (status >= 200 && status < 300) pipeline.hincrby(bk, "requests2xx", 1);
-  else if (status >= 400 && status < 500) pipeline.hincrby(bk, "requests4xx", 1);
-  else if (status >= 500) pipeline.hincrby(bk, "requests5xx", 1);
-  pipeline.hincrby(sk, String(status), 1);
-  if (isFallback) pipeline.hincrby(bk, "fallbacks", 1);
-
-  if (usage) {
-    if (usage.input) pipeline.hincrby(bk, "tokensInput", usage.input);
-    if (usage.output) pipeline.hincrby(bk, "tokensOutput", usage.output);
-    if (usage.cache_read) pipeline.hincrby(bk, "tokensCacheRead", usage.cache_read);
-    if (usage.cache_write) pipeline.hincrby(bk, "tokensCacheWrite", usage.cache_write);
-    if (usage.reasoning) pipeline.hincrby(bk, "tokensReasoning", usage.reasoning);
-  }
-  if (estimatedCost != null) pipeline.hincrbyfloat(bk, "estimatedSpend", estimatedCost);
-
-  if (latencyMs != null) {
-    pipeline.rpush(lk, latencyMs);
-    pipeline.ltrim(lk, -MAX_SAMPLES, -1);
-  }
-  if (ttftMs != null) {
-    pipeline.rpush(tk, ttftMs);
-    pipeline.ltrim(tk, -MAX_SAMPLES, -1);
-  }
-}
 
 function bumpMem(bucket, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
   bucket.counters.requests = (bucket.counters.requests || 0) + 1;
@@ -203,34 +213,81 @@ function recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, est
   bumpMem(memBucket("global:_"), status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
   bumpMem(memBucket(`provider:${provider}`), status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
   bumpMem(memBucket(`model:${model}`), status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-  const pb = memBucket(`provider:${provider}`);
-  pb.models[model] = (pb.models[model] || 0) + 1;
   if (!mem.sets.has("providers")) mem.sets.set("providers", new Set());
   if (!mem.sets.has("models")) mem.sets.set("models", new Set());
   mem.sets.get("providers").add(provider);
   mem.sets.get("models").add(model);
 }
 
+// Upserts one bucket row, incrementing counters atomically via
+// ON CONFLICT ... DO UPDATE SET col = table.col + EXCLUDED.col. The
+// status-code breakdown is a dynamic-key JSONB increment; lat/ttft are
+// appended and trimmed to the last MAX_SAMPLES in the same statement.
+async function upsertBucket(scope, name, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
+  const is2xx = status >= 200 && status < 300 ? 1 : 0;
+  const is4xx = status >= 400 && status < 500 ? 1 : 0;
+  const is5xx = status >= 500 ? 1 : 0;
+  const statusStr = String(status);
+  await sql`
+    INSERT INTO gw_metrics_buckets (
+      scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
+      upstream_errors, fallbacks, tokens_input, tokens_output,
+      tokens_cache_read, tokens_cache_write, tokens_reasoning,
+      estimated_spend, status_breakdown, lat, ttft
+    ) VALUES (
+      ${scope}, ${name}, 1, ${is2xx}, ${is4xx}, ${is5xx},
+      0, ${isFallback ? 1 : 0}, ${usage?.input || 0}, ${usage?.output || 0},
+      ${usage?.cache_read || 0}, ${usage?.cache_write || 0}, ${usage?.reasoning || 0},
+      ${estimatedCost || 0}, jsonb_build_object(${statusStr}::text, 1),
+      ${latencyMs != null ? [latencyMs] : []}, ${ttftMs != null ? [ttftMs] : []}
+    )
+    ON CONFLICT (scope, name) DO UPDATE SET
+      requests = gw_metrics_buckets.requests + EXCLUDED.requests,
+      requests_2xx = gw_metrics_buckets.requests_2xx + EXCLUDED.requests_2xx,
+      requests_4xx = gw_metrics_buckets.requests_4xx + EXCLUDED.requests_4xx,
+      requests_5xx = gw_metrics_buckets.requests_5xx + EXCLUDED.requests_5xx,
+      fallbacks = gw_metrics_buckets.fallbacks + EXCLUDED.fallbacks,
+      tokens_input = gw_metrics_buckets.tokens_input + EXCLUDED.tokens_input,
+      tokens_output = gw_metrics_buckets.tokens_output + EXCLUDED.tokens_output,
+      tokens_cache_read = gw_metrics_buckets.tokens_cache_read + EXCLUDED.tokens_cache_read,
+      tokens_cache_write = gw_metrics_buckets.tokens_cache_write + EXCLUDED.tokens_cache_write,
+      tokens_reasoning = gw_metrics_buckets.tokens_reasoning + EXCLUDED.tokens_reasoning,
+      estimated_spend = gw_metrics_buckets.estimated_spend + EXCLUDED.estimated_spend,
+      status_breakdown = jsonb_set(
+        gw_metrics_buckets.status_breakdown, ARRAY[${statusStr}::text],
+        to_jsonb(COALESCE((gw_metrics_buckets.status_breakdown ->> ${statusStr})::bigint, 0) + 1)
+      ),
+      lat = CASE WHEN ${latencyMs != null} THEN
+        (array_append(gw_metrics_buckets.lat, ${latencyMs}::double precision))[
+          greatest(1, cardinality(array_append(gw_metrics_buckets.lat, ${latencyMs}::double precision)) - ${MAX_SAMPLES - 1}):
+        ]
+        ELSE gw_metrics_buckets.lat END,
+      ttft = CASE WHEN ${ttftMs != null} THEN
+        (array_append(gw_metrics_buckets.ttft, ${ttftMs}::double precision))[
+          greatest(1, cardinality(array_append(gw_metrics_buckets.ttft, ${ttftMs}::double precision)) - ${MAX_SAMPLES - 1}):
+        ]
+        ELSE gw_metrics_buckets.ttft END
+  `;
+}
+
 export async function recordRequest(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
   provider = provider || "unknown";
   model = model || "unknown";
 
-  if (!redisUsable()) {
+  if (!dbUsable()) {
     recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
     return;
   }
 
   try {
-    const pipeline = redis.pipeline();
-    await bumpBucket(pipeline, "global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    await bumpBucket(pipeline, "provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    await bumpBucket(pipeline, "model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    pipeline.hincrby(modelsOfProviderKey(provider), model, 1);
-    pipeline.sadd(providersSetKey(), provider);
-    pipeline.sadd(modelsSetKey(), model);
-    await pipeline.exec();
+    await ensureSchema();
+    await Promise.all([
+      upsertBucket("global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
+      upsertBucket("provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
+      upsertBucket("model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
+    ]);
   } catch (error) {
-    recordRedisFailure(error);
+    recordDbFailure(error);
     recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
   }
 }
@@ -246,23 +303,32 @@ function recordUpstreamErrorMem(provider, model) {
   }
 }
 
+async function bumpUpstreamErrors(scope, name) {
+  await sql`
+    INSERT INTO gw_metrics_buckets (scope, name, upstream_errors)
+    VALUES (${scope}, ${name}, 1)
+    ON CONFLICT (scope, name) DO UPDATE SET
+      upstream_errors = gw_metrics_buckets.upstream_errors + 1
+  `;
+}
+
 export async function recordUpstreamError(provider, model) {
   provider = provider || "unknown";
 
-  if (!redisUsable()) {
+  if (!dbUsable()) {
     recordUpstreamErrorMem(provider, model);
     return;
   }
 
   try {
-    const pipeline = redis.pipeline();
-    pipeline.hincrby(bucketKey("provider", provider), "upstreamErrors", 1);
-    pipeline.hincrby(bucketKey("global", "_"), "upstreamErrors", 1);
-    if (model) pipeline.hincrby(bucketKey("model", model), "upstreamErrors", 1);
-    pipeline.sadd(providersSetKey(), provider);
-    await pipeline.exec();
+    await ensureSchema();
+    await Promise.all([
+      bumpUpstreamErrors("global", "_"),
+      bumpUpstreamErrors("provider", provider),
+      ...(model ? [bumpUpstreamErrors("model", model)] : []),
+    ]);
   } catch (error) {
-    recordRedisFailure(error);
+    recordDbFailure(error);
     recordUpstreamErrorMem(provider, model);
   }
 }
@@ -270,26 +336,30 @@ export async function recordUpstreamError(provider, model) {
 // ─── Gauges (activeRequests / activeStreams) ─────────────────────────────────
 
 export async function incrGauge(name, delta) {
-  if (!redisUsable()) {
+  if (!dbUsable()) {
     mem.gauges.set(name, (mem.gauges.get(name) || 0) + delta);
     return;
   }
   try {
-    if (delta >= 0) await redis.incrby(gaugeKey(name), delta);
-    else await redis.decrby(gaugeKey(name), -delta);
+    await ensureSchema();
+    await sql`
+      INSERT INTO gw_metrics_gauges (name, value) VALUES (${name}, ${delta})
+      ON CONFLICT (name) DO UPDATE SET value = gw_metrics_gauges.value + EXCLUDED.value
+    `;
   } catch (error) {
-    recordRedisFailure(error);
+    recordDbFailure(error);
     mem.gauges.set(name, (mem.gauges.get(name) || 0) + delta);
   }
 }
 
 export async function getGauge(name) {
-  if (!redisUsable()) return Math.max(0, mem.gauges.get(name) || 0);
+  if (!dbUsable()) return Math.max(0, mem.gauges.get(name) || 0);
   try {
-    const v = await redis.get(gaugeKey(name));
-    return Math.max(0, Number(v) || 0);
+    await ensureSchema();
+    const rows = await sql`SELECT value FROM gw_metrics_gauges WHERE name = ${name}`;
+    return Math.max(0, Number(rows[0]?.value) || 0);
   } catch (error) {
-    recordRedisFailure(error);
+    recordDbFailure(error);
     return Math.max(0, mem.gauges.get(name) || 0);
   }
 }
@@ -303,37 +373,44 @@ function defaultCircuitBreaker() {
   return { state: "closed", failures: 0, openedAt: null, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS };
 }
 
+function cbMemKey(provider, model) {
+  return `${provider || "unknown"}:${model || "unknown"}`;
+}
+
 export async function getCircuitBreaker(provider, model) {
-  const key = cbKey(provider, model);
-  if (!redisUsable()) {
+  const key = cbMemKey(provider, model);
+  if (!dbUsable()) {
     if (!mem.cbs.has(key)) mem.cbs.set(key, defaultCircuitBreaker());
     return mem.cbs.get(key);
   }
   try {
-    const raw = await redis.hgetall(key);
-    if (!raw || !raw.state) {
-      return defaultCircuitBreaker();
-    }
+    await ensureSchema();
+    const rows = await sql`
+      SELECT state, failures, opened_at FROM gw_circuit_breakers
+      WHERE provider = ${provider || "unknown"} AND model = ${model || "unknown"}
+    `;
+    const raw = rows[0];
+    if (!raw) return defaultCircuitBreaker();
     return {
       state: raw.state,
       failures: Number(raw.failures) || 0,
-      openedAt: raw.openedAt ? Number(raw.openedAt) : null,
+      openedAt: raw.opened_at ? Number(raw.opened_at) : null,
       threshold: CB_THRESHOLD,
       cooldownMs: CB_COOLDOWN_MS,
     };
   } catch (error) {
-    recordRedisFailure(error);
+    recordDbFailure(error);
     // Fail open: an unreachable circuit-breaker store must never be
     // treated as an OPEN circuit -- that would block a perfectly healthy
-    // provider route just because our own metrics Redis is struggling.
+    // provider route just because our own metrics DB is struggling.
     if (!mem.cbs.has(key)) mem.cbs.set(key, defaultCircuitBreaker());
     return mem.cbs.get(key);
   }
 }
 
-// isCircuitOpen deliberately never throws (see the Redis health circuit
-// breaker note above) -- both of its call sites in server.js need a
-// clean boolean, and one of them is a bare `await` outside any try/catch.
+// isCircuitOpen deliberately never throws (see the DB health circuit
+// breaker note above) -- both of its call sites in server.js need a clean
+// boolean, and one of them is a bare `await` outside any try/catch.
 export async function isCircuitOpen(provider, model) {
   const cb = await getCircuitBreaker(provider, model);
   if (cb.state === "open") {
@@ -347,18 +424,21 @@ export async function isCircuitOpen(provider, model) {
 }
 
 async function setCircuitState(provider, model, state, failures, openedAt) {
-  const key = cbKey(provider, model);
-  if (!redisUsable()) {
+  const key = cbMemKey(provider, model);
+  if (!dbUsable()) {
     mem.cbs.set(key, { state, failures, openedAt, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS });
     return;
   }
   try {
-    const pipeline = redis.pipeline();
-    pipeline.hset(key, { state, failures, openedAt: openedAt ?? "" });
-    pipeline.sadd(cbSetKey(), key);
-    await pipeline.exec();
+    await ensureSchema();
+    await sql`
+      INSERT INTO gw_circuit_breakers (provider, model, state, failures, opened_at)
+      VALUES (${provider || "unknown"}, ${model || "unknown"}, ${state}, ${failures}, ${openedAt ?? null})
+      ON CONFLICT (provider, model) DO UPDATE SET
+        state = EXCLUDED.state, failures = EXCLUDED.failures, opened_at = EXCLUDED.opened_at
+    `;
   } catch (error) {
-    recordRedisFailure(error);
+    recordDbFailure(error);
     mem.cbs.set(key, { state, failures, openedAt, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS });
   }
 }
@@ -383,107 +463,147 @@ export async function recordBreakerSuccess(provider, model) {
 }
 
 export async function getAllCircuitBreakers() {
-  if (!redisUsable()) {
+  if (!dbUsable()) {
     const out = {};
-    for (const [key, cb] of mem.cbs.entries()) {
-      const shortKey = key.slice(PREFIX.length + 3); // strip "gw:m:cb:"
-      out[shortKey] = cb;
-    }
+    for (const [key, cb] of mem.cbs.entries()) out[key] = cb;
     return out;
   }
   try {
-    const keys = await redis.smembers(cbSetKey());
-    if (!keys.length) return {};
+    await ensureSchema();
+    const rows = await sql`SELECT provider, model, state, failures, opened_at FROM gw_circuit_breakers`;
     const out = {};
-    await Promise.all(keys.map(async (key) => {
-      const raw = await redis.hgetall(key);
-      if (!raw || !raw.state) return;
-      const shortKey = key.slice(PREFIX.length + 3);
-      out[shortKey] = {
+    for (const raw of rows) {
+      out[`${raw.provider}:${raw.model}`] = {
         state: raw.state,
         failures: Number(raw.failures) || 0,
-        openedAt: raw.openedAt ? Number(raw.openedAt) : null,
+        openedAt: raw.opened_at ? Number(raw.opened_at) : null,
       };
-    }));
-    return out;
-  } catch (error) {
-    recordRedisFailure(error);
-    const out = {};
-    for (const [key, cb] of mem.cbs.entries()) {
-      const shortKey = key.slice(PREFIX.length + 3);
-      out[shortKey] = cb;
     }
     return out;
+  } catch (error) {
+    recordDbFailure(error);
+    const out = {};
+    for (const [key, cb] of mem.cbs.entries()) out[key] = cb;
+    return out;
+  }
+}
+
+// ─── Generic small TTL-keyed KV (shared with gemini-cache.js) ───────────────
+// Same fail-open discipline as everything else here: never throws, falls
+// back to a local in-memory Map on any DB error.
+
+export async function kvGet(key) {
+  const now = Date.now();
+  if (!dbUsable()) {
+    const entry = mem.kv.get(key);
+    if (!entry) return null;
+    if (entry.expiresAtMs != null && entry.expiresAtMs <= now) { mem.kv.delete(key); return null; }
+    return entry.value;
+  }
+  try {
+    await ensureSchema();
+    const rows = await sql`SELECT value, expires_at_ms FROM gw_kv WHERE key = ${key}`;
+    const raw = rows[0];
+    if (!raw) return null;
+    if (raw.expires_at_ms != null && Number(raw.expires_at_ms) <= now) return null;
+    return raw.value;
+  } catch (error) {
+    recordDbFailure(error);
+    const entry = mem.kv.get(key);
+    if (!entry) return null;
+    if (entry.expiresAtMs != null && entry.expiresAtMs <= now) { mem.kv.delete(key); return null; }
+    return entry.value;
+  }
+}
+
+export async function kvSet(key, value, ttlSeconds) {
+  const expiresAtMs = ttlSeconds ? Date.now() + ttlSeconds * 1000 : null;
+  if (!dbUsable()) {
+    mem.kv.set(key, { value, expiresAtMs });
+    return;
+  }
+  try {
+    await ensureSchema();
+    await sql`
+      INSERT INTO gw_kv (key, value, expires_at_ms) VALUES (${key}, ${value}, ${expiresAtMs})
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at_ms = EXCLUDED.expires_at_ms
+    `;
+  } catch (error) {
+    recordDbFailure(error);
+    mem.kv.set(key, { value, expiresAtMs });
   }
 }
 
 // ─── Snapshot for /metrics and /health ───────────────────────────────────────
 
 async function readBucket(scope, name) {
-  if (!redisUsable()) {
+  if (!dbUsable()) {
     const b = memBucket(scope === "global" ? "global:_" : `${scope}:${name}`);
     return serializeFromMem(b);
   }
   try {
-    const bk = bucketKey(scope, name);
-    const sk = statusKey(scope, name);
-    const lk = latKey(scope, name);
-    const tk = ttftKey(scope, name);
-    const [counters, status, lat, ttft] = await Promise.all([
-      redis.hgetall(bk),
-      redis.hgetall(sk),
-      redis.lrange(lk, 0, -1),
-      redis.lrange(tk, 0, -1),
-    ]);
-    return serializeFromRedis(counters || {}, status || {}, (lat || []).map(Number), (ttft || []).map(Number));
+    await ensureSchema();
+    const rows = await sql`
+      SELECT * FROM gw_metrics_buckets WHERE scope = ${scope} AND name = ${name}
+    `;
+    return serializeFromDb(rows[0] || null);
   } catch (error) {
-    recordRedisFailure(error);
+    recordDbFailure(error);
     const b = memBucket(scope === "global" ? "global:_" : `${scope}:${name}`);
     return serializeFromMem(b);
   }
 }
 
-function serializeFromRedis(c, status, lat, ttft) {
+// CORRECTED 2026-08-18 (twice, back in the Redis-backed version): the
+// caller (server.js) feeds this store an already-normalized usage object
+// where tokensInput is TRUE uncached-only input for every protocol (see
+// cacheBreakdownOf() in server.js) -- Anthropic's additive-vs-subset
+// distinction is resolved BEFORE it reaches here, not re-derived at read
+// time. Kept this formula and its defensive clamp unchanged across the
+// 2026-08-27 Postgres migration.
+function cacheHitRateOf(input, cacheRead, cacheWrite) {
+  const denom = input + cacheRead + cacheWrite;
+  return denom > 0 ? Number(Math.min(1, cacheRead / denom).toFixed(4)) : 0;
+}
+
+function serializeFromDb(row) {
+  if (!row) {
+    return {
+      requests: 0, requests2xx: 0, requests4xx: 0, requests5xx: 0,
+      upstreamErrors: 0, fallbacks: 0,
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0, cacheHitRate: 0 },
+      estimatedSpend: 0, latency: percentiles([]), ttft: percentiles([]), statusBreakdown: {},
+    };
+  }
+  const input = Number(row.tokens_input) || 0;
+  const cacheRead = Number(row.tokens_cache_read) || 0;
+  const cacheWrite = Number(row.tokens_cache_write) || 0;
+  const output = Number(row.tokens_output) || 0;
   return {
-    requests: Number(c.requests) || 0,
-    requests2xx: Number(c.requests2xx) || 0,
-    requests4xx: Number(c.requests4xx) || 0,
-    requests5xx: Number(c.requests5xx) || 0,
-    upstreamErrors: Number(c.upstreamErrors) || 0,
-    fallbacks: Number(c.fallbacks) || 0,
+    requests: Number(row.requests) || 0,
+    requests2xx: Number(row.requests_2xx) || 0,
+    requests4xx: Number(row.requests_4xx) || 0,
+    requests5xx: Number(row.requests_5xx) || 0,
+    upstreamErrors: Number(row.upstream_errors) || 0,
+    fallbacks: Number(row.fallbacks) || 0,
     tokens: {
-      input: Number(c.tokensInput) || 0,
-      output: Number(c.tokensOutput) || 0,
-      cacheRead: Number(c.tokensCacheRead) || 0,
-      cacheWrite: Number(c.tokensCacheWrite) || 0,
-      reasoning: Number(c.tokensReasoning) || 0,
-      total: (Number(c.tokensInput) || 0) + (Number(c.tokensOutput) || 0),
-      // CORRECTED 2026-08-18 (twice): the caller (server.js) now feeds this
-      // store an already-normalized usage object where tokensInput is
-      // TRUE uncached-only input for every protocol (see cacheBreakdownOf()
-      // in server.js) -- Anthropic's additive-vs-subset distinction is
-      // resolved BEFORE it reaches here, not re-derived at read time. That
-      // first attempt at a protocol-agnostic formula here
-      // (Math.min(1, cacheRead / (input+cacheRead+cacheWrite))) silently
-      // broke DeepSeek's real hit rate (89.94% -> 47.35%) by adding
-      // cacheRead into the denominator on top of an input that (at the
-      // time) still included it as a subset -- double-counting it. Now
-      // that input is guaranteed uncached-only at the source, this same
-      // formula is simply correct for every protocol, no clamp needed
-      // (kept as a defensive guard only).
-      cacheHitRate: (Number(c.tokensInput) || 0) + (Number(c.tokensCacheRead) || 0) + (Number(c.tokensCacheWrite) || 0) > 0
-        ? Number(Math.min(1, (Number(c.tokensCacheRead) || 0) / ((Number(c.tokensInput) || 0) + (Number(c.tokensCacheRead) || 0) + (Number(c.tokensCacheWrite) || 0))).toFixed(4))
-        : 0,
+      input, output, cacheRead, cacheWrite,
+      reasoning: Number(row.tokens_reasoning) || 0,
+      total: input + output,
+      cacheHitRate: cacheHitRateOf(input, cacheRead, cacheWrite),
     },
-    estimatedSpend: Number(Number(c.estimatedSpend || 0).toFixed(6)),
-    latency: percentiles(lat),
-    ttft: percentiles(ttft),
-    statusBreakdown: status,
+    estimatedSpend: Number(Number(row.estimated_spend || 0).toFixed(6)),
+    latency: percentiles((row.lat || []).map(Number)),
+    ttft: percentiles((row.ttft || []).map(Number)),
+    statusBreakdown: row.status_breakdown || {},
   };
 }
 
 function serializeFromMem(b) {
   const c = b.counters;
+  const input = c.tokensInput || 0;
+  const cacheRead = c.tokensCacheRead || 0;
+  const cacheWrite = c.tokensCacheWrite || 0;
   return {
     requests: c.requests || 0,
     requests2xx: c.requests2xx || 0,
@@ -492,15 +612,10 @@ function serializeFromMem(b) {
     upstreamErrors: c.upstreamErrors || 0,
     fallbacks: c.fallbacks || 0,
     tokens: {
-      input: c.tokensInput || 0,
-      output: c.tokensOutput || 0,
-      cacheRead: c.tokensCacheRead || 0,
-      cacheWrite: c.tokensCacheWrite || 0,
+      input, output: c.tokensOutput || 0, cacheRead, cacheWrite,
       reasoning: c.tokensReasoning || 0,
-      total: (c.tokensInput || 0) + (c.tokensOutput || 0),
-      cacheHitRate: (c.tokensInput || 0) + (c.tokensCacheRead || 0) + (c.tokensCacheWrite || 0) > 0
-        ? Number(Math.min(1, (c.tokensCacheRead || 0) / ((c.tokensInput || 0) + (c.tokensCacheRead || 0) + (c.tokensCacheWrite || 0))).toFixed(4))
-        : 0,
+      total: input + (c.tokensOutput || 0),
+      cacheHitRate: cacheHitRateOf(input, cacheRead, cacheWrite),
     },
     estimatedSpend: Number((c.estimatedSpend || 0).toFixed(6)),
     latency: percentiles(b.lat),
@@ -513,19 +628,20 @@ export async function getMetricsSnapshot(knownProviders, knownModels) {
   const global = await readBucket("global", "_");
 
   let providerNames, modelNames;
-  if (!redisUsable()) {
+  if (!dbUsable()) {
     providerNames = [...new Set([...(mem.sets.get("providers") || []), ...knownProviders])];
     modelNames = [...new Set([...(mem.sets.get("models") || []), ...knownModels])];
   } else {
     try {
-      const [seenProviders, seenModels] = await Promise.all([
-        redis.smembers(providersSetKey()),
-        redis.smembers(modelsSetKey()),
+      await ensureSchema();
+      const [providerRows, modelRows] = await Promise.all([
+        sql`SELECT DISTINCT name FROM gw_metrics_buckets WHERE scope = 'provider'`,
+        sql`SELECT DISTINCT name FROM gw_metrics_buckets WHERE scope = 'model'`,
       ]);
-      providerNames = [...new Set([...(seenProviders || []), ...knownProviders])];
-      modelNames = [...new Set([...(seenModels || []), ...knownModels])];
+      providerNames = [...new Set([...providerRows.map((r) => r.name), ...knownProviders])];
+      modelNames = [...new Set([...modelRows.map((r) => r.name), ...knownModels])];
     } catch (error) {
-      recordRedisFailure(error);
+      recordDbFailure(error);
       providerNames = [...new Set([...(mem.sets.get("providers") || []), ...knownProviders])];
       modelNames = [...new Set([...(mem.sets.get("models") || []), ...knownModels])];
     }

@@ -13,7 +13,7 @@ import {
   getGauge,
   getMetricsSnapshot,
   getAllCircuitBreakers,
-  usingRedis,
+  usingDb,
 } from "./metrics-store.js";
 import { getOrCreateCachedContent } from "./gemini-cache.js";
 
@@ -356,12 +356,14 @@ const costOf = (r, u) => {
 
 // ─── Metrics + circuit breakers ──────────────────────────────────────────────
 //
-// Durable, cross-instance state now lives in metrics-store.js (Redis via
-// Upstash REST when KV_REST_API_URL/KV_REST_API_TOKEN are set, otherwise
-// an in-memory fallback for local dev). See that file for why: this
-// process runs as stateless Vercel serverless functions, so a plain
-// module-level object here would only ever reflect one instance's slice
-// of traffic instead of the gateway's real, aggregate usage.
+// Durable, cross-instance state now lives in metrics-store.js (Postgres/
+// Neon via GATEWAY_METRICS_DATABASE_URL when set, otherwise an in-memory
+// fallback for local dev -- migrated off Upstash Redis entirely
+// 2026-08-27, see that file's HISTORY note). See that file for why a
+// shared external store is needed at all: this process runs as stateless
+// Vercel serverless functions, so a plain module-level object here would
+// only ever reflect one instance's slice of traffic instead of the
+// gateway's real, aggregate usage.
 
 const startTime = Date.now();
 
@@ -676,7 +678,7 @@ app.get("/health", async (_req, res) => {
     circuitBreakers,
     activeRequests,
     activeStreams,
-    metricsBackend: usingRedis() ? "redis" : "in-memory (single instance only)",
+    metricsBackend: usingDb() ? "postgres" : "in-memory (single instance only)",
   });
 });
 
@@ -711,7 +713,7 @@ app.get("/metrics", adminAuth, async (_req, res) => {
   res.json({
     uptime: Math.floor((Date.now() - startTime) / 1000),
     ...snapshot,
-    metricsBackend: usingRedis() ? "redis" : "in-memory (single instance only)",
+    metricsBackend: usingDb() ? "postgres" : "in-memory (single instance only)",
   });
 });
 

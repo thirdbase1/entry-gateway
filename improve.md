@@ -428,3 +428,54 @@ an Upstash-side condition (same recurring issue class already seen and
 partly remediated for entry-agents' own Redis instance) -- this fix only
 makes the gateway resilient *to* that condition, it doesn't prevent
 Upstash from rate-limiting the account again.
+
+## 2026-08-27 (same day, follow-up): migrated entirely off Upstash Redis
+
+Owner asked, after the fail-open fix above: why does entry-agents even
+use Upstash, and can the gateway move off it entirely instead of just
+being resilient to its outages? Answer to the first part: Vercel
+serverless functions are stateless between invocations, so anything that
+needs to be shared/consistent across concurrent instances (rate limits,
+skills cache, this gateway's own metrics/circuit-breakers) needs a fast
+external store -- Upstash Redis was the store used for that. But this is
+now the second real incident in about a week traced back to Upstash-side
+throttling (first hit entry-agents' own separate Redis instance, this one
+hit the gateway's), so worth actually removing the dependency here rather
+than just tolerating it.
+
+Migrated metrics-store.js (and gemini-cache.js, which had its own smaller
+Redis usage for the Gemini explicit-cache resource-name lookup) from
+`@upstash/redis` to `@neondatabase/serverless`, pointed at the SAME Neon
+Postgres database entry-agents already runs on (reused rather than
+provisioning new infra -- new `GATEWAY_METRICS_DATABASE_URL` env var,
+namespaced tables `gw_metrics_buckets` / `gw_metrics_gauges` /
+`gw_circuit_breakers` / `gw_kv` so nothing collides with entry-agents' own
+tables in that DB). Chose the Neon serverless HTTP driver specifically
+because it needs no persistent connection/pool, matching how the REST-
+based Upstash client worked -- still a good fit for stateless functions.
+
+Counters use `INSERT ... ON CONFLICT DO UPDATE SET col = table.col +
+EXCLUDED.col` for atomic increments (including a dynamic-key JSONB
+increment for the per-status-code breakdown); latency/ttft samples are
+appended to a Postgres array column and trimmed to the last 500 in the
+same statement. Circuit-breaker state and gauges are straightforward
+upsert tables. `usingRedis()` renamed to `usingDb()` (also updated
+server.js's one call site + the `/health` and `/metrics` `metricsBackend`
+field, now reports `"postgres"` instead of `"redis"`).
+
+Kept the exact same fail-open discipline from the earlier same-day fix
+(15s in-process circuit breaker around DB calls, falls back to the
+existing in-memory path) -- Postgres isn't immune to outages either, this
+just means it's no longer sharing Upstash's specific account/quota with
+everything else.
+
+Verified: renamed `metrics-store-redis-failure.test.js` ->
+`metrics-store-db-failure.test.js`, updated to point at an unreachable
+Postgres host instead of an unreachable Redis host -- all 9 tests pass.
+Separately ran a real manual script against the actual Neon DB
+(recordRequest/recordUpstreamError/gauges/circuit-breaker open-close-
+recover/kv get-set) to confirm the SQL itself is correct, not just the
+fail-open path -- confirmed correct, then cleaned up the test rows.
+Removed `KV_REST_API_URL`/`KV_REST_API_TOKEN` from the Vercel project and
+`@upstash/redis` from package.json -- zero Upstash usage left anywhere in
+this repo.

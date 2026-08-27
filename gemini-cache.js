@@ -26,11 +26,11 @@
 //      would just double the tokens billed) and set `cachedContent` to the
 //      cache's resource name instead.
 //   4. If not found (or expired): create it via Google's
-//      `cachedContents.create`, remember the resource name (Redis-backed,
-//      cross-instance-consistent -- same store metrics-store.js already
-//      uses), and use it starting with THIS request.
+//      `cachedContents.create`, remember the resource name (Postgres-
+//      backed via metrics-store.js's shared gw_kv table, cross-instance-
+//      consistent), and use it starting with THIS request.
 //   5. Any failure here (network error, content below Google's per-model
-//      minimum token count, Redis unavailable) must never break the
+//      minimum token count, database unavailable) must never break the
 //      underlying chat request -- always fall back to sending
 //      `systemInstruction` unmodified, which still gets Google's automatic
 //      implicit caching for free.
@@ -46,6 +46,8 @@
 // over-attempting and eating Google's 400 on every call) gates the attempt
 // before we ever call Google; Google's own validation is the real
 // backstop if this estimate is ever wrong.
+import { kvGet, kvSet } from "./metrics-store.js";
+
 const CHARS_PER_TOKEN_ESTIMATE = 3.2;
 const MIN_TOKENS_BY_PREFIX = [
   [/^gemini-(3\.7|3\.6|3\.5)-flash/, 4096],
@@ -74,37 +76,27 @@ const PREFIX = "gw:gc:"; // namespaced alongside metrics-store.js's "gw:m:"
 // configured, or if a Redis call itself fails.
 const memCache = new Map(); // hash -> { name, expiresAtMs }
 
-let redisClient = null;
-async function getRedis() {
-  if (redisClient !== null) return redisClient;
-  if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) return null;
-  const { Redis } = await import("@upstash/redis");
-  redisClient = new Redis({ url: process.env.KV_REST_API_URL, token: process.env.KV_REST_API_TOKEN });
-  return redisClient;
-}
-
+// Backed by the same Postgres-backed KV as metrics-store.js (migrated off
+// Upstash Redis entirely 2026-08-27 -- see that file's top-of-file HISTORY
+// note). kvGet/kvSet already never throw (fail open internally), but this
+// module keeps its own memCache as an extra fallback layer since a
+// caching miss here must NEVER break the underlying chat request -- it
+// should just fall through to sending systemInstruction unmodified.
 async function readCacheEntry(hash) {
-  const redis = await getRedis();
-  if (redis) {
-    try {
-      const raw = await redis.get(`${PREFIX}${hash}`);
-      if (raw) return typeof raw === "string" ? JSON.parse(raw) : raw;
-    } catch (e) {
-      console.error(JSON.stringify({ type: "gemini_cache_redis_read_error", message: e.message }));
-    }
+  try {
+    const raw = await kvGet(`${PREFIX}${hash}`);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    console.error(JSON.stringify({ type: "gemini_cache_read_error", message: e.message }));
   }
   return memCache.get(hash) ?? null;
 }
 
 async function writeCacheEntry(hash, entry, ttlSeconds) {
-  const redis = await getRedis();
-  if (redis) {
-    try {
-      await redis.set(`${PREFIX}${hash}`, JSON.stringify(entry), { ex: ttlSeconds });
-      return;
-    } catch (e) {
-      console.error(JSON.stringify({ type: "gemini_cache_redis_write_error", message: e.message }));
-    }
+  try {
+    await kvSet(`${PREFIX}${hash}`, JSON.stringify(entry), ttlSeconds);
+  } catch (e) {
+    console.error(JSON.stringify({ type: "gemini_cache_write_error", message: e.message }));
   }
   memCache.set(hash, entry);
 }
