@@ -384,3 +384,47 @@ Separately, this same edit also folded in the ling-3.0-flash-free fix
 from earlier today (moved from the disconnected EXTRA_MODEL_ROUTES_JSON_4
 slot into this live one) and deduped an accidental double gpt-5.6-luna
 entry left over from an earlier pass.
+
+## 2026-08-27: metrics-store.js Redis calls could hang or crash real requests
+
+Found while checking runtime logs: Upstash rate-limited this project's
+Redis instance (`UpstashError: Your database has been temporarily
+rate-limited`). This exposed two real bugs in metrics-store.js, both
+now fixed:
+
+1. Every exported function did an unguarded `await redis.xxx()` /
+   `await pipeline.exec()` with no try/catch. When Redis errored, that
+   propagated straight up as a raw exception.
+2. In `server.js`'s `handle()` fallback loop, the `isCircuitOpen()` call
+   made *before* the `try { await proxy(...) }` block (used to skip
+   already-open circuits when there are 2+ candidate routes) had nothing
+   to catch it -- an uncaught rejection there just hangs the request with
+   no response ever sent, until Vercel's hard 300s function timeout kills
+   it. Confirmed in real logs: several `/v1/chat/completions` requests hit
+   exactly this, logged as `Unhandled Rejection: UpstashError...` followed
+   by `Vercel Runtime Timeout Error: Task timed out after 300 seconds`.
+   Single-candidate models (e.g. claude-opus-4-6) instead hit bug #1 inside
+   `proxy()`, which *is* wrapped by `handle()`'s own try/catch, so those
+   just got a fast but misleading 502 whose `error` field was the raw
+   Upstash message -- looked like an upstream model failure, but it was
+   actually our own metrics/circuit-breaker store.
+
+Fix: added an in-process Redis-health circuit breaker inside
+metrics-store.js (`isRedisCircuitOpen`/`recordRedisFailure`, 15s cooldown
+-- same pattern as entry-agents' `lib/rate-limit.ts`) and wrapped every
+real Redis call in try/catch that falls back to the existing in-memory
+path on failure. `isCircuitOpen()` specifically is now guaranteed to
+never throw, since `server.js` relies on that at a call site with no
+try/catch of its own by design (documented inline at both ends). New
+`metrics-store-redis-failure.test.js` points the module at a real,
+unreachable host (no mocking lib in this repo, same philosophy as
+`fallback.test.js`) and asserts every exported function resolves quickly
+with a safe fallback instead of throwing/hanging -- confirmed it fails
+hard against the pre-fix code (ENOTFOUND propagates straight through)
+and passes against the fix.
+
+Not fixed / out of scope: the *first* Redis rate-limit event itself is
+an Upstash-side condition (same recurring issue class already seen and
+partly remediated for entry-agents' own Redis instance) -- this fix only
+makes the gateway resilient *to* that condition, it doesn't prevent
+Upstash from rate-limiting the account again.

@@ -46,7 +46,59 @@ if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
 
 export const usingRedis = () => redis !== null;
 
-// ─── In-memory fallback (dev only) ───────────────────────────────────────────
+// ─── Redis health circuit breaker (in-process, NOT the Redis-backed
+// per-model circuit breaker below -- this one protects access to Redis
+// itself) ──────────────────────────────────────────────────────────────────
+//
+// Found 2026-08-27: every function below either threw straight out of an
+// unguarded `await redis.xxx()`/`await pipeline.exec()`, or (for
+// isCircuitOpen specifically) was called with NO try/catch at all at one
+// of its two call sites in server.js's fallback loop (the bare-await one
+// outside proxy()'s own try block). When Upstash rate-limited this
+// project's Redis instance, that meant real chat requests either (a) got
+// a fast but misleading 502 whose error message looked like an upstream
+// model failure when it was actually our own metrics/circuit-breaker
+// store, or (b) for multi-candidate models, hung completely unguarded
+// until Vercel's hard 300s function timeout killed them with no response
+// ever sent. Metrics and circuit-breaking are both non-critical secondary
+// concerns -- they must never be able to block or slow down the actual
+// proxy request. Fixed the same way entry-agents' own rate limiter
+// (lib/rate-limit.ts) already fails open against this exact failure
+// class: catch every real Redis error, fall back to the existing
+// in-memory path for that one call, and open a short in-process circuit
+// so a sustained outage doesn't force every subsequent request to pay a
+// doomed round-trip to Redis before giving up.
+const REDIS_CIRCUIT_COOLDOWN_MS = 15_000;
+let redisCircuitOpenedAt = null;
+
+function isRedisCircuitOpen() {
+  if (redisCircuitOpenedAt === null) return false;
+  if (Date.now() - redisCircuitOpenedAt > REDIS_CIRCUIT_COOLDOWN_MS) {
+    // Cooldown elapsed -- let the next call make a fresh real attempt.
+    redisCircuitOpenedAt = null;
+    return false;
+  }
+  return true;
+}
+
+function recordRedisFailure(error) {
+  const wasAlreadyOpen = redisCircuitOpenedAt !== null;
+  redisCircuitOpenedAt = Date.now();
+  if (!wasAlreadyOpen) {
+    console.error(JSON.stringify({
+      type: "metrics_store_redis_degraded",
+      message: "A Redis call failed -- metrics and circuit-breaker checks are temporarily fail-open/in-memory-only on this instance so requests keep flowing.",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
+
+// True when it's worth even trying a real Redis call right now.
+function redisUsable() {
+  return redis !== null && !isRedisCircuitOpen();
+}
+
+// ─── In-memory fallback (dev only, and Redis-outage fail-open) ──────────────
 
 const mem = {
   buckets: new Map(), // key -> { counters, status, lat[], ttft[] }
@@ -147,69 +199,99 @@ function bumpMem(bucket, status, latencyMs, ttftMs, usage, estimatedCost, isFall
   if (ttftMs != null) { bucket.ttft.push(ttftMs); if (bucket.ttft.length > MAX_SAMPLES) bucket.ttft.shift(); }
 }
 
+function recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
+  bumpMem(memBucket("global:_"), status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+  bumpMem(memBucket(`provider:${provider}`), status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+  bumpMem(memBucket(`model:${model}`), status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+  const pb = memBucket(`provider:${provider}`);
+  pb.models[model] = (pb.models[model] || 0) + 1;
+  if (!mem.sets.has("providers")) mem.sets.set("providers", new Set());
+  if (!mem.sets.has("models")) mem.sets.set("models", new Set());
+  mem.sets.get("providers").add(provider);
+  mem.sets.get("models").add(model);
+}
+
 export async function recordRequest(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
   provider = provider || "unknown";
   model = model || "unknown";
 
-  if (!redis) {
-    bumpMem(memBucket("global:_"), status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    bumpMem(memBucket(`provider:${provider}`), status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    bumpMem(memBucket(`model:${model}`), status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    const pb = memBucket(`provider:${provider}`);
-    pb.models[model] = (pb.models[model] || 0) + 1;
-    if (!mem.sets.has("providers")) mem.sets.set("providers", new Set());
-    if (!mem.sets.has("models")) mem.sets.set("models", new Set());
-    mem.sets.get("providers").add(provider);
-    mem.sets.get("models").add(model);
+  if (!redisUsable()) {
+    recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
     return;
   }
 
-  const pipeline = redis.pipeline();
-  await bumpBucket(pipeline, "global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-  await bumpBucket(pipeline, "provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-  await bumpBucket(pipeline, "model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-  pipeline.hincrby(modelsOfProviderKey(provider), model, 1);
-  pipeline.sadd(providersSetKey(), provider);
-  pipeline.sadd(modelsSetKey(), model);
-  await pipeline.exec();
+  try {
+    const pipeline = redis.pipeline();
+    await bumpBucket(pipeline, "global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    await bumpBucket(pipeline, "provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    await bumpBucket(pipeline, "model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    pipeline.hincrby(modelsOfProviderKey(provider), model, 1);
+    pipeline.sadd(providersSetKey(), provider);
+    pipeline.sadd(modelsSetKey(), model);
+    await pipeline.exec();
+  } catch (error) {
+    recordRedisFailure(error);
+    recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+  }
+}
+
+function recordUpstreamErrorMem(provider, model) {
+  const pb = memBucket(`provider:${provider}`);
+  pb.counters.upstreamErrors = (pb.counters.upstreamErrors || 0) + 1;
+  const gb = memBucket("global:_");
+  gb.counters.upstreamErrors = (gb.counters.upstreamErrors || 0) + 1;
+  if (model) {
+    const mb = memBucket(`model:${model}`);
+    mb.counters.upstreamErrors = (mb.counters.upstreamErrors || 0) + 1;
+  }
 }
 
 export async function recordUpstreamError(provider, model) {
   provider = provider || "unknown";
-  if (!redis) {
-    const pb = memBucket(`provider:${provider}`);
-    pb.counters.upstreamErrors = (pb.counters.upstreamErrors || 0) + 1;
-    const gb = memBucket("global:_");
-    gb.counters.upstreamErrors = (gb.counters.upstreamErrors || 0) + 1;
-    if (model) {
-      const mb = memBucket(`model:${model}`);
-      mb.counters.upstreamErrors = (mb.counters.upstreamErrors || 0) + 1;
-    }
+
+  if (!redisUsable()) {
+    recordUpstreamErrorMem(provider, model);
     return;
   }
-  const pipeline = redis.pipeline();
-  pipeline.hincrby(bucketKey("provider", provider), "upstreamErrors", 1);
-  pipeline.hincrby(bucketKey("global", "_"), "upstreamErrors", 1);
-  if (model) pipeline.hincrby(bucketKey("model", model), "upstreamErrors", 1);
-  pipeline.sadd(providersSetKey(), provider);
-  await pipeline.exec();
+
+  try {
+    const pipeline = redis.pipeline();
+    pipeline.hincrby(bucketKey("provider", provider), "upstreamErrors", 1);
+    pipeline.hincrby(bucketKey("global", "_"), "upstreamErrors", 1);
+    if (model) pipeline.hincrby(bucketKey("model", model), "upstreamErrors", 1);
+    pipeline.sadd(providersSetKey(), provider);
+    await pipeline.exec();
+  } catch (error) {
+    recordRedisFailure(error);
+    recordUpstreamErrorMem(provider, model);
+  }
 }
 
 // ─── Gauges (activeRequests / activeStreams) ─────────────────────────────────
 
 export async function incrGauge(name, delta) {
-  if (!redis) {
+  if (!redisUsable()) {
     mem.gauges.set(name, (mem.gauges.get(name) || 0) + delta);
     return;
   }
-  if (delta >= 0) await redis.incrby(gaugeKey(name), delta);
-  else await redis.decrby(gaugeKey(name), -delta);
+  try {
+    if (delta >= 0) await redis.incrby(gaugeKey(name), delta);
+    else await redis.decrby(gaugeKey(name), -delta);
+  } catch (error) {
+    recordRedisFailure(error);
+    mem.gauges.set(name, (mem.gauges.get(name) || 0) + delta);
+  }
 }
 
 export async function getGauge(name) {
-  if (!redis) return Math.max(0, mem.gauges.get(name) || 0);
-  const v = await redis.get(gaugeKey(name));
-  return Math.max(0, Number(v) || 0);
+  if (!redisUsable()) return Math.max(0, mem.gauges.get(name) || 0);
+  try {
+    const v = await redis.get(gaugeKey(name));
+    return Math.max(0, Number(v) || 0);
+  } catch (error) {
+    recordRedisFailure(error);
+    return Math.max(0, mem.gauges.get(name) || 0);
+  }
 }
 
 // ─── Circuit breakers (shared across instances) ──────────────────────────────
@@ -217,25 +299,41 @@ export async function getGauge(name) {
 const CB_THRESHOLD = 5;
 const CB_COOLDOWN_MS = 30000;
 
-export async function getCircuitBreaker(provider, model) {
-  const key = cbKey(provider, model);
-  if (!redis) {
-    if (!mem.cbs.has(key)) mem.cbs.set(key, { state: "closed", failures: 0, openedAt: null, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS });
-    return mem.cbs.get(key);
-  }
-  const raw = await redis.hgetall(key);
-  if (!raw || !raw.state) {
-    return { state: "closed", failures: 0, openedAt: null, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS };
-  }
-  return {
-    state: raw.state,
-    failures: Number(raw.failures) || 0,
-    openedAt: raw.openedAt ? Number(raw.openedAt) : null,
-    threshold: CB_THRESHOLD,
-    cooldownMs: CB_COOLDOWN_MS,
-  };
+function defaultCircuitBreaker() {
+  return { state: "closed", failures: 0, openedAt: null, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS };
 }
 
+export async function getCircuitBreaker(provider, model) {
+  const key = cbKey(provider, model);
+  if (!redisUsable()) {
+    if (!mem.cbs.has(key)) mem.cbs.set(key, defaultCircuitBreaker());
+    return mem.cbs.get(key);
+  }
+  try {
+    const raw = await redis.hgetall(key);
+    if (!raw || !raw.state) {
+      return defaultCircuitBreaker();
+    }
+    return {
+      state: raw.state,
+      failures: Number(raw.failures) || 0,
+      openedAt: raw.openedAt ? Number(raw.openedAt) : null,
+      threshold: CB_THRESHOLD,
+      cooldownMs: CB_COOLDOWN_MS,
+    };
+  } catch (error) {
+    recordRedisFailure(error);
+    // Fail open: an unreachable circuit-breaker store must never be
+    // treated as an OPEN circuit -- that would block a perfectly healthy
+    // provider route just because our own metrics Redis is struggling.
+    if (!mem.cbs.has(key)) mem.cbs.set(key, defaultCircuitBreaker());
+    return mem.cbs.get(key);
+  }
+}
+
+// isCircuitOpen deliberately never throws (see the Redis health circuit
+// breaker note above) -- both of its call sites in server.js need a
+// clean boolean, and one of them is a bare `await` outside any try/catch.
 export async function isCircuitOpen(provider, model) {
   const cb = await getCircuitBreaker(provider, model);
   if (cb.state === "open") {
@@ -250,14 +348,19 @@ export async function isCircuitOpen(provider, model) {
 
 async function setCircuitState(provider, model, state, failures, openedAt) {
   const key = cbKey(provider, model);
-  if (!redis) {
+  if (!redisUsable()) {
     mem.cbs.set(key, { state, failures, openedAt, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS });
     return;
   }
-  const pipeline = redis.pipeline();
-  pipeline.hset(key, { state, failures, openedAt: openedAt ?? "" });
-  pipeline.sadd(cbSetKey(), key);
-  await pipeline.exec();
+  try {
+    const pipeline = redis.pipeline();
+    pipeline.hset(key, { state, failures, openedAt: openedAt ?? "" });
+    pipeline.sadd(cbSetKey(), key);
+    await pipeline.exec();
+  } catch (error) {
+    recordRedisFailure(error);
+    mem.cbs.set(key, { state, failures, openedAt, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS });
+  }
 }
 
 export async function recordBreakerFailure(provider, model) {
@@ -280,7 +383,7 @@ export async function recordBreakerSuccess(provider, model) {
 }
 
 export async function getAllCircuitBreakers() {
-  if (!redis) {
+  if (!redisUsable()) {
     const out = {};
     for (const [key, cb] of mem.cbs.entries()) {
       const shortKey = key.slice(PREFIX.length + 3); // strip "gw:m:cb:"
@@ -288,40 +391,56 @@ export async function getAllCircuitBreakers() {
     }
     return out;
   }
-  const keys = await redis.smembers(cbSetKey());
-  if (!keys.length) return {};
-  const out = {};
-  await Promise.all(keys.map(async (key) => {
-    const raw = await redis.hgetall(key);
-    if (!raw || !raw.state) return;
-    const shortKey = key.slice(PREFIX.length + 3);
-    out[shortKey] = {
-      state: raw.state,
-      failures: Number(raw.failures) || 0,
-      openedAt: raw.openedAt ? Number(raw.openedAt) : null,
-    };
-  }));
-  return out;
+  try {
+    const keys = await redis.smembers(cbSetKey());
+    if (!keys.length) return {};
+    const out = {};
+    await Promise.all(keys.map(async (key) => {
+      const raw = await redis.hgetall(key);
+      if (!raw || !raw.state) return;
+      const shortKey = key.slice(PREFIX.length + 3);
+      out[shortKey] = {
+        state: raw.state,
+        failures: Number(raw.failures) || 0,
+        openedAt: raw.openedAt ? Number(raw.openedAt) : null,
+      };
+    }));
+    return out;
+  } catch (error) {
+    recordRedisFailure(error);
+    const out = {};
+    for (const [key, cb] of mem.cbs.entries()) {
+      const shortKey = key.slice(PREFIX.length + 3);
+      out[shortKey] = cb;
+    }
+    return out;
+  }
 }
 
 // ─── Snapshot for /metrics and /health ───────────────────────────────────────
 
 async function readBucket(scope, name) {
-  if (!redis) {
+  if (!redisUsable()) {
     const b = memBucket(scope === "global" ? "global:_" : `${scope}:${name}`);
     return serializeFromMem(b);
   }
-  const bk = bucketKey(scope, name);
-  const sk = statusKey(scope, name);
-  const lk = latKey(scope, name);
-  const tk = ttftKey(scope, name);
-  const [counters, status, lat, ttft] = await Promise.all([
-    redis.hgetall(bk),
-    redis.hgetall(sk),
-    redis.lrange(lk, 0, -1),
-    redis.lrange(tk, 0, -1),
-  ]);
-  return serializeFromRedis(counters || {}, status || {}, (lat || []).map(Number), (ttft || []).map(Number));
+  try {
+    const bk = bucketKey(scope, name);
+    const sk = statusKey(scope, name);
+    const lk = latKey(scope, name);
+    const tk = ttftKey(scope, name);
+    const [counters, status, lat, ttft] = await Promise.all([
+      redis.hgetall(bk),
+      redis.hgetall(sk),
+      redis.lrange(lk, 0, -1),
+      redis.lrange(tk, 0, -1),
+    ]);
+    return serializeFromRedis(counters || {}, status || {}, (lat || []).map(Number), (ttft || []).map(Number));
+  } catch (error) {
+    recordRedisFailure(error);
+    const b = memBucket(scope === "global" ? "global:_" : `${scope}:${name}`);
+    return serializeFromMem(b);
+  }
 }
 
 function serializeFromRedis(c, status, lat, ttft) {
@@ -394,16 +513,22 @@ export async function getMetricsSnapshot(knownProviders, knownModels) {
   const global = await readBucket("global", "_");
 
   let providerNames, modelNames;
-  if (!redis) {
+  if (!redisUsable()) {
     providerNames = [...new Set([...(mem.sets.get("providers") || []), ...knownProviders])];
     modelNames = [...new Set([...(mem.sets.get("models") || []), ...knownModels])];
   } else {
-    const [seenProviders, seenModels] = await Promise.all([
-      redis.smembers(providersSetKey()),
-      redis.smembers(modelsSetKey()),
-    ]);
-    providerNames = [...new Set([...(seenProviders || []), ...knownProviders])];
-    modelNames = [...new Set([...(seenModels || []), ...knownModels])];
+    try {
+      const [seenProviders, seenModels] = await Promise.all([
+        redis.smembers(providersSetKey()),
+        redis.smembers(modelsSetKey()),
+      ]);
+      providerNames = [...new Set([...(seenProviders || []), ...knownProviders])];
+      modelNames = [...new Set([...(seenModels || []), ...knownModels])];
+    } catch (error) {
+      recordRedisFailure(error);
+      providerNames = [...new Set([...(mem.sets.get("providers") || []), ...knownProviders])];
+      modelNames = [...new Set([...(mem.sets.get("models") || []), ...knownModels])];
+    }
   }
 
   const byProvider = {};

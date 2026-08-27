@@ -628,6 +628,11 @@ async function handle(req, res) {
     }
     const r = available[i];
     const provider = r.provider || r.upstreamApiKeyEnv || "unknown";
+    // isCircuitOpen() is guaranteed to never throw (fails open internally
+    // in metrics-store.js) -- this bare await used to be the actual cause
+    // of real requests hanging until Vercel's 300s function timeout during
+    // a 2026-08-27 Upstash rate-limit incident, since it sat outside the
+    // try/catch below with nothing to catch a raw Redis error escaping it.
     if (available.length > 1 && (await isCircuitOpen(provider, model))) continue; // skip open circuits if alternatives exist
     try {
       await proxy(req, res, r, p, model, action, id, i > 0);
