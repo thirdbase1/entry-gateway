@@ -87,11 +87,28 @@ const adminKeys = () => new Set((process.env.ADMIN_API_KEYS || "").split(",").ma
 // actually "encrypted" as the comment above hoped). Same fix: a third
 // slot for new additions, verified as type "encrypted" (readable via
 // the API) when it was created this time.
+//
+// BUG FOUND 2026-08-28: EXTRA_MODEL_ROUTES_JSON_4 was created on Vercel
+// at some point (type "encrypted", has a value) but was NEVER added to
+// this array -- so whatever routes it holds have been completely inert
+// in production this whole time, silently. Also confirmed the same day:
+// the opaque base64 "eyJ2...` blob the Vercel API returns for
+// decrypt=true on an "encrypted"-type var is NOT a double-encryption bug
+// -- it's just Vercel's normal API representation for that var type
+// (confirmed by creating EXTRA_MODEL_ROUTES_JSON_5 fresh with known
+// plaintext and seeing the identical envelope shape come straight back
+// in the creation response itself). So _2/_3/_4 are likely fine
+// underneath; there's just no way to read the real plaintext back via
+// this API for any of them. Wiring in both _4 and a new _5 now (used for
+// the api.b.ai models added this same day: deepseek-v4-flash-vision-exp,
+// glm-5.3-flash, qwen3.8-flash).
 const configured = () => [
   ...(Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_2", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_2", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_3", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_3", []) : []),
+  ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_4", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_4", []) : []),
+  ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_5", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_5", []) : []),
 ].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r }));
 const routes = () => {
   const m = new Map();
