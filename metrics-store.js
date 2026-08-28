@@ -379,9 +379,19 @@ function cbMemKey(provider, model) {
 
 export async function getCircuitBreaker(provider, model) {
   const key = cbMemKey(provider, model);
+  // Fast path: trust a within-cooldown snapshot written by THIS instance's
+  // recordBreaker* calls (see setCircuitState). This is what lets server.js
+  // fire-and-forget the durable DB write on the request hot path without the
+  // circuit breaker going blind -- in-instance state stays synchronous and
+  // correct, while the DB write still propagates it to other instances. On a
+  // cold start (no local snapshot) or once a snapshot ages past the cooldown
+  // window we fall through to the DB so cross-instance state (e.g. another
+  // instance having tripped this breaker) is still picked up.
+  const local = mem.cbs.get(key);
+  if (local && Date.now() - (local.updatedAt || 0) < CB_COOLDOWN_MS) return { ...local };
   if (!dbUsable()) {
-    if (!mem.cbs.has(key)) mem.cbs.set(key, defaultCircuitBreaker());
-    return mem.cbs.get(key);
+    if (!mem.cbs.has(key)) mem.cbs.set(key, { ...defaultCircuitBreaker(), updatedAt: Date.now() });
+    return { ...mem.cbs.get(key) };
   }
   try {
     await ensureSchema();
@@ -403,8 +413,8 @@ export async function getCircuitBreaker(provider, model) {
     // Fail open: an unreachable circuit-breaker store must never be
     // treated as an OPEN circuit -- that would block a perfectly healthy
     // provider route just because our own metrics DB is struggling.
-    if (!mem.cbs.has(key)) mem.cbs.set(key, defaultCircuitBreaker());
-    return mem.cbs.get(key);
+    if (!mem.cbs.has(key)) mem.cbs.set(key, { ...defaultCircuitBreaker(), updatedAt: Date.now() });
+    return { ...mem.cbs.get(key) };
   }
 }
 
@@ -425,10 +435,12 @@ export async function isCircuitOpen(provider, model) {
 
 async function setCircuitState(provider, model, state, failures, openedAt) {
   const key = cbMemKey(provider, model);
-  if (!dbUsable()) {
-    mem.cbs.set(key, { state, failures, openedAt, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS });
-    return;
-  }
+  // Update the synchronous in-instance overlay FIRST so subsequent
+  // isCircuitOpen()/getCircuitBreaker() calls on this warm instance see the
+  // new state immediately, independent of whether/when the durable DB write
+  // below lands (server.js fire-and-forgets it off the request hot path).
+  mem.cbs.set(key, { state, failures, openedAt, updatedAt: Date.now(), threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS });
+  if (!dbUsable()) return;
   try {
     await ensureSchema();
     await sql`
@@ -439,7 +451,7 @@ async function setCircuitState(provider, model, state, failures, openedAt) {
     `;
   } catch (error) {
     recordDbFailure(error);
-    mem.cbs.set(key, { state, failures, openedAt, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS });
+    // Overlay was already updated above; nothing further to do on failure.
   }
 }
 
