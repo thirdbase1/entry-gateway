@@ -479,3 +479,63 @@ fail-open path -- confirmed correct, then cleaned up the test rows.
 Removed `KV_REST_API_URL`/`KV_REST_API_TOKEN` from the Vercel project and
 `@upstash/redis` from package.json -- zero Upstash usage left anywhere in
 this repo.
+
+## 2026-08-28: Wired 3 new models via api.b.ai, fixed dead EXTRA_MODEL_ROUTES_JSON_4
+
+Owner asked to add three models -- deepseek-v4-flash-vision-exp, glm-5.3-flash, qwen3.8-flash --
+via a new reseller, api.b.ai, using a provided key (now stored as the `BAI_API_KEY` Vercel secret,
+type sensitive). Live-tested the key against api.b.ai directly first (`/v1/models` catalog list +
+real chat completions for all three) before wiring anything into the gateway.
+
+Found and fixed a real bug while doing this: `EXTRA_MODEL_ROUTES_JSON_4` already existed on Vercel
+(type "encrypted", has a value) but was never added to `configured()`'s array -- meaning whatever
+routes it holds have been completely inert in production, silently, since whenever it was created.
+Added both `_4` and a new `_5` (used for these 3 new routes) to `configured()`. Also resolved a
+long-running suspicion from the `_2`/`_3` comments above: the opaque base64 `eyJ2...` blob the
+Vercel API returns for `decrypt=true` on an "encrypted"-type var is NOT a double-encryption bug --
+it's just Vercel's normal API representation for that var type. Confirmed by creating `_5` fresh
+with known plaintext JSON and getting the identical envelope shape back immediately in the
+creation response itself, before any encryption round-trip could have mangled it. So `_2`/`_3`/`_4`
+are probably fine underneath; there's just no way to ever read the real plaintext back via this
+API for any "encrypted" var, by design.
+
+Pricing sourced from each model's real creator's own published rate, not api.b.ai's (reseller)
+rate, per owner instruction ("price all of them with the official price of the creator"):
+
+- **deepseek-v4-flash-vision-exp** (DeepSeek's own pricing page, api-docs.deepseek.com): shares
+  deepseek-v4-flash's rate card exactly (not deepseek-v4-pro's higher one). Real pricing has a
+  peak/off-peak split (peak = 01:00-04:00 and 06:00-10:00 UTC Mon-Fri; off-peak = everything else,
+  half price) that this gateway has no time-of-day mechanism to model -- picked the PEAK rate as a
+  flat, conservative choice so we never undercharge: `input: 0.44, output: 1.32, cache_read: 0.014`
+  (all per 1M tokens). Context window 1,048,576 (1M), max output 384K per DeepSeek's own table.
+  Confirmed via live probe: thinking mode default-on, but genuinely toggleable (reasoning_effort
+  "none" zeroes reasoning_content/reasoning_tokens); kept on the app's DEFAULT_LEVELS
+  (low/medium/high) matching deepseek-v4-flash's own established convention rather than exposing
+  the full none-xhigh-max range it technically also accepts.
+- **glm-5.3-flash** (Z.ai's own pricing page, docs.z.ai/guides/overview/pricing): current effective
+  *promotional* rate (50% off through 24:00 Sept 9, 2026 UTC+8) -- `input: 0.075, output: 0.25,
+  cache_read: 0.015` per 1M. List price after the promo ends is double that
+  (0.15/0.50/0.03) -- **needs revisiting after 2026-09-09** or this will undercharge going
+  forward. Context window 1M, max output 128K per Z.ai's own model page. Confirmed via live probe:
+  genuinely cannot disable thinking -- both "none" and "medium" reasoning_effort get a hard 400
+  straight from the upstream itself ("该模型始终思考，不支持关闭思考；请使用 low、high 或
+  max。" -- "this model always thinks, disabling isn't supported; use low, high, or max"). Real
+  accepted vocabulary is exactly low/high/max, added as an explicit override in entry-agents'
+  model-reasoning.ts.
+- **qwen3.8-flash** (Alibaba Cloud's own blog post announcing the model): `input: 0.16, output:
+  0.47` per 1M. No official cache-read rate published anywhere by Alibaba for this specific model,
+  so left unset rather than assuming a discount -- falls back to full input rate on any cache hit,
+  which is the safe direction to be wrong in. Context window 1M (default; natively 262,144,
+  extendable via YaRN) per Alibaba's/Qwen's own announcement. Confirmed via live probe: real
+  accepted reasoning_effort vocabulary is the *full* none/low/medium/high/xhigh/max -- wider than
+  either existing Qwen3.8 model already in this codebase (qwen3.8-max-free: low/medium/xhigh;
+  qwen3.8-27b: none/low/medium/xhigh) -- and "none" genuinely zeroes reasoning output rather than
+  silently ignoring the param. Added as its own explicit override in model-reasoning.ts.
+
+All three verified end-to-end live through entry-agents' own reasoning-probe route (which calls
+*this* gateway, not api.b.ai directly) after both repos redeployed -- real 200s with correct
+reasoning_content and final answers for all three model ids.
+
+No icon-wiring needed: entry-agents' provider-icons.tsx infers the brand from the model id's
+prefix (`deepseek-`, `glm-`, `qwen-`) rather than any field this gateway returns, so all three
+picked up the right @lobehub/icons brand automatically.
