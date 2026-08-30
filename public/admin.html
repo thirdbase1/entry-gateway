@@ -794,7 +794,14 @@
       const models = modelsRes.status === 'fulfilled' ? modelsRes.value : null;
       const routes = routesRes.status === 'fulfilled' ? routesRes.value : null;
 
+      const rejected = [metricsRes, modelsRes, routesRes].filter(r => r.status === 'rejected');
       if (!health) throw new Error(healthRes.reason?.message || 'Failed to connect');
+      if (rejected.length === 3) {
+        // Auto-auth session rejected or expired -- re-open the key bar so a
+        // key can still be entered manually.
+        document.getElementById('conn-bar').style.display = '';
+        throw new Error(rejected[0].reason?.message || 'Unauthorized');
+      }
 
       render(health, metrics, models, routes);
       document.getElementById('refreshTime').textContent = new Date().toLocaleTimeString();
@@ -1035,13 +1042,15 @@
       apiKey = metaKey.content;
       document.getElementById('gwKey').value = apiKey;
     }
-    // If both are present, auto-connect immediately
-    if (baseUrl && apiKey) {
-      document.getElementById('conn-bar').style.display = 'none';
-      connect();
-    } else if (baseUrl) {
-      // Pre-fill URL but show the bar for manual key entry
+    // Auto-connect as soon as the URL is known: the server hands this page a
+    // short-lived signed HttpOnly session cookie, so read-only data loads with
+    // NO key entry at all. A pasted key remains optional and only adds the
+    // ability to run paid proxy test calls; if the gateway rejects the session
+    // (ADMIN_AUTOAUTH=0 or expired), the 401 path re-opens the key bar.
+    if (baseUrl) {
       document.getElementById('gwUrl').value = baseUrl;
+      if (apiKey) document.getElementById('conn-bar').style.display = 'none';
+      connect();
     }
   </script>
 </body>

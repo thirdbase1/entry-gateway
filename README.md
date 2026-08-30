@@ -17,37 +17,30 @@ No payload translation is performed. A request is routed only to upstreams confi
 
 ## Admin Dashboard
 
-The dashboard auto-detects the gateway URL and API key from environment variables — **zero manual config needed** on Vercel or any self-hosted deployment.
+The dashboard is a static page served at `/` and `/admin`. The page itself is public (a browser can't send an `Authorization` header on a top-level navigation), but **every API call it makes is Bearer-authenticated**, so no data is exposed without a key.
 
 ### Auto-detection
 
-When the server serves `/admin`, it injects two meta tags into the HTML:
+When the server serves `/admin`, it injects meta tags into the HTML:
 
-| Meta tag | Source | Description |
+| Meta tag | Source | Injected when |
 |---|---|---|
-| `gateway-url` | `VERCEL_URL` env var (prepended with `https://`) or request origin | The gateway's public URL |
-| `gateway-key` | First key from `ADMIN_API_KEYS` (falls back to `GATEWAY_API_KEYS`) | Bearer token for API calls |
+| `gateway-url` | request origin | always (the URL is not a secret) |
+| `gateway-key` | First key from `ADMIN_API_KEYS` (falls back to `GATEWAY_API_KEYS`) | **only when the request already presents a valid Bearer token** |
 
-If both are present, the dashboard **auto-connects immediately** — no manual URL or key entry needed. If only the URL is detected, the key field is shown for manual entry.
+The `gateway-key` is deliberately **not** embedded for anonymous visitors. An earlier version injected the live admin/gateway key into the page for *anyone* who could reach the URL — a credential leak, since the page is served without auth. Now the key is only auto-injected when the request itself is already authenticated (e.g. an internal tool that fetches `/admin` with an `Authorization` header). A normal browser visit gets the URL pre-filled and shows the key field for manual entry.
 
 ### Accessing the dashboard
 
 ```bash
-# On Vercel — auto-connects, just open in browser
+# Open in a browser — URL is auto-filled, paste your key into the connection bar
 open https://your-gateway.vercel.app/admin
 
-# Self-hosted — also auto-connects
-open https://your-gateway.example.com/admin
-
-# Manual connection (if auto-detect is unavailable)
-# Enter gateway URL and API key in the connection bar
-```
-
-Auth is required to access `/admin` — you need a valid `ADMIN_API_KEYS` or `GATEWAY_API_KEYS` Bearer token. In a browser, pass the key as a URL hash:
-
-```bash
+# Or pass the key as a URL hash so the page auto-connects on load
 open https://your-gateway.vercel.app/admin#your-admin-key
 ```
+
+The `#your-admin-key` hash is read client-side and never sent to the server in the request line, so it isn't logged by the gateway or intermediaries.
 
 ### What the dashboard shows
 
