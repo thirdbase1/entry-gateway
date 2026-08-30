@@ -18,6 +18,7 @@ import http from "node:http";
 
 const GW_KEY = "gw-secret-key";
 const RL_KEY = "rl-key";
+const FAIL_KEY = "failure-test-key";
 const ADMIN_KEY = "admin-secret-key";
 
 function listen(server) {
@@ -56,19 +57,27 @@ function request(port, { method = "GET", path = "/", headers = {}, body } = {}) 
 
 const geminiLog = [];
 const openaiLog = [];
+let failingUpstreamHits = 0;
 let gatewayPort;
 let gateway;
 let geminiUpstream;
 let openaiUpstream;
+let failingUpstream;
 
 test.before(async () => {
   geminiUpstream = startMockUpstream(geminiLog);
   openaiUpstream = startMockUpstream(openaiLog);
   const geminiPort = await listen(geminiUpstream);
   const openaiPort = await listen(openaiUpstream);
+  failingUpstream = http.createServer((_req, res) => {
+    failingUpstreamHits += 1;
+    res.writeHead(503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "unavailable" }));
+  });
+  const failingPort = await listen(failingUpstream);
 
   process.env.VERCEL = "1"; // don't app.listen()
-  process.env.GATEWAY_API_KEYS = `${GW_KEY},${RL_KEY}`;
+  process.env.GATEWAY_API_KEYS = `${GW_KEY},${RL_KEY},${FAIL_KEY}`;
   process.env.ADMIN_API_KEYS = ADMIN_KEY;
   process.env.MODEL_DISCOVERY_JSON = "[]";
   process.env.TEST_G_KEY = "dummy-g";
@@ -79,6 +88,7 @@ test.before(async () => {
   process.env.MODEL_ROUTES_JSON = JSON.stringify([
     { id: "gemini-3.5-flash", protocol: "gemini-generate", provider: "pG", upstreamBaseURL: `http://127.0.0.1:${geminiPort}`, upstreamApiKeyEnv: "TEST_G_KEY", priority: 1 },
     { id: "test-openai", protocol: "openai-chat", provider: "pA", upstreamBaseURL: `http://127.0.0.1:${openaiPort}`, upstreamApiKeyEnv: "TEST_A_KEY", priority: 1 },
+    { id: "failing-openai", protocol: "openai-chat", provider: "pFail", upstreamBaseURL: `http://127.0.0.1:${failingPort}`, upstreamApiKeyEnv: "TEST_A_KEY", priority: 1 },
   ]);
 
   const { default: app } = await import(`./server.js?t=${Date.now()}`);
@@ -87,7 +97,7 @@ test.before(async () => {
 });
 
 test.after(async () => {
-  for (const s of [gateway, geminiUpstream, openaiUpstream]) {
+  for (const s of [gateway, geminiUpstream, openaiUpstream, failingUpstream]) {
     s?.closeAllConnections?.();
     s?.close?.();
   }
@@ -218,6 +228,34 @@ test("6b. session cookie auto-auths read-only endpoints without a Bearer token",
     const r = await request(gatewayPort, { path, headers: { Cookie: pair } });
     assert.equal(r.status, 200, `${path} should be auto-authed by the session cookie`);
   }
+});
+
+test("5b. each retryable upstream response counts as one breaker failure", async () => {
+  failingUpstreamHits = 0;
+  for (let i = 0; i < 3; i++) {
+    const r = await request(gatewayPort, {
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: { Authorization: `Bearer ${FAIL_KEY}`, "Content-Type": "application/json" },
+      body: { model: "failing-openai", messages: [{ role: "user", content: "hi" }] },
+    });
+    assert.equal(r.status, 502);
+  }
+
+  const { getCircuitBreaker } = await import("./metrics-store.js");
+  const cb = await getCircuitBreaker("pFail", "failing-openai");
+  assert.equal(failingUpstreamHits, 3);
+  assert.equal(cb.state, "closed", "three failures must not trip a five-failure breaker");
+  assert.equal(cb.failures, 3, "each upstream response must increment the breaker exactly once");
+});
+
+test("6b-2. a dedicated admin key can read /v1/models", async () => {
+  const r = await request(gatewayPort, {
+    path: "/v1/models",
+    headers: { Authorization: `Bearer ${ADMIN_KEY}` },
+  });
+  assert.equal(r.status, 200);
+  assert.equal(JSON.parse(r.body).object, "list");
 });
 
 test("6c. session cookie must NOT unlock the paid proxy routes", async () => {

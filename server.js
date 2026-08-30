@@ -287,7 +287,10 @@ const modelsAuth = (req, res, next) => {
   const valid = keys();
   const admins = adminKeys();
   if (!valid.size && !admins.size) return res.status(500).json({ error: { type: "ConfigError", message: "GATEWAY_API_KEYS is not configured." } });
-  if (valid.has(supplied) || (admins.size && admins.has(supplied))) return auth(req, res, next);
+  // A dedicated admin key is valid for this read-only endpoint but is not a
+  // gateway key, so sending it through auth() would incorrectly reject it.
+  if (admins.size && admins.has(supplied)) return next();
+  if (valid.has(supplied)) return auth(req, res, next);
   if (autoAuthEnabled() && dashTokenValid(cookieValue(req, DASH_COOKIE))) return next();
   return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
 };
@@ -788,14 +791,15 @@ async function proxy(req, res, r, p, model, action, id, isFallback) {
     defer(recordRequest(provider, model, response.status, latencyMs, ttft, normalizedUsage, estimatedCost, isFallback));
     log({ requestId: id, model, protocol: p, provider, status: response.status, latencyMs, ttftMs: ttft, usage: normalizedUsage, cache: cacheSummary(normalizedUsage), estimatedCost, isFallback });
   } catch (e) {
-    defer(recordBreakerFailure(provider, model));
-    defer(recordUpstreamError(provider, model));
-    // Only record here if we haven't already recorded this exact attempt
-    // above (the 5xx/429 branch records before throwing). e.retryable is
-    // only set by that branch, so its absence means this is a genuine
-    // network-level failure (timeout, DNS, abort, missing key, etc.) that
-    // never got a recordRequest call yet.
-    if (!e.retryable) defer(recordRequest(provider, model, 0, Date.now() - started, ttft, null, null, isFallback));
+    // The 5xx/429 branch records the failure before throwing so it can retain
+    // the real upstream status. Only network-level failures reach this catch
+    // unrecorded; counting retryable responses again would trip the breaker
+    // twice per failed attempt and double the upstream-error metric.
+    if (!e.retryable) {
+      defer(recordBreakerFailure(provider, model));
+      defer(recordUpstreamError(provider, model));
+      defer(recordRequest(provider, model, 0, Date.now() - started, ttft, null, null, isFallback));
+    }
     throw e;
   } finally {
     defer(incrGauge("activeRequests", -1));
