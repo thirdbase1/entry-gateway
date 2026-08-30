@@ -192,3 +192,71 @@ test("5. per-key rate limiting returns 429 once the budget is exhausted", async 
   assert.equal(limited.headers["retry-after"], "1");
   assert.match(limited.body, /RateLimitError/);
 });
+
+// ─── 6. Dashboard auto-auth (signed HttpOnly session, no key entry) ──────────
+// The dashboard page must authenticate itself with NO credential entry, via a
+// short-lived signed cookie that unlocks READ-ONLY endpoints only. The real
+// API keys must never appear in the page, and the paid proxy routes must keep
+// requiring a real key.
+test("6a. GET /admin hands out a signed session cookie without any key", async () => {
+  const res = await request(gatewayPort, { path: "/admin" });
+  assert.equal(res.status, 200);
+  const cookie = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash="));
+  assert.ok(cookie, "expected a gw_dash session cookie");
+  assert.match(cookie, /HttpOnly/i);
+  assert.match(cookie, /SameSite=Strict/i);
+  assert.match(cookie, /Max-Age=/);
+  // The cookie must not simply BE an API key.
+  assert.ok(!cookie.includes(ADMIN_KEY) && !cookie.includes(GW_KEY));
+});
+
+test("6b. session cookie auto-auths read-only endpoints without a Bearer token", async () => {
+  const res = await request(gatewayPort, { path: "/admin" });
+  const cookie = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash="));
+  const pair = cookie.split(";")[0];
+  for (const path of ["/metrics", "/v1/debug/routes", "/v1/models"]) {
+    const r = await request(gatewayPort, { path, headers: { Cookie: pair } });
+    assert.equal(r.status, 200, `${path} should be auto-authed by the session cookie`);
+  }
+});
+
+test("6c. session cookie must NOT unlock the paid proxy routes", async () => {
+  const res = await request(gatewayPort, { path: "/admin" });
+  const pair = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash=")).split(";")[0];
+  const r = await request(gatewayPort, {
+    method: "POST",
+    path: "/v1/chat/completions",
+    headers: { "Content-Type": "application/json", Cookie: pair },
+    body: { model: "gemini-3.5-flash", messages: [{ role: "user", content: "hi" }] },
+  });
+  assert.equal(r.status, 401, "proxy routes keep requiring a real API key");
+  assert.match(r.body, /AuthError/);
+});
+
+test("6d. a tampered session cookie is rejected", async () => {
+  const res = await request(gatewayPort, { path: "/admin" });
+  const pair = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash=")).split(";")[0];
+  const [name, value] = pair.split("=");
+  const [exp, sig] = value.split(".");
+  const forged = `${name}=${exp}.${"0".repeat(sig.length)}`;
+  const r = await request(gatewayPort, { path: "/metrics", headers: { Cookie: forged } });
+  assert.equal(r.status, 401);
+  // And a forged far-future expiry with a bogus signature too.
+  const forged2 = `${name}=${Date.now() + 3.6e6}.${"f".repeat(sig.length)}`;
+  const r2 = await request(gatewayPort, { path: "/metrics", headers: { Cookie: forged2 } });
+  assert.equal(r2.status, 401);
+});
+
+test("6e. ADMIN_AUTOAUTH=0 disables the session entirely", async () => {
+  process.env.ADMIN_AUTOAUTH = "0";
+  try {
+    const res = await request(gatewayPort, { path: "/admin" });
+    assert.equal(res.status, 200);
+    const cookie = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash="));
+    assert.ok(!cookie, "no session cookie should be issued when auto-auth is off");
+    const r = await request(gatewayPort, { path: "/metrics" });
+    assert.equal(r.status, 401);
+  } finally {
+    delete process.env.ADMIN_AUTOAUTH;
+  }
+});

@@ -1,6 +1,6 @@
 import express from "express";
 import { readFileSync } from "fs";
-import { createHash } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import {
@@ -222,6 +222,73 @@ const adminAuth = (req, res, next) => {
   if (!valid.size && !admins.size) return res.status(500).json({ error: { type: "ConfigError", message: "No keys configured." } });
   if (admins.size && admins.has(supplied)) return next();
   if (valid.has(supplied)) return next();
+  // Read-only dashboard session: auto-issued by the dashboard page itself, so
+  // opening /admin authenticates the viewer with no key entry at all.
+  if (autoAuthEnabled() && dashTokenValid(cookieValue(req, DASH_COOKIE))) return next();
+  return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
+};
+
+// ─── Dashboard auto-auth (stateless signed session) ──────────────────────────
+// The dashboard is a read-only viewer for /health, /metrics, /v1/models and
+// /v1/debug/routes. Rather than embedding a live API key in the page (the
+// critical leak fixed in serveAdminDashboard) or forcing the operator to paste
+// a key, serving the dashboard sets a short-lived HttpOnly cookie signed with
+// a secret DERIVED FROM the configured keys -- never the keys themselves.
+// adminAuth and the read-only /v1/models route accept that cookie, so simply
+// opening the dashboard authenticates it. The paid proxy routes keep requiring
+// a real API key, so a stolen or forged cookie can never spend money.
+const DASH_COOKIE = "gw_dash";
+const DASH_TTL_MS = 8 * 60 * 60 * 1000; // one operator workday
+// Read lazily (not module-level) so tests can toggle it per request.
+const autoAuthEnabled = () => process.env.ADMIN_AUTOAUTH !== "0";
+const dashSecret = () => {
+  const seed = process.env.ADMIN_API_KEYS || process.env.GATEWAY_API_KEYS || "";
+  return seed ? createHash("sha256").update(`gw-dash-v1:${seed}`).digest() : null;
+};
+const dashSign = (secret, exp) => createHmac("sha256", secret).update(`dash:${exp}`).digest("hex");
+const dashToken = () => {
+  const secret = dashSecret();
+  if (!secret || !autoAuthEnabled()) return null;
+  const exp = Date.now() + DASH_TTL_MS;
+  return `${exp}.${dashSign(secret, exp)}`;
+};
+const dashTokenValid = token => {
+  const secret = dashSecret();
+  if (!secret || !autoAuthEnabled() || !token) return false;
+  const dot = token.lastIndexOf(".");
+  if (dot <= 0) return false;
+  const exp = Number(token.slice(0, dot));
+  if (!Number.isFinite(exp) || exp < Date.now()) return false;
+  const expected = Buffer.from(dashSign(secret, exp), "hex");
+  let actual;
+  try { actual = Buffer.from(token.slice(dot + 1), "hex"); } catch { return false; }
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+};
+// Minimal single-purpose cookie reader -- avoids adding a cookie-parser
+// dependency just to read one value.
+const cookieValue = (req, name) => {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === name) {
+      try { return decodeURIComponent(part.slice(eq + 1).trim()); } catch { return part.slice(eq + 1).trim(); }
+    }
+  }
+  return null;
+};
+
+// /v1/models is read-only (no spend), so the auto-authed dashboard session may
+// call it too. Real API keys still go through `auth` so they keep their
+// per-key rate limiting and headers.
+const modelsAuth = (req, res, next) => {
+  const supplied = bearerToken(req);
+  const valid = keys();
+  const admins = adminKeys();
+  if (!valid.size && !admins.size) return res.status(500).json({ error: { type: "ConfigError", message: "GATEWAY_API_KEYS is not configured." } });
+  if (valid.has(supplied) || (admins.size && admins.has(supplied))) return auth(req, res, next);
+  if (autoAuthEnabled() && dashTokenValid(cookieValue(req, DASH_COOKIE))) return next();
   return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
 };
 // Case-insensitive match: Google's two action names differ only in the
@@ -897,7 +964,7 @@ function resolvedCostFor(r) {
   return resolved;
 }
 
-app.get("/v1/models", auth, (_req, res) => {
+app.get("/v1/models", modelsAuth, (_req, res) => {
   const m = new Map();
   for (const r of routes().filter((r) => r.enabled !== false)) {
     const x = m.get(r.id) || { id: r.id, object: "model", name: r.name || r.id, owned_by: r.provider || "gateway", protocols: [], context_window: r.context_window, cost: resolvedCostFor(r) };
@@ -978,6 +1045,19 @@ const serveAdminDashboard = (req, res) => {
     // can carry the operator's key, and even unauthenticated it reflects the
     // request Host, so it must not be stored or shared.
     res.setHeader("Cache-Control", "no-store");
+
+    // Dashboard auto-auth: hand every visitor a short-lived, signed, HttpOnly
+    // session cookie so the page can load read-only admin data with NO key
+    // entry at all. Real API keys are still never embedded in the page, and
+    // this cookie is worthless against the paid proxy routes (they keep
+    // requiring a real key). Set ADMIN_AUTOAUTH=0 to revert to key-only.
+    const token = dashToken();
+    if (token) {
+      const secure = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "; Secure" : "";
+      res.setHeader("Set-Cookie",
+        `${DASH_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(DASH_TTL_MS / 1000)}${secure}`);
+    }
+
     res.set("Content-Type", "text/html").send(html);
   } catch {
     res.status(404).send("Admin dashboard not found.");
