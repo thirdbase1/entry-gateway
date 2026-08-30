@@ -5,19 +5,19 @@ Self-hosted, config-driven native-protocol AI gateway. Clients use one gateway A
 ## Routes
 
 - `GET /health` — gateway status, uptime, providers, circuit breakers, active requests
-- `GET /metrics` — per-provider and aggregate metrics (admin-auth protected)
-- `GET /admin` — built-in admin dashboard UI (admin-auth protected)
+- `GET /metrics` — per-provider and aggregate metrics (public through the read-only dashboard session by default)
+- `GET /admin` — built-in public, read-only admin dashboard UI
 - `GET /v1/models` — deduplicated public models with protocol metadata
 - `POST /v1/chat/completions` — OpenAI-compatible passthrough
 - `POST /v1/messages` — Anthropic Messages passthrough
 - `POST /v1beta/models/:model:generateContent` — Gemini-style passthrough
-- `GET /v1/debug/routes` — route configuration debug view (admin-auth protected)
+- `GET /v1/debug/routes` — route configuration debug view (public through the read-only dashboard session by default)
 
 No payload translation is performed. A request is routed only to upstreams configured for the same native protocol. Duplicate models use ascending `priority` and fall back to the next compatible upstream after retryable upstream failures.
 
 ## Admin Dashboard
 
-The dashboard is a static page served at `/` and `/admin`. The page itself is public (a browser can't send an `Authorization` header on a top-level navigation), but **every API call it makes is Bearer-authenticated**, so no data is exposed without a key.
+The dashboard is a static page served at `/` and `/admin`. By design, opening it creates a signed, read-only session with access to `/metrics`, `/v1/models`, and `/v1/debug/routes`, so those operational views are public when `ADMIN_AUTOAUTH` is enabled (the default). The session cannot call paid proxy routes, which always require a real gateway key.
 
 ### Auto-detection
 
@@ -28,12 +28,12 @@ When the server serves `/admin`, it injects meta tags into the HTML:
 | `gateway-url` | request origin | always (the URL is not a secret) |
 | `gateway-key` | First key from `ADMIN_API_KEYS` (falls back to `GATEWAY_API_KEYS`) | **only when the request already presents a valid Bearer token** |
 
-The `gateway-key` is deliberately **not** embedded for anonymous visitors. An earlier version injected the live admin/gateway key into the page for *anyone* who could reach the URL — a credential leak, since the page is served without auth. Now the key is only auto-injected when the request itself is already authenticated (e.g. an internal tool that fetches `/admin` with an `Authorization` header). A normal browser visit gets the URL pre-filled and shows the key field for manual entry.
+The `gateway-key` is deliberately **not** embedded for anonymous visitors. An earlier version injected the live admin/gateway key into the page for *anyone* who could reach the URL. Now the key is only auto-injected when the request itself is already authenticated. A normal browser visit uses the read-only session automatically; a real key is only needed for paid proxy calls or when `ADMIN_AUTOAUTH=0`.
 
 ### Accessing the dashboard
 
 ```bash
-# Open in a browser — URL is auto-filled, paste your key into the connection bar
+# Open in a browser — read-only dashboard data loads automatically
 open https://your-gateway.vercel.app/admin
 
 # Or pass the key as a URL hash so the page auto-connects on load
@@ -41,6 +41,8 @@ open https://your-gateway.vercel.app/admin#your-admin-key
 ```
 
 The `#your-admin-key` hash is read client-side and never sent to the server in the request line, so it isn't logged by the gateway or intermediaries.
+
+Set `ADMIN_AUTOAUTH=0` to require an admin or gateway Bearer key for the read-only endpoints.
 
 ### What the dashboard shows
 

@@ -161,6 +161,18 @@ const mem = {
   cbs: new Map(), // key -> {state,failures,openedAt,threshold,cooldownMs}
   kv: new Map(), // key -> { value, expiresAtMs }
 };
+// Circuit updates are launched off the request hot path. Serialize updates for
+// each provider/model so concurrent completions cannot all read the same state
+// and overwrite one another with the same failure count.
+const circuitQueues = new Map();
+function withCircuitLock(key, update) {
+  const previous = circuitQueues.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(update);
+  circuitQueues.set(key, current);
+  return current.finally(() => {
+    if (circuitQueues.get(key) === current) circuitQueues.delete(key);
+  });
+}
 function memBucket(key) {
   if (!mem.buckets.has(key)) {
     mem.buckets.set(key, {
@@ -455,23 +467,84 @@ async function setCircuitState(provider, model, state, failures, openedAt) {
   }
 }
 
-export async function recordBreakerFailure(provider, model) {
-  const cb = await getCircuitBreaker(provider, model);
+function incrementLocalCircuitFailure(provider, model) {
+  const key = cbMemKey(provider, model);
+  const cb = mem.cbs.get(key) || defaultCircuitBreaker();
   const failures = cb.failures + 1;
-  if (cb.state === "closed" && failures >= cb.threshold) {
-    await setCircuitState(provider, model, "open", failures, Date.now());
-    console.error(JSON.stringify({ type: "circuit_opened", provider, model, failures }));
-  } else {
-    await setCircuitState(provider, model, cb.state, failures, cb.openedAt);
+  const shouldOpen = cb.state === "half_open" || (cb.state === "closed" && failures >= cb.threshold);
+  const openedAt = shouldOpen ? Date.now() : cb.openedAt;
+  const next = {
+    state: shouldOpen ? "open" : cb.state,
+    failures,
+    openedAt,
+    updatedAt: Date.now(),
+    threshold: CB_THRESHOLD,
+    cooldownMs: CB_COOLDOWN_MS,
+  };
+  mem.cbs.set(key, next);
+  return { next, justOpened: shouldOpen && cb.state !== "open" };
+}
+
+async function incrementCircuitFailure(provider, model) {
+  const key = cbMemKey(provider, model);
+  if (!dbUsable()) return incrementLocalCircuitFailure(provider, model);
+
+  const now = Date.now();
+  try {
+    await ensureSchema();
+    const rows = await sql`
+      INSERT INTO gw_circuit_breakers (provider, model, state, failures, opened_at)
+      VALUES (${provider || "unknown"}, ${model || "unknown"}, 'closed', 1, null)
+      ON CONFLICT (provider, model) DO UPDATE SET
+        failures = gw_circuit_breakers.failures + 1,
+        state = CASE
+          WHEN gw_circuit_breakers.state = 'half_open'
+            OR (gw_circuit_breakers.state = 'closed' AND gw_circuit_breakers.failures + 1 >= ${CB_THRESHOLD})
+          THEN 'open'
+          ELSE gw_circuit_breakers.state
+        END,
+        opened_at = CASE
+          WHEN gw_circuit_breakers.state = 'half_open'
+            OR (gw_circuit_breakers.state = 'closed' AND gw_circuit_breakers.failures + 1 >= ${CB_THRESHOLD})
+          THEN ${now}
+          ELSE gw_circuit_breakers.opened_at
+        END
+      RETURNING state, failures, opened_at
+    `;
+    const raw = rows[0];
+    const next = {
+      state: raw.state,
+      failures: Number(raw.failures) || 0,
+      openedAt: raw.opened_at ? Number(raw.opened_at) : null,
+      updatedAt: Date.now(),
+      threshold: CB_THRESHOLD,
+      cooldownMs: CB_COOLDOWN_MS,
+    };
+    mem.cbs.set(key, next);
+    return { next, justOpened: next.state === "open" && next.openedAt === now };
+  } catch (error) {
+    recordDbFailure(error);
+    return incrementLocalCircuitFailure(provider, model);
   }
 }
 
+export async function recordBreakerFailure(provider, model) {
+  const key = cbMemKey(provider, model);
+  return withCircuitLock(key, async () => {
+    const { next, justOpened } = await incrementCircuitFailure(provider, model);
+    if (justOpened) console.error(JSON.stringify({ type: "circuit_opened", provider, model, failures: next.failures }));
+  });
+}
+
 export async function recordBreakerSuccess(provider, model) {
-  const cb = await getCircuitBreaker(provider, model);
-  if (cb.state !== "closed") {
-    await setCircuitState(provider, model, "closed", 0, null);
-    console.log(JSON.stringify({ type: "circuit_recovered", provider, model }));
-  }
+  const key = cbMemKey(provider, model);
+  return withCircuitLock(key, async () => {
+    const cb = await getCircuitBreaker(provider, model);
+    if (cb.state !== "closed" || cb.failures !== 0) {
+      await setCircuitState(provider, model, "closed", 0, null);
+      if (cb.state !== "closed") console.log(JSON.stringify({ type: "circuit_recovered", provider, model }));
+    }
+  });
 }
 
 export async function getAllCircuitBreakers() {
