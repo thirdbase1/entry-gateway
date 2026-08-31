@@ -6,6 +6,7 @@ Self-hosted, config-driven native-protocol AI gateway. Clients use one gateway A
 
 - `GET /health` — gateway status, uptime, providers, circuit breakers, active requests
 - `GET /metrics` — per-provider and aggregate metrics (public through the read-only dashboard session by default)
+- `GET /` — public landing page (static, no auth)
 - `GET /admin` — built-in public, read-only admin dashboard UI
 - `GET /v1/models` — deduplicated public models with protocol metadata
 - `POST /v1/chat/completions` — OpenAI-compatible passthrough
@@ -17,7 +18,7 @@ No payload translation is performed. A request is routed only to upstreams confi
 
 ## Admin Dashboard
 
-The dashboard is a static page served at `/` and `/admin`. By design, opening it creates a signed, read-only session with access to `/metrics`, `/v1/models`, and `/v1/debug/routes`, so those operational views are public when `ADMIN_AUTOAUTH` is enabled (the default). The session cannot call paid proxy routes, which always require a real gateway key.
+The dashboard is a static page served at `/admin` (the domain root `/` is the public landing page). By design, opening it creates a signed, read-only session with access to `/metrics`, `/v1/models`, and `/v1/debug/routes`, so those operational views are public when `ADMIN_AUTOAUTH` is enabled (the default). The session cannot call paid proxy routes, which always require a real gateway key.
 
 ### Auto-detection
 

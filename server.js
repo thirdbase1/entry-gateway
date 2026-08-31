@@ -1068,11 +1068,21 @@ const serveAdminDashboard = (req, res) => {
   }
 };
 
-// Serve the dashboard at the bare domain root, not just /admin -- so you
-// can just visit the gateway's normal URL and land straight on the
-// credentials/dashboard screen instead of having to remember and type
-// "/admin" every time. /admin is kept as an alias for old bookmarks/links.
-app.get("/", serveAdminDashboard);
+// Public landing page at the bare domain root. Fully static -- no request
+// data (Host, origin, path) is reflected into it, so unlike the admin page it
+// needs no escaping, no no-store, and can be cached by browsers/CDNs.
+const serveLandingPage = (_req, res) => {
+  try {
+    res.set("Content-Type", "text/html").send(readFileSync(join(__dirname, "public", "landing.html")));
+  } catch {
+    res.status(404).send("Landing page not found.");
+  }
+};
+
+// "/" is the public landing page; the operator dashboard lives at /admin.
+// The dashboard auto-authenticates via its signed session cookie (see
+// serveAdminDashboard), so /admin is still the only URL you need.
+app.get("/", serveLandingPage);
 app.get("/admin", serveAdminDashboard);
 
 // ─── Discovery ───────────────────────────────────────────────────────────────

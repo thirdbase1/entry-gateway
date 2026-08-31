@@ -298,3 +298,36 @@ test("6e. ADMIN_AUTOAUTH=0 disables the session entirely", async () => {
     delete process.env.ADMIN_AUTOAUTH;
   }
 });
+
+// ─── 7. Landing page at "/" ──────────────────────────────────────────────────
+// "/" is the public marketing page; the dashboard moved to /admin only. The
+// landing page must be fully static: it must never echo request data (the
+// Host header is attacker-controllable) and must never carry a credential.
+test("7a. / serves the landing page (not the dashboard)", async () => {
+  const res = await request(gatewayPort, { path: "/" });
+  assert.equal(res.status, 200);
+  assert.match(res.headers["content-type"] || "", /text\/html/);
+  assert.ok(res.body.includes("OpenAIThirdParty"), "expected the landing page brand");
+  assert.ok(!res.body.includes("gateway-key"), "landing page must not carry the dashboard's key meta");
+});
+
+test("7b. / is fully static -- Host header is never reflected", async () => {
+  const payload = 'x"><script>alert(1)</script>';
+  const res = await request(gatewayPort, { path: "/", headers: { Host: payload } });
+  assert.equal(res.status, 200);
+  assert.ok(!res.body.includes(payload), "Host header was reflected into the landing page");
+});
+
+test("7c. / never leaks any API key", async () => {
+  const res = await request(gatewayPort, { path: "/" });
+  assert.equal(res.status, 200);
+  assert.ok(!res.body.includes(ADMIN_KEY), "landing page leaked the admin key");
+  assert.ok(!res.body.includes(GW_KEY), "landing page leaked the gateway key");
+});
+
+test("7d. /admin still serves the dashboard after the landing page landed", async () => {
+  const res = await request(gatewayPort, { path: "/admin" });
+  assert.equal(res.status, 200);
+  assert.ok(!res.body.includes("OpenAIThirdParty — One API"), "admin route must not serve the landing page");
+});
+
