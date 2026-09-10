@@ -661,6 +661,17 @@
       </div>
     </div>
 
+    <!-- Daily history (gw_metrics_daily, since 2026-09-10) -->
+    <div class="section-card" id="dailyCard" style="display:none;">
+      <div class="section-header">
+        <h2><span class="sec-icon">📅</span> Daily History</h2>
+        <span class="badge" id="dailyBadge">—</span>
+      </div>
+      <div class="section-body" style="padding:0;overflow-x:auto;">
+        <table class="provider-table" id="dailyTable"></table>
+      </div>
+    </div>
+
     <!-- Cache hit rate by model -->
     <div class="section-card">
       <div class="section-header">
@@ -922,6 +933,62 @@
         `;
       } else {
         document.getElementById('providerTable').innerHTML = '<tbody><tr><td style="padding:20px;color:var(--muted-foreground);">No provider data yet</td></tr></tbody>';
+      }
+
+      // Daily history (per-day UTC rollups, unbounded retention).
+      // Card is hidden entirely when 'daily' is absent (gateway older
+      // than 2026-09-10); shown with an empty state when present but no
+      // days recorded yet, so a fresh gateway isn't silently blank.
+      const dailyCard = document.getElementById('dailyCard');
+      if (Array.isArray(metrics?.daily)) {
+        dailyCard.style.display = '';
+        const dailyRows = metrics.daily
+          .filter(r => r.scope === 'global')
+          .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
+          .slice(-14)
+          .reverse(); // newest first (slice already made a fresh copy)
+        document.getElementById('dailyBadge').textContent =
+          dailyRows.length + ' day' + (dailyRows.length !== 1 ? 's' : '') + ' · unbounded retention';
+        const maxReq = Math.max(...dailyRows.map(r => r.requests || 0), 1);
+        if (dailyRows.length) {
+          document.getElementById('dailyTable').innerHTML = `
+            <thead><tr>
+              <th>Day (UTC)</th>
+              <th class="num">Requests</th>
+              <th class="num">2xx</th>
+              <th class="num">4xx</th>
+              <th class="num">5xx</th>
+              <th class="num">Errors</th>
+              <th class="num">Spend</th>
+            </tr></thead>
+            <tbody>
+              ${dailyRows.map(r => `
+                <tr>
+                  <td class="mono">${escapeHtml(String(r.day))}</td>
+                  <td class="num">
+                    <span style="display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;">
+                      <span style="display:inline-block;height:6px;min-width:1px;border-radius:2px;background:var(--accent);opacity:.7;width:${Math.max((r.requests / maxReq) * 40, r.requests > 0 ? 3 : 0)}px;"></span>
+                      ${fmtNum(r.requests || 0)}
+                    </span>
+                  </td>
+                  <td class="num" style="color:var(--emerald)">${fmtNum(r.requests2xx || 0)}</td>
+                  <td class="num" style="color:var(--amber)">${fmtNum(r.requests4xx || 0)}</td>
+                  <td class="num" style="color:var(--red)">${fmtNum(r.requests5xx || 0)}</td>
+                  <td class="num">${fmtNum(r.upstreamErrors || 0)}</td>
+                  <td class="num" style="color:var(--accent)">${fmtMoney(r.estimatedSpend || 0)}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          `;
+        } else {
+          document.getElementById('dailyTable').innerHTML = `
+            <tbody><tr><td style="color:var(--muted-foreground);font-size:13px;padding:16px 20px;">
+              No history recorded yet — days appear here as requests flow. Retention is unbounded (nothing is ever trimmed).
+            </td></tr></tbody>
+          `;
+        }
+      } else {
+        dailyCard.style.display = 'none';
       }
 
       // Cache hit rate by model -- explicit + implicit cache reads as a

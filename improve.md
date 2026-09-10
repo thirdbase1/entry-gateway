@@ -573,3 +573,18 @@ today". The /metrics endpoint showed lifetime totals only.
    fallback.test.js uses, so `node --test *.test.js` made it app.listen on :8787 and whichever
    file bound the port second crashed with EADDRINUSE. Guard added, matching the established
    pattern; full suite now exits cleanly (15 pass, 0 fail).
+
+**Follow-up same day:** the daily history also had to be surfaced in the *UIs* -- the /metrics field
+alone rendered as nothing anywhere:
+
+1. `public/admin.html` (the gateway's own /admin dashboard) got a "Daily History" section-card
+   (last 14 UTC days, scope=global only, newest first, requests/2xx/4xx/5xx/errors/spend + a
+   proportional inline bar per day). Hidden only when `daily` is absent (older gateway); shows an
+   explicit "no history recorded yet" empty state when the array is present but empty.
+2. entry-agents' admin Gateway dashboard (same-day commit 8c7cf0f) initially hid its Daily History
+   card whenever the array was empty -- a fresh table with zero traffic rendered as *nothing*, which
+   read as "the feature doesn't exist". Fixed in 977fae9 to render with an empty state whenever the
+   field is present.
+
+Lesson: an API field with zero rows is invisible -- always pair new data surfaces with an explicit
+empty state, or ship the UI in the same change.
