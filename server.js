@@ -605,6 +605,25 @@ function cacheSummary(usage) {
 // across EVERY session of the same agent type, so keying on it would
 // collapse all concurrent unrelated sessions onto one shard instead of
 // giving each session its own affinity.
+// Hosts whose backend needs a stable prompt_cache_key to have a real
+// chance of landing repeat requests on the same warm machine. Pure and
+// exported so this decision is unit-testable without spinning up any
+// network mock (see needs-session-affinity.test.js).
+export const NEEDS_SESSION_AFFINITY_HOSTS = new Set(["api.b.ai"]);
+
+export function needsSessionAffinity(provider, model, upstreamBaseURL) {
+  if (provider === "freemodel" && typeof model === "string" && model.startsWith("gpt-5.6")) {
+    return true;
+  }
+  let host = null;
+  try {
+    host = new URL(upstreamBaseURL).host;
+  } catch {
+    return false;
+  }
+  return NEEDS_SESSION_AFFINITY_HOSTS.has(host);
+}
+
 function derivePromptCacheKey(body) {
   try {
     const messages = Array.isArray(body?.messages) ? body.messages : [];
@@ -674,14 +693,30 @@ async function proxy(req, res, r, p, model, action, id, isFallback) {
       ? { ...req.body, model: r.upstreamModel }
       : req.body;
 
-  // Pin gpt-5.6-family FreeModel requests to a stable per-session cache
-  // key so OpenAI's best-effort implicit caching has a real chance of
-  // hitting on every step, not just when luck lands us on the same
-  // backend machine. Scoped narrowly (freemodel + gpt-5.6-*) rather than
-  // blanket-applied to the whole openai-chat protocol, since that protocol
+  // Pin gpt-5.6-family FreeModel requests, AND every api.b.ai-hosted model
+  // (deepseek-v4-flash-vision-exp, glm-5.3-flash, qwen3.8-flash -- added
+  // 2026-08-28), to a stable per-session cache key so best-effort implicit
+  // caching has a real chance of hitting on every step, not just when luck
+  // lands us on the same backend machine.
+  //
+  // Found 2026-08-28: confirmed live (two sequential direct calls via the
+  // admin reasoning-probe route, same >1024-token prefix) that all three
+  // api.b.ai models DO cache correctly when repeat requests land on the
+  // same backend -- cached_tokens went from 0 to ~2048/1920 on the second
+  // call. So "these models don't cache in production" is the exact same
+  // root cause as the gpt-5.6 bug this key was built for: nothing sent a
+  // session-affinity hint, so concurrent real users' requests scatter
+  // across api.b.ai's backend replicas instead of reliably landing warm.
+  // Matched by upstreamBaseURL rather than by provider, since api.b.ai's
+  // three routes are labelled with three different provider values
+  // (deepseek/zai/qwen, matching each model's real creator for pricing
+  // purposes) despite sharing one physical backend that needs the same
+  // affinity treatment.
+  //
+  // Scoped to openai-chat only (not blanket-applied) since that protocol
   // label is also used for Claude routes proxied through a translation
   // layer that may not tolerate -- or even want -- an OpenAI-specific field.
-  if (p === "openai-chat" && r.provider === "freemodel" && model.startsWith("gpt-5.6") && !outgoingBody.prompt_cache_key) {
+  if (p === "openai-chat" && needsSessionAffinity(r.provider, model, r.upstreamBaseURL) && !outgoingBody.prompt_cache_key) {
     const cacheKey = derivePromptCacheKey(req.body);
     if (cacheKey) outgoingBody = { ...outgoingBody, prompt_cache_key: cacheKey };
   }
