@@ -125,7 +125,8 @@ async function ensureSchema() {
   // gw_metrics_buckets above is a single cumulative all-time counter per
   // (scope, name) -- it has NO time dimension at all, so the /metrics
   // snapshot could never answer "how much traffic ran yesterday vs
-  // today". This table writes the same counters rolled up per UTC day.
+  // today". This table writes the same counters rolled up per Nigeria-local
+  // day (12am WAT, per the 2026-09-10 owner request).
   // Retention is deliberately UNBOUNDED -- nothing ever deletes these
   // rows, so history is kept indefinitely (well past a year); if the
   // table ever gets too big, aggregate further rather than truncate.
@@ -316,10 +317,15 @@ async function upsertBucket(scope, name, status, latencyMs, ttftMs, usage, estim
 }
 
 // ─── Per-day history (added 2026-09-10) ─────────────────────────────────────────
-// UTC day key -- stable regardless of instance region, and matches the
-// DATE column Postgres stores above.
-function utcDay() {
-  return new Date().toISOString().slice(0, 10);
+// Day key in Nigeria local time (owner request 2026-09-10: each day's
+// history should start at 12am Nigeria time, not UTC midnight).
+// Africa/Lagos (WAT) is fixed UTC+1 with no DST -- now or ever -- so
+// shifting the UTC timestamp by +1h yields the exact Nigeria-local
+// calendar day: a new day's bucket starts at 12am Lagos (23:00 UTC).
+// Stable regardless of instance region, and still a plain DATE-shaped
+// string for the Postgres column.
+export function localDay() {
+  return new Date(Date.now() + 3600_000).toISOString().slice(0, 10);
 }
 
 function memDailyBucket(day, scope, name) {
@@ -333,7 +339,7 @@ function memDailyBucket(day, scope, name) {
 }
 
 function bumpDailyMem(scope, name, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
-  const b = memDailyBucket(utcDay(), scope, name);
+  const b = memDailyBucket(localDay(), scope, name);
   b.requests += 1;
   if (status >= 200 && status < 300) b.requests2xx += 1;
   else if (status >= 400 && status < 500) b.requests4xx += 1;
@@ -349,7 +355,7 @@ function bumpDailyMem(scope, name, status, latencyMs, ttftMs, usage, estimatedCo
   b.estimatedSpend += estimatedCost || 0;
 }
 
-// Same shape as upsertBucket but targeting gw_metrics_daily with the UTC
+// Same shape as upsertBucket but targeting gw_metrics_daily with the WAT
 // day in the key. Written alongside the cumulative bucket in the same
 // request's Promise.all batch so the two can only disagree mid-outage,
 // never permanently drift.
@@ -407,7 +413,7 @@ export async function recordRequest(provider, model, status, latencyMs, ttftMs, 
 
   try {
     await ensureSchema();
-    const day = utcDay();
+    const day = localDay();
     await Promise.all([
       upsertBucket("global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
       upsertBucket("provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
@@ -454,7 +460,7 @@ export async function recordUpstreamError(provider, model) {
 
   if (!dbUsable()) {
     recordUpstreamErrorMem(provider, model);
-    const day = utcDay();
+    const day = localDay();
     memDailyBucket(day, "global", "_").upstreamErrors += 1;
     memDailyBucket(day, "provider", provider).upstreamErrors += 1;
     if (model) memDailyBucket(day, "model", model).upstreamErrors += 1;
@@ -463,7 +469,7 @@ export async function recordUpstreamError(provider, model) {
 
   try {
     await ensureSchema();
-    const day = utcDay();
+    const day = localDay();
     await Promise.all([
       bumpUpstreamErrors("global", "_"),
       bumpUpstreamErrors("provider", provider),
@@ -475,7 +481,7 @@ export async function recordUpstreamError(provider, model) {
   } catch (error) {
     recordDbFailure(error);
     recordUpstreamErrorMem(provider, model);
-    const dayOnFail = utcDay();
+    const dayOnFail = localDay();
     memDailyBucket(dayOnFail, "global", "_").upstreamErrors += 1;
     memDailyBucket(dayOnFail, "provider", provider).upstreamErrors += 1;
     if (model) memDailyBucket(dayOnFail, "model", model).upstreamErrors += 1;

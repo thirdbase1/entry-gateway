@@ -664,7 +664,7 @@
     <!-- Daily history (gw_metrics_daily, since 2026-09-10) -->
     <div class="section-card" id="dailyCard" style="display:none;">
       <div class="section-header">
-        <h2><span class="sec-icon">📅</span> Daily History</h2>
+        <h2><span class="sec-icon">📅</span> Daily History (Nigeria time)</h2>
         <span class="badge" id="dailyBadge">—</span>
       </div>
       <div class="section-body" style="padding:0;overflow-x:auto;">
@@ -935,7 +935,7 @@
         document.getElementById('providerTable').innerHTML = '<tbody><tr><td style="padding:20px;color:var(--muted-foreground);">No provider data yet</td></tr></tbody>';
       }
 
-      // Daily history (per-day UTC rollups, unbounded retention).
+      // Daily history (per-day rollups at 12am Nigeria/WAT time, unbounded retention).
       // Card is hidden entirely when 'daily' is absent (gateway older
       // than 2026-09-10); shown with an empty state when present but no
       // days recorded yet, so a fresh gateway isn't silently blank.
@@ -953,7 +953,7 @@
         if (dailyRows.length) {
           document.getElementById('dailyTable').innerHTML = `
             <thead><tr>
-              <th>Day (UTC)</th>
+              <th>Day (WAT)</th>
               <th class="num">Requests</th>
               <th class="num">2xx</th>
               <th class="num">4xx</th>

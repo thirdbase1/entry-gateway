@@ -588,3 +588,12 @@ alone rendered as nothing anywhere:
 
 Lesson: an API field with zero rows is invisible -- always pair new data surfaces with an explicit
 empty state, or ship the UI in the same change.
+
+**Owner follow-up (same day): daily buckets roll at 12am NIGERIA time, not UTC.**
+`gw_metrics_daily` initially used UTC day keys; the owner wants each day to start at 12am
+Africa/Lagos (WAT). Since Lagos is fixed UTC+1 with no DST (ever), `localDay()` in
+metrics-store.js shifts UTC by +1h before slicing the date: 23:00 UTC = midnight Lagos = new day.
+Exported `localDay` and added `local-day.test.js` with boundary tests (22:59Z vs 23:00Z roll,
+month-end roll). Existing UTC-keyed rows from the first hours (2026-09-10) simply merge into the
+same "2026-09-10" key since UTC and Lagos agree on the date for the first 23h of the UTC day --
+no migration needed. Dashboards' "Day (UTC)" labels renamed to "Day (WAT)".
