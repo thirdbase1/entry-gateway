@@ -85,6 +85,20 @@ test("getCircuitBreaker()/recordBreakerFailure()/recordBreakerSuccess() fail ope
   await assert.doesNotReject(resolvesWithin(recordBreakerSuccess("providerA", "model-x"), "recordBreakerSuccess"));
 });
 
+// Added 2026-09-10 with the per-day metrics history: the snapshot grew
+// a `daily` field (array of per-day rows, or null when the DB read
+// fails). In mem-fallback mode it must be a real array built from the
+// in-memory daily map -- recordRequest() above ran with the DB down, so
+// those requests were recorded to mem buckets INCLUDING the daily ones.
+test("getMetricsSnapshot() returns a usable in-memory `daily` history when the DB is unreachable", async () => {
+  const snap = await resolvesWithin(getMetricsSnapshot(["providerA"], ["model-x"]), "getMetricsSnapshot (daily)");
+  assert.ok(Array.isArray(snap.daily), "daily must be an array in mem-fallback mode");
+  const today = new Date().toISOString().slice(0, 10);
+  const todayGlobal = snap.daily.find((d) => d.day === today && d.scope === "global");
+  assert.ok(todayGlobal, "today's global daily bucket must exist from the recordRequest calls in earlier tests");
+  assert.ok(todayGlobal.requests >= 1, `today's global daily requests >= 1 (got ${todayGlobal.requests})`);
+});
+
 test("getAllCircuitBreakers()/getMetricsSnapshot() (the /health and /metrics admin endpoints) fail open when the DB is unreachable", async () => {
   await assert.doesNotReject(resolvesWithin(getAllCircuitBreakers(), "getAllCircuitBreakers"));
   await assert.doesNotReject(resolvesWithin(getMetricsSnapshot(["providerA"], ["model-x"]), "getMetricsSnapshot"));

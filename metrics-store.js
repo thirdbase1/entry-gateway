@@ -121,6 +121,38 @@ async function ensureSchema() {
       PRIMARY KEY (scope, name)
     )
   `;
+  // Added 2026-09-10: per-day metrics history. The original
+  // gw_metrics_buckets above is a single cumulative all-time counter per
+  // (scope, name) -- it has NO time dimension at all, so the /metrics
+  // snapshot could never answer "how much traffic ran yesterday vs
+  // today". This table writes the same counters rolled up per UTC day.
+  // Retention is deliberately UNBOUNDED -- nothing ever deletes these
+  // rows, so history is kept indefinitely (well past a year); if the
+  // table ever gets too big, aggregate further rather than truncate.
+  // lat/ttft sample arrays are intentionally NOT kept per day -- they
+  // are unbounded-ish per row and only matter for the live percentile
+  // view, which stays on the cumulative table.
+  await sql`
+    CREATE TABLE IF NOT EXISTS gw_metrics_daily (
+      day DATE NOT NULL,
+      scope TEXT NOT NULL,
+      name TEXT NOT NULL,
+      requests BIGINT NOT NULL DEFAULT 0,
+      requests_2xx BIGINT NOT NULL DEFAULT 0,
+      requests_4xx BIGINT NOT NULL DEFAULT 0,
+      requests_5xx BIGINT NOT NULL DEFAULT 0,
+      upstream_errors BIGINT NOT NULL DEFAULT 0,
+      fallbacks BIGINT NOT NULL DEFAULT 0,
+      tokens_input BIGINT NOT NULL DEFAULT 0,
+      tokens_output BIGINT NOT NULL DEFAULT 0,
+      tokens_cache_read BIGINT NOT NULL DEFAULT 0,
+      tokens_cache_write BIGINT NOT NULL DEFAULT 0,
+      tokens_reasoning BIGINT NOT NULL DEFAULT 0,
+      estimated_spend DOUBLE PRECISION NOT NULL DEFAULT 0,
+      status_breakdown JSONB NOT NULL DEFAULT '{}'::jsonb,
+      PRIMARY KEY (day, scope, name)
+    )
+  `;
   await sql`
     CREATE TABLE IF NOT EXISTS gw_metrics_gauges (
       name TEXT PRIMARY KEY,
@@ -156,6 +188,7 @@ async function ensureSchema() {
 
 const mem = {
   buckets: new Map(), // key -> { counters, status, lat[], ttft[] }
+  daily: new Map(), // "YYYY-MM-DD|scope|name" -> per-day counters (2026-09-10)
   sets: new Map(), // key -> Set
   gauges: new Map(), // key -> number
   cbs: new Map(), // key -> {state,failures,openedAt,threshold,cooldownMs}
@@ -282,25 +315,117 @@ async function upsertBucket(scope, name, status, latencyMs, ttftMs, usage, estim
   `;
 }
 
+// ─── Per-day history (added 2026-09-10) ─────────────────────────────────────────
+// UTC day key -- stable regardless of instance region, and matches the
+// DATE column Postgres stores above.
+function utcDay() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function memDailyBucket(day, scope, name) {
+  const key = `${day}|${scope}|${name}`;
+  let b = mem.daily.get(key);
+  if (!b) {
+    b = { requests: 0, requests2xx: 0, requests4xx: 0, requests5xx: 0, upstreamErrors: 0, fallbacks: 0, tokensInput: 0, tokensOutput: 0, tokensCacheRead: 0, tokensCacheWrite: 0, tokensReasoning: 0, estimatedSpend: 0 };
+    mem.daily.set(key, b);
+  }
+  return b;
+}
+
+function bumpDailyMem(scope, name, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
+  const b = memDailyBucket(utcDay(), scope, name);
+  b.requests += 1;
+  if (status >= 200 && status < 300) b.requests2xx += 1;
+  else if (status >= 400 && status < 500) b.requests4xx += 1;
+  else if (status >= 500) b.requests5xx += 1;
+  if (isFallback) b.fallbacks += 1;
+  if (usage) {
+    b.tokensInput += usage.input || 0;
+    b.tokensOutput += usage.output || 0;
+    b.tokensCacheRead += usage.cache_read || 0;
+    b.tokensCacheWrite += usage.cache_write || 0;
+    b.tokensReasoning += usage.reasoning || 0;
+  }
+  b.estimatedSpend += estimatedCost || 0;
+}
+
+// Same shape as upsertBucket but targeting gw_metrics_daily with the UTC
+// day in the key. Written alongside the cumulative bucket in the same
+// request's Promise.all batch so the two can only disagree mid-outage,
+// never permanently drift.
+async function upsertDailyBucket(day, scope, name, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
+  const statusStr = String(status);
+  await sql`
+    INSERT INTO gw_metrics_daily (
+      day, scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
+      fallbacks, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+      tokens_reasoning, estimated_spend, status_breakdown
+    ) VALUES (
+      ${day}, ${scope}, ${name}, 1, ${status >= 200 && status < 300 ? 1 : 0}, ${status >= 400 && status < 500 ? 1 : 0}, ${status >= 500 ? 1 : 0},
+      ${isFallback ? 1 : 0}, ${usage?.input || 0}, ${usage?.output || 0}, ${usage?.cache_read || 0}, ${usage?.cache_write || 0},
+      ${usage?.reasoning || 0}, ${estimatedCost || 0}, jsonb_build_object(${statusStr}::text, 1)
+    )
+    ON CONFLICT (day, scope, name) DO UPDATE SET
+      requests = gw_metrics_daily.requests + EXCLUDED.requests,
+      requests_2xx = gw_metrics_daily.requests_2xx + EXCLUDED.requests_2xx,
+      requests_4xx = gw_metrics_daily.requests_4xx + EXCLUDED.requests_4xx,
+      requests_5xx = gw_metrics_daily.requests_5xx + EXCLUDED.requests_5xx,
+      fallbacks = gw_metrics_daily.fallbacks + EXCLUDED.fallbacks,
+      tokens_input = gw_metrics_daily.tokens_input + EXCLUDED.tokens_input,
+      tokens_output = gw_metrics_daily.tokens_output + EXCLUDED.tokens_output,
+      tokens_cache_read = gw_metrics_daily.tokens_cache_read + EXCLUDED.tokens_cache_read,
+      tokens_cache_write = gw_metrics_daily.tokens_cache_write + EXCLUDED.tokens_cache_write,
+      tokens_reasoning = gw_metrics_daily.tokens_reasoning + EXCLUDED.tokens_reasoning,
+      estimated_spend = gw_metrics_daily.estimated_spend + EXCLUDED.estimated_spend,
+      status_breakdown = jsonb_set(
+        gw_metrics_daily.status_breakdown, ARRAY[${statusStr}::text],
+        to_jsonb(COALESCE((gw_metrics_daily.status_breakdown ->> ${statusStr})::bigint, 0) + 1)
+      )
+  `;
+}
+
+async function bumpDailyUpstreamErrors(day, scope, name) {
+  await sql`
+    INSERT INTO gw_metrics_daily (day, scope, name, upstream_errors)
+    VALUES (${day}, ${scope}, ${name}, 1)
+    ON CONFLICT (day, scope, name) DO UPDATE SET
+      upstream_errors = gw_metrics_daily.upstream_errors + EXCLUDED.upstream_errors
+  `;
+}
+
 export async function recordRequest(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
   provider = provider || "unknown";
   model = model || "unknown";
 
   if (!dbUsable()) {
     recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    bumpDailyMem("global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    bumpDailyMem("provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    bumpDailyMem("model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
     return;
   }
 
   try {
     await ensureSchema();
+    const day = utcDay();
     await Promise.all([
       upsertBucket("global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
       upsertBucket("provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
       upsertBucket("model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
+      upsertDailyBucket(day, "global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
+      upsertDailyBucket(day, "provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
+      upsertDailyBucket(day, "model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
     ]);
   } catch (error) {
     recordDbFailure(error);
     recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    // 2026-09-10: daily history must be recorded on the DB-FAILURE catch
+    // path too (not just the !dbUsable() early return) -- the unreachable-
+    // DB regression test proved requests recorded during a DB outage
+    // otherwise vanished from the daily view entirely.
+    bumpDailyMem("global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    bumpDailyMem("provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    bumpDailyMem("model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
   }
 }
 
@@ -329,19 +454,31 @@ export async function recordUpstreamError(provider, model) {
 
   if (!dbUsable()) {
     recordUpstreamErrorMem(provider, model);
+    const day = utcDay();
+    memDailyBucket(day, "global", "_").upstreamErrors += 1;
+    memDailyBucket(day, "provider", provider).upstreamErrors += 1;
+    if (model) memDailyBucket(day, "model", model).upstreamErrors += 1;
     return;
   }
 
   try {
     await ensureSchema();
+    const day = utcDay();
     await Promise.all([
       bumpUpstreamErrors("global", "_"),
       bumpUpstreamErrors("provider", provider),
       ...(model ? [bumpUpstreamErrors("model", model)] : []),
+      bumpDailyUpstreamErrors(day, "global", "_"),
+      bumpDailyUpstreamErrors(day, "provider", provider),
+      ...(model ? [bumpDailyUpstreamErrors(day, "model", model)] : []),
     ]);
   } catch (error) {
     recordDbFailure(error);
     recordUpstreamErrorMem(provider, model);
+    const dayOnFail = utcDay();
+    memDailyBucket(dayOnFail, "global", "_").upstreamErrors += 1;
+    memDailyBucket(dayOnFail, "provider", provider).upstreamErrors += 1;
+    if (model) memDailyBucket(dayOnFail, "model", model).upstreamErrors += 1;
   }
 }
 
@@ -742,6 +879,58 @@ export async function getMetricsSnapshot(knownProviders, knownModels) {
   const activeRequests = await getGauge("activeRequests");
   const activeStreams = await getGauge("activeStreams");
 
+  // Per-day history (added 2026-09-10). Unbounded retention -- every day
+  // that ever had traffic stays queryable forever, so a full year (or
+  // more) of daily trends is always available. Rows only exist for days
+  // with traffic, so this stays small in practice.
+  let daily = null;
+  if (!dbUsable()) {
+    daily = [...mem.daily.entries()]
+      .map(([key, b]) => {
+        const [day, scope, name] = key.split("|");
+        return {
+          day, scope, name,
+          requests: b.requests, requests2xx: b.requests2xx, requests4xx: b.requests4xx, requests5xx: b.requests5xx,
+          upstreamErrors: b.upstreamErrors, fallbacks: b.fallbacks,
+          tokens: { input: b.tokensInput, output: b.tokensOutput, cacheRead: b.tokensCacheRead, cacheWrite: b.tokensCacheWrite, reasoning: b.tokensReasoning },
+          estimatedSpend: b.estimatedSpend,
+        };
+      })
+      .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+  } else {
+    try {
+      await ensureSchema();
+      const rows = await sql`
+        SELECT day, scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
+               upstream_errors, fallbacks, tokens_input, tokens_output,
+               tokens_cache_read, tokens_cache_write, tokens_reasoning, estimated_spend
+        FROM gw_metrics_daily
+        ORDER BY day ASC
+      `;
+      daily = rows.map((r) => ({
+        day: r.day instanceof Date ? r.day.toISOString().slice(0, 10) : String(r.day),
+        scope: r.scope, name: r.name,
+        requests: Number(r.requests) || 0,
+        requests2xx: Number(r.requests_2xx) || 0,
+        requests4xx: Number(r.requests_4xx) || 0,
+        requests5xx: Number(r.requests_5xx) || 0,
+        upstreamErrors: Number(r.upstream_errors) || 0,
+        fallbacks: Number(r.fallbacks) || 0,
+        tokens: {
+          input: Number(r.tokens_input) || 0,
+          output: Number(r.tokens_output) || 0,
+          cacheRead: Number(r.tokens_cache_read) || 0,
+          cacheWrite: Number(r.tokens_cache_write) || 0,
+          reasoning: Number(r.tokens_reasoning) || 0,
+        },
+        estimatedSpend: Number(r.estimated_spend) || 0,
+      }));
+    } catch (error) {
+      recordDbFailure(error);
+      daily = null;
+    }
+  }
+
   return {
     activeRequests,
     activeStreams,
@@ -749,6 +938,7 @@ export async function getMetricsSnapshot(knownProviders, knownModels) {
     byProvider,
     byModel,
     circuitBreakers,
+    daily,
     providers: providerNames,
     modelCount: modelNames.length,
     providerCount: providerNames.length,

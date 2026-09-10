@@ -539,3 +539,37 @@ reasoning_content and final answers for all three model ids.
 No icon-wiring needed: entry-agents' provider-icons.tsx infers the brand from the model id's
 prefix (`deepseek-`, `glm-`, `qwen-`) rather than any field this gateway returns, so all three
 picked up the right @lobehub/icons brand automatically.
+
+## 2026-09-10: Per-day metrics history (unbounded retention, 1 year+ by design)
+
+**Question that prompted this:** "how many days does the metrics track?" Answer: the original
+`gw_metrics_buckets` (Postgres, since the 2026-08-27 Upstash migration) had **no time dimension at
+all** — one cumulative all-time counter per (scope, name). It could never answer "yesterday vs
+today". The /metrics endpoint showed lifetime totals only.
+
+**What shipped:**
+- New `gw_metrics_daily` table (PK: day, scope, name) — same counters as the cumulative table,
+  rolled up per UTC day (`new Date().toISOString().slice(0,10)`). lat/ttft sample arrays are
+  deliberately NOT kept per day (unbounded-ish per row; percentiles stay a cumulative-table
+  feature).
+- `recordRequest()` and `recordUpstreamError()` write the daily rows in the SAME Promise.all
+  batch as the cumulative upserts, so the two can only disagree mid-outage, never permanently.
+- **Retention is deliberately UNBOUNDED** — nothing ever deletes daily rows, so history survives
+  indefinitely (owner asked for "no end", at least a year). Rows only exist for days with traffic,
+  so this stays small in practice; if it ever grows huge, aggregate further rather than truncate.
+- `getMetricsSnapshot()` returns a new `daily` field: flat array of { day, scope, name, requests,
+  requests2xx/4xx/5xx, upstreamErrors, fallbacks, tokens{...}, estimatedSpend }, ordered by day.
+  server.js spreads the snapshot into /metrics, so the field flows through with zero route
+  changes.
+- In-memory fallback tracks daily too (`mem.daily`), on BOTH the `!dbUsable()` early return AND
+  the DB-failure catch path — the regression test caught exactly this gap in the first draft:
+  requests recorded during a DB outage otherwise vanished from the daily view.
+
+**Bugs found while testing (both pre-existing, both fixed):**
+1. The 2026-08-28 session-affinity work (server.js `needsSessionAffinity()` + its unit test) had
+   been left **uncommitted** in the local working tree — it was live in production but absent
+   from git. Committed now as its own commit so git stops lying about what's deployed.
+2. `needs-session-affinity.test.js` imported server.js without the `VERCEL=1` guard
+   fallback.test.js uses, so `node --test *.test.js` made it app.listen on :8787 and whichever
+   file bound the port second crashed with EADDRINUSE. Guard added, matching the established
+   pattern; full suite now exits cleanly (15 pass, 0 fail).
