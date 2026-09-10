@@ -16,10 +16,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 
-const GW_KEY = "gw-secret-key";
-const RL_KEY = "rl-key";
-const FAIL_KEY = "failure-test-key";
-const ADMIN_KEY = "admin-secret-key";
+const GW_KEY = "gw-secret-key-0123456789abcdef";
+const RL_KEY = "rl-key-0123456789abcdef-0123";
+const FAIL_KEY = "failure-test-key-0123456789ab";
+const ADMIN_KEY = "admin-secret-key-0123456789abcd";
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, () => resolve(server.address().port)));
@@ -77,6 +77,9 @@ test.before(async () => {
   const failingPort = await listen(failingUpstream);
 
   process.env.VERCEL = "1"; // don't app.listen()
+  // The dash-session signing secret is derived from the API keys, so this
+  // suite uses realistic-length keys (server.js refuses to mint a signed
+  // session on Vercel when every configured key looks low-entropy).
   process.env.GATEWAY_API_KEYS = `${GW_KEY},${RL_KEY},${FAIL_KEY}`;
   process.env.ADMIN_API_KEYS = ADMIN_KEY;
   process.env.MODEL_DISCOVERY_JSON = "[]";
@@ -243,7 +246,9 @@ test("5b. each retryable upstream response counts as one breaker failure", async
   }
 
   const { getCircuitBreaker } = await import("./metrics-store.js");
-  const cb = await getCircuitBreaker("pFail", "failing-openai");
+  // Breakers are keyed by a single per-model identity (`model:<id>`), not the
+  // candidate's provider label -- see cbProvider in server.js handle().
+  const cb = await getCircuitBreaker("model:failing-openai", "failing-openai");
   assert.equal(failingUpstreamHits, 3);
   assert.equal(cb.state, "closed", "three failures must not trip a five-failure breaker");
   assert.equal(cb.failures, 3, "each upstream response must increment the breaker exactly once");

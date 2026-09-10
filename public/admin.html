@@ -601,7 +601,7 @@
   </div>
 
   <!-- Connection bar -->
-  <div class="conn-bar">
+  <div class="conn-bar" id="conn-bar">
     <div class="field">
       <label>Gateway URL</label>
       <input type="url" id="gwUrl" placeholder="https://your-gateway.example.com" value="">
@@ -810,7 +810,7 @@
       if (rejected.length === 3) {
         // Auto-auth session rejected or expired -- re-open the key bar so a
         // key can still be entered manually.
-        document.getElementById('conn-bar').style.display = '';
+        document.getElementById('conn-bar')?.style && (document.getElementById('conn-bar').style.display = '');
         throw new Error(rejected[0].reason?.message || 'Unauthorized');
       }
 
@@ -1116,7 +1116,14 @@
     // (ADMIN_AUTOAUTH=0 or expired), the 401 path re-opens the key bar.
     if (baseUrl) {
       document.getElementById('gwUrl').value = baseUrl;
-      if (apiKey) document.getElementById('conn-bar').style.display = 'none';
+      // With no injected key, hide the whole URL/key bar too: the signed
+      // session cookie does everything on its own and there is nothing for
+      // the visitor to type. The 401 path in fetchAll() re-shows the bar if
+      // the session was rejected or expired (ADMIN_AUTOAUTH=0), so manual
+      // key entry always remains possible.
+      const bar = document.getElementById('conn-bar');
+      if (apiKey) { if (bar) bar.style.display = 'none'; }
+      else if (bar) { bar.querySelector('#gwKey')?.closest('.field')?.classList.add('hidden'); }
       connect();
     }
   </script>

@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test *.test.js"
+    "test": "node --test *.test.js",
+    "test:security": "node --test security.test.js"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
