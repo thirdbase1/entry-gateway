@@ -910,7 +910,18 @@
           <tbody>
             ${provNames.map(name => {
               const p = byProv[name];
-              const cbKey = Object.keys(cbStates).find(k => k.startsWith(name + ':'));
+              // Breakers are per-model since the 2026-09 hardening pass
+              // (keys like "model:<id>:<id>"), so a provider row's health is
+              // the worst state across all of that provider's models. The
+              // model->provider mapping comes from the live routes list;
+              // legacy pre-hardening keys ("provider:model") still match the
+              // old prefix during the transition.
+              const provModels = new Set(
+                (routes?.routes || []).filter(r => (r.provider || r.upstreamApiKeyEnv || 'unknown') === name).map(r => r.id)
+              );
+              const cbKey = Object.keys(cbStates).find(k =>
+                k.startsWith('model:') && provModels.has(k.split(':')[1])
+              ) || Object.keys(cbStates).find(k => k.startsWith(name + ':'));
               const cbState = cbKey ? cbStates[cbKey] : 'closed';
               const healthColor = cbState === 'closed' ? 'var(--emerald)' : cbState === 'half_open' ? 'var(--amber)' : 'var(--red)';
               return `
