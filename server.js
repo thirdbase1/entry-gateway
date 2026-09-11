@@ -16,6 +16,7 @@ import {
   usingDb,
 } from "./metrics-store.js";
 import { getOrCreateCachedContent } from "./gemini-cache.js";
+import { createUpstreamAbort } from "./upstream-abort.js";
 
 const app = express();
 // Vercel (and most PaaS) terminate TLS upstream and forward to this
@@ -822,12 +823,25 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
     }
   }
 
+  // Abort the upstream fetch on the hard timeout OR as soon as the client
+  // disconnects (res close) -- without this, an abandoned SSE stream keeps
+  // consuming upstream provider tokens until the timeout fires.
+  const upstreamAbort = createUpstreamAbort({
+    req,
+    res,
+    requestId: id,
+    model,
+    protocol: p,
+    provider,
+    timeoutMs: Number(r.timeoutMs || 120000),
+  });
+
   try {
     const response = await fetch(upstreamUrl(r, p, model, action), {
       method: "POST",
       headers: headers(r, p),
       body: JSON.stringify(outgoingBody),
-      signal: AbortSignal.timeout(Number(r.timeoutMs || 120000)),
+      signal: upstreamAbort.signal,
     });
 
     if (response.status >= 500 || response.status === 429) {
@@ -872,6 +886,12 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
       const decoder = new TextDecoder();
       let buffer = "";
       while (true) {
+        if (upstreamAbort.isAborted()) {
+          // Client is gone: cancel the reader so the upstream connection is
+          // released immediately instead of draining the rest of the stream.
+          try { await reader.cancel("Client disconnected"); } catch {}
+          break;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         if (ttft === null) ttft = Date.now() - started;
@@ -922,6 +942,7 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
     }
     throw e;
   } finally {
+    upstreamAbort.cleanup();
     defer(incrGauge("activeRequests", -1));
     if (streaming) defer(incrGauge("activeStreams", -1));
   }
