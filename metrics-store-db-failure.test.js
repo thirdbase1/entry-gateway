@@ -22,6 +22,7 @@ process.env.GATEWAY_METRICS_DATABASE_URL =
 
 const {
   usingDb,
+  localDay,
   recordRequest,
   recordUpstreamError,
   incrGauge,
@@ -93,7 +94,10 @@ test("getCircuitBreaker()/recordBreakerFailure()/recordBreakerSuccess() fail ope
 test("getMetricsSnapshot() returns a usable in-memory `daily` history when the DB is unreachable", async () => {
   const snap = await resolvesWithin(getMetricsSnapshot(["providerA"], ["model-x"]), "getMetricsSnapshot (daily)");
   assert.ok(Array.isArray(snap.daily), "daily must be an array in mem-fallback mode");
-  const today = new Date().toISOString().slice(0, 10);
+  // Use the store's own localDay() (Lagos/WAT day boundary), NOT a UTC date
+  // slice -- they intentionally differ between 23:00-00:00 UTC, and a hardcoded
+  // UTC compare here made this test fail purely on the wall clock.
+  const today = localDay();
   const todayGlobal = snap.daily.find((d) => d.day === today && d.scope === "global");
   assert.ok(todayGlobal, "today's global daily bucket must exist from the recordRequest calls in earlier tests");
   assert.ok(todayGlobal.requests >= 1, `today's global daily requests >= 1 (got ${todayGlobal.requests})`);

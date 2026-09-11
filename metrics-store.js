@@ -236,7 +236,20 @@ function percentiles(arr) {
 
 // ─── Recording ────────────────────────────────────────────────────────────────
 
+// STABILITY: every numeric field consumed by the record* functions below is
+// clamped to a finite, non-negative number before it reaches an accumulator.
+// A NaN anywhere in this path is permanently sticky (NaN + x = NaN): one bad
+// upstream usage payload would silently poison that provider/model's spend
+// and latency counters forever, and Postgres DOUBLE PRECISION happily stores
+// NaN the same way. The values originate from parsed upstream JSON, so this
+// is defensive input validation at the trust boundary, not paranoia.
+const num = (x) => (Number.isFinite(x) && x > 0 ? x : 0);
+
 function bumpMem(bucket, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
+  if (usage) usage = { input: num(usage.input), output: num(usage.output), cache_read: num(usage.cache_read), cache_write: num(usage.cache_write), reasoning: num(usage.reasoning) };
+  if (estimatedCost != null) estimatedCost = num(estimatedCost);
+  if (latencyMs != null) latencyMs = num(latencyMs);
+  if (ttftMs != null) ttftMs = num(ttftMs);
   bucket.counters.requests = (bucket.counters.requests || 0) + 1;
   if (status >= 200 && status < 300) bucket.counters.requests2xx = (bucket.counters.requests2xx || 0) + 1;
   else if (status >= 400 && status < 500) bucket.counters.requests4xx = (bucket.counters.requests4xx || 0) + 1;
@@ -274,6 +287,12 @@ async function upsertBucket(scope, name, status, latencyMs, ttftMs, usage, estim
   const is4xx = status >= 400 && status < 500 ? 1 : 0;
   const is5xx = status >= 500 ? 1 : 0;
   const statusStr = String(status);
+  // Same finite/non-negative clamp as bumpMem -- see num()'s comment. These
+  // values go straight into DOUBLE PRECISION columns where a NaN would be
+  // stored permanently and poison every later aggregate read.
+  const u = usage
+    ? { input: num(usage.input), output: num(usage.output), cache_read: num(usage.cache_read), cache_write: num(usage.cache_write), reasoning: num(usage.reasoning) }
+    : null;
   await sql`
     INSERT INTO gw_metrics_buckets (
       scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
@@ -282,10 +301,10 @@ async function upsertBucket(scope, name, status, latencyMs, ttftMs, usage, estim
       estimated_spend, status_breakdown, lat, ttft
     ) VALUES (
       ${scope}, ${name}, 1, ${is2xx}, ${is4xx}, ${is5xx},
-      0, ${isFallback ? 1 : 0}, ${usage?.input || 0}, ${usage?.output || 0},
-      ${usage?.cache_read || 0}, ${usage?.cache_write || 0}, ${usage?.reasoning || 0},
-      ${estimatedCost || 0}, jsonb_build_object(${statusStr}::text, 1),
-      ${latencyMs != null ? [latencyMs] : []}, ${ttftMs != null ? [ttftMs] : []}
+      0, ${isFallback ? 1 : 0}, ${u?.input || 0}, ${u?.output || 0},
+      ${u?.cache_read || 0}, ${u?.cache_write || 0}, ${u?.reasoning || 0},
+      ${estimatedCost != null ? num(estimatedCost) : 0}, jsonb_build_object(${statusStr}::text, 1),
+      ${latencyMs != null ? [num(latencyMs)] : []}, ${ttftMs != null ? [num(ttftMs)] : []}
     )
     ON CONFLICT (scope, name) DO UPDATE SET
       requests = gw_metrics_buckets.requests + EXCLUDED.requests,
@@ -346,13 +365,13 @@ function bumpDailyMem(scope, name, status, latencyMs, ttftMs, usage, estimatedCo
   else if (status >= 500) b.requests5xx += 1;
   if (isFallback) b.fallbacks += 1;
   if (usage) {
-    b.tokensInput += usage.input || 0;
-    b.tokensOutput += usage.output || 0;
-    b.tokensCacheRead += usage.cache_read || 0;
-    b.tokensCacheWrite += usage.cache_write || 0;
-    b.tokensReasoning += usage.reasoning || 0;
+    b.tokensInput += num(usage.input);
+    b.tokensOutput += num(usage.output);
+    b.tokensCacheRead += num(usage.cache_read);
+    b.tokensCacheWrite += num(usage.cache_write);
+    b.tokensReasoning += num(usage.reasoning);
   }
-  b.estimatedSpend += estimatedCost || 0;
+  b.estimatedSpend += estimatedCost != null ? num(estimatedCost) : 0;
 }
 
 // Same shape as upsertBucket but targeting gw_metrics_daily with the WAT
@@ -361,6 +380,9 @@ function bumpDailyMem(scope, name, status, latencyMs, ttftMs, usage, estimatedCo
 // never permanently drift.
 async function upsertDailyBucket(day, scope, name, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
   const statusStr = String(status);
+  const u = usage
+    ? { input: num(usage.input), output: num(usage.output), cache_read: num(usage.cache_read), cache_write: num(usage.cache_write), reasoning: num(usage.reasoning) }
+    : null;
   await sql`
     INSERT INTO gw_metrics_daily (
       day, scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
@@ -368,8 +390,8 @@ async function upsertDailyBucket(day, scope, name, status, latencyMs, ttftMs, us
       tokens_reasoning, estimated_spend, status_breakdown
     ) VALUES (
       ${day}, ${scope}, ${name}, 1, ${status >= 200 && status < 300 ? 1 : 0}, ${status >= 400 && status < 500 ? 1 : 0}, ${status >= 500 ? 1 : 0},
-      ${isFallback ? 1 : 0}, ${usage?.input || 0}, ${usage?.output || 0}, ${usage?.cache_read || 0}, ${usage?.cache_write || 0},
-      ${usage?.reasoning || 0}, ${estimatedCost || 0}, jsonb_build_object(${statusStr}::text, 1)
+      ${isFallback ? 1 : 0}, ${u?.input || 0}, ${u?.output || 0}, ${u?.cache_read || 0}, ${u?.cache_write || 0},
+      ${u?.reasoning || 0}, ${estimatedCost != null ? num(estimatedCost) : 0}, jsonb_build_object(${statusStr}::text, 1)
     )
     ON CONFLICT (day, scope, name) DO UPDATE SET
       requests = gw_metrics_daily.requests + EXCLUDED.requests,
