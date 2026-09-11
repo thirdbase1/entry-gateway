@@ -597,3 +597,14 @@ Exported `localDay` and added `local-day.test.js` with boundary tests (22:59Z vs
 month-end roll). Existing UTC-keyed rows from the first hours (2026-09-10) simply merge into the
 same "2026-09-10" key since UTC and Lagos agree on the date for the first 23h of the UTC day --
 no migration needed. Dashboards' "Day (UTC)" labels renamed to "Day (WAT)".
+
+**2026-09-11: PR #6 (client-disconnect abort) reworked and landed as direct code.**
+The original PR carried the feature as a `patches/*.patch` file applied by a GitHub
+workflow -- a patch written against the Aug-20 server.js would no longer apply after the
+metrics + hardening changes. Reworked: `createUpstreamAbort()` (upstream-abort.js) is wired
+directly into proxy() (fetch signal + reader-loop cancel + finally cleanup), the
+patch/workflow/scripts machinery deleted, and the test rewritten as a real node:test file
+with an end-to-end case (client disconnects mid-SSE -> upstream connection torn down,
+verified server-side). 57/57 tests. Also: after PR #10's per-model breaker identity
+(`model:<id>:<id>`), both dashboards' provider Health lookups needed to map breakers back
+to provider rows via the live routes list (gateway 91ddae2, entry-agents c2744e7).
