@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenAIThirdParty — One API. Every OpenAI model.</title>
+<meta name="description" content="OpenAI-compatible gateway. Keep your existing SDK and switch by changing only the base URL.">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #FFFFFF;
+    color: #111827;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    padding: 24px;
+  }
+  .wrap { width: 100%; max-width: 980px; margin: 0 auto; }
+  a { text-decoration: none; color: inherit; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 500; white-space: nowrap;
+  }
+  .badge-success { background: #DCFCE7; color: #15803D; }
+  .badge-info { background: #DBEAFE; color: #1D4ED8; }
+  .badge-warning { background: #FEF3C7; color: #B45309; }
+  .badge-ondark { background: rgba(34,197,94,.15); color: #4ADE80; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    border-radius: 10px; font-size: 14px; font-weight: 500;
+    padding: 10px 18px; cursor: pointer; border: 1px solid transparent;
+    transition: filter .15s ease, background .15s ease;
+    font-family: inherit;
+  }
+  .btn-success { background: #16A34A; color: #FFFFFF; }
+  .btn-success:hover { filter: brightness(1.08); }
+  .btn-outline { background: transparent; color: #111827; border-color: #D4D4D8; }
+  .btn-outline:hover { background: #F4F4F5; }
+  .btn-outline-ondark { background: transparent; color: #4ADE80; border-color: rgba(74,222,128,.4); }
+  .btn-outline-ondark:hover { background: rgba(74,222,128,.08); }
+  .btn[disabled] { opacity: .45; cursor: not-allowed; filter: none; }
+  .btn-sm { padding: 7px 14px; font-size: 13px; }
+  .btn-block { width: 100%; }
+  .icon { display: inline-flex; flex-shrink: 0; }
+
+  /* Header */
+  header {
+    background: #0A0A0A; border-radius: 24px 24px 0 0;
+    padding: 20px 32px;
+  }
+  .header-row { display: flex; align-items: center; gap: 24px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 40px; height: 40px; border-radius: 10px; background: #16A34A;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .brand-name { font-size: 17px; font-weight: 600; color: #FFFFFF; }
+  .brand-sub { font-size: 12px; color: #A1A1AA; margin-top: 1px; }
+  .brand-text { display: flex; flex-direction: column; gap: 0; }
+  .nav { display: flex; align-items: center; gap: 18px; margin-left: auto; }
+  .nav a { color: #D4D4D8; font-size: 14px; }
+  .nav a:hover { color: #FFFFFF; }
+
+  /* Hero */
+  .hero { background: #F7F7F5; border-radius: 0 0 24px 24px; padding: 40px 32px; display: flex; flex-direction: column; gap: 28px; }
+  .hero-inner { display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; }
+  h1.hero-title { font-size: 40px; font-weight: 700; letter-spacing: -0.03em; color: #09090B; }
+  .hero-sub { max-width: 680px; color: #52525B; font-size: 16px; line-height: 1.6; }
+  .checks { display: flex; gap: 24px; align-items: center; justify-content: center; flex-wrap: wrap; }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 14px; color: #3F3F46; }
+
+  .grid2 { display: grid; grid-template-columns: 7fr 5fr; gap: 16px; }
+  @media (max-width: 780px) { .grid2, .grid-feat { grid-template-columns: 1fr !important; } }
+  .card { border: 1px solid #E4E4E7; border-radius: 16px; background: #FFFFFF; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .card h3 { font-size: 15px; font-weight: 600; color: #09090B; }
+  .card-top { display: flex; align-items: center; justify-content: space-between; }
+  .terminal { background: #0A0A0A; border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .dots { display: flex; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .terminal pre { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 13px; color: #D4D4D8; line-height: 1.6; white-space: pre-wrap; }
+  .card-foot { text-align: center; font-size: 12px; color: #64748B; }
+  .divider { height: 1px; background: #F1F5F9; border: 0; }
+  .field input {
+    width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #E4E4E7;
+    font-size: 14px; font-family: inherit; outline: none; margin-bottom: 10px;
+  }
+  .field input:focus { border-color: #16A34A; box-shadow: 0 0 0 3px rgba(22,163,74,.12); }
+  .note { font-size: 12px; color: #71717A; }
+  .waitlist { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 10px 0; text-align: center; }
+  .waitlist .email { font-size: 14px; color: #52525B; }
+
+  /* Section shells */
+  section { padding: 32px 0; }
+  .section-head { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; margin-bottom: 24px; }
+  h2.section-title { font-size: 26px; font-weight: 700; letter-spacing: -0.02em; color: #09090B; }
+  .section-sub { max-width: 640px; color: #52525B; font-size: 14px; line-height: 1.6; }
+  .diagram { border: 1px solid #E5E7EB; border-radius: 24px; padding: 16px; background: #FFFFFF; }
+  .diagram svg { width: 100%; height: auto; display: block; }
+
+  .grid-feat { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .feat { display: flex; flex-direction: column; gap: 6px; }
+  .feat b { font-size: 15px; color: #09090B; }
+  .feat p { font-size: 13px; color: #52525B; }
+  .feat code { background: #F4F4F5; border-radius: 5px; padding: 1px 5px; font-size: 12px; }
+
+  /* Quickstart */
+  .codeblock { border: 1px solid #E5E7EB; border-radius: 16px; background: #0D1117; padding: 20px; }
+  .codeblock-head { display: flex; align-items: center; gap: 8px; color: #E5E7EB; font-size: 14px; font-weight: 500; margin-bottom: 12px; }
+  .codeblock hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin-bottom: 12px; }
+  .codeblock pre { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 13px; color: #D1D5DB; line-height: 1.7; white-space: pre-wrap; }
+
+  /* CTA */
+  .cta { background: #0A0A0A; border-radius: 24px; padding: 40px 32px; display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; }
+  .cta h2 { font-size: 28px; font-weight: 700; color: #FFFFFF; letter-spacing: -0.02em; }
+  .cta p { max-width: 560px; color: #A1A1AA; font-size: 14px; line-height: 1.6; }
+  .cta hr { width: 100%; border: 0; border-top: 1px solid rgba(255,255,255,.08); margin-top: 8px; }
+  .cta .copy { font-size: 12px; color: #71717A; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="header-row">
+      <div class="brand">
+        <div class="logo">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <path d="M12 3.5 18.5 7v6.5"/><path d="M18.5 13.5 12 20.5 5.5 13.5"/>
+            <path d="M5.5 13.5V7L12 3.5"/><path d="M12 3.5v17"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span class="brand-name">OpenAIThirdParty</span>
+            <span class="badge badge-success">Beta</span>
+          </div>
+          <span class="brand-sub">OpenAI Gateway</span>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="#quickstart">Docs</a>
+        <a href="#why">Pricing</a>
+        <a class="btn btn-success btn-sm" href="/admin">Get API Key</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="hero">
+    <div class="hero-inner">
+      <span class="badge badge-success">100% OpenAI Compatible</span>
+      <h1 class="hero-title">One API. Every OpenAI model.</h1>
+      <p class="hero-sub">Replace multiple integrations with one OpenAI-compatible endpoint. Keep your existing SDK and switch by changing only the base URL.</p>
+      <div style="display:flex;gap:12px;">
+        <a class="btn btn-success" href="/admin">Start Building</a>
+        <a class="btn btn-outline" href="#quickstart">View Docs</a>
+      </div>
+      <div class="checks">
+        <span class="check"><svg class="icon" width="15" height="15" viewBox="0 0 24 24" fill="#16A34A"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.2 13.6-3.4-3.4 1.4-1.4 2 2 4.4-4.4 1.4 1.4-5.8 5.8z"/></svg>GPT-5 Ready</span>
+        <span class="check"><svg class="icon" width="15" height="15" viewBox="0 0 24 24" fill="#16A34A"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.2 13.6-3.4-3.4 1.4-1.4 2 2 4.4-4.4 1.4 1.4-5.8 5.8z"/></svg>Responses API</span>
+        <span class="check"><svg class="icon" width="15" height="15" viewBox="0 0 24 24" fill="#16A34A"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.2 13.6-3.4-3.4 1.4-1.4 2 2 4.4-4.4 1.4 1.4-5.8 5.8z"/></svg>Streaming</span>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <div class="card-top">
+          <span class="badge badge-success">Live</span>
+          <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#16A34A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        </div>
+        <h3>API Request</h3>
+        <div class="terminal">
+          <div class="dots">
+            <span class="dot" style="background:#22C55E"></span>
+            <span class="dot" style="background:#F59E0B"></span>
+            <span class="dot" style="background:#EF4444"></span>
+          </div>
+          <pre>POST /v1/responses
+model: gpt-5
+stream: true
+
+✓ Routed successfully</pre>
+        </div>
+        <hr class="divider">
+        <div class="card-foot">Average latency 420ms</div>
+      </div>
+
+      <div class="card field">
+        <h3>Get your API key</h3>
+        <div id="signup">
+          <input id="email" inputmode="email" type="email" placeholder="you@company.com" autocomplete="email">
+          <button id="joinBtn" class="btn btn-success btn-block" disabled>Create Free Account</button>
+          <p class="note" style="margin-top:10px;">No credit card required</p>
+        </div>
+        <div id="waitlist" class="waitlist" style="display:none;">
+          <svg class="icon" width="40" height="40" viewBox="0 0 24 24" fill="#16A34A"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.2 13.6-3.4-3.4 1.4-1.4 2 2 4.4-4.4 1.4 1.4-5.8 5.8z"/></svg>
+          <b style="font-size:15px;">You're on the waitlist</b>
+          <span class="email" id="waitlistEmail"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <section>
+    <div class="section-head">
+      <span class="badge badge-info">Routing Engine</span>
+      <h2 class="section-title">Intelligent OpenAI request routing</h2>
+      <p class="section-sub">Every request enters one endpoint, where the gateway applies caching, authentication, rate limits, and smart routing before reaching OpenAI.</p>
+    </div>
+    <div class="diagram">
+      <svg viewBox="0 0 640 280" role="img" aria-label="Routing diagram showing Client connecting to OpenAIThirdParty Gateway, then branching to GPT-5, GPT-5 Mini, Responses API, Embeddings, and Image Generation.">
+        <defs>
+          <linearGradient id="g" x1="0" x2="1">
+            <stop offset="0%" stop-color="#16A34A"/>
+            <stop offset="100%" stop-color="#22C55E"/>
+          </linearGradient>
+        </defs>
+        <rect width="640" height="280" rx="18" fill="#F8FAFC"/>
+        <rect x="30" y="110" width="140" height="60" rx="12" fill="#FFFFFF" stroke="#CBD5E1"/>
+        <text x="100" y="128" font-size="11" text-anchor="middle" fill="#64748B">Client</text>
+        <text x="100" y="147" font-size="15" font-weight="bold" text-anchor="middle" fill="#111827">OpenAI SDK</text>
+        <line x1="170" y1="140" x2="210" y2="140" stroke="#94A3B8" stroke-dasharray="6 6" stroke-width="1.5" stroke-linecap="round"/>
+        <rect x="210" y="80" width="170" height="120" rx="18" fill="url(#g)"/>
+        <text x="295" y="105" font-size="11" text-anchor="middle" fill="#DCFCE7">Gateway</text>
+        <text x="295" y="128" font-size="18" font-weight="bold" text-anchor="middle" fill="#FFFFFF">OpenAIThirdParty</text>
+        <text x="295" y="146" font-size="9" text-anchor="middle" fill="#DCFCE7">Cache • Auth</text>
+        <text x="295" y="160" font-size="9" text-anchor="middle" fill="#DCFCE7">Rate Limit • Logs</text>
+        <g id="routes"></g>
+      </svg>
+    </div>
+  </section>
+
+  <section id="why" style="background:#FAFAF9;border-radius:24px;padding:32px;">
+    <div class="section-head">
+      <span class="badge badge-discovery" style="background:#EDE9FE;color:#6D28D9;">Why developers use it</span>
+      <h2 class="section-title">Everything you need around the OpenAI API</h2>
+    </div>
+    <div class="grid-feat">
+      <div class="feat">
+        <svg class="icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#16A34A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg>
+        <b>Drop-in compatible</b>
+        <p>Change only your <code>baseURL</code>.</p>
+      </div>
+      <div class="feat">
+        <svg class="icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#16A34A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+        <b>Streaming support</b>
+        <p>Works with real-time responses.</p>
+      </div>
+      <div class="feat">
+        <svg class="icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#16A34A" stroke-width="2" stroke-linecap="round"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6" rx="1"/><rect x="12" y="8" width="3" height="10" rx="1"/><rect x="17" y="4" width="3" height="14" rx="1"/></svg>
+        <b>Usage analytics</b>
+        <p>Monitor tokens, latency, and cost.</p>
+      </div>
+      <div class="feat">
+        <svg class="icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#16A34A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        <b>Secure API keys</b>
+        <p>Rotate and manage keys from one dashboard.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="quickstart">
+    <div class="section-head">
+      <span class="badge badge-warning">Quickstart</span>
+      <h2 class="section-title">Works with the official OpenAI SDK</h2>
+    </div>
+    <div class="codeblock">
+      <div class="codeblock-head">
+        <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#22C55E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>
+        JavaScript
+      </div>
+      <hr>
+      <pre>import OpenAI from "openai";
+
+const client = new OpenAI({
+  apiKey: process.env.OPENAITHIRDPARTY_KEY,
+  baseURL: "https://api.openaithirdparty.dev/v1",
+});
+
+const response = await client.responses.create({
+  model: "gpt-5",
+  input: "Hello!"
+});</pre>
+    </div>
+  </section>
+
+  <div class="cta">
+    <span class="badge badge-ondark">Ready to build?</span>
+    <h2>Ship OpenAI apps without changing your stack.</h2>
+    <p>One endpoint, one API key, and full compatibility with the latest OpenAI models.</p>
+    <div style="display:flex;gap:12px;">
+      <a class="btn btn-success" href="/admin">Get Started</a>
+      <a class="btn btn-outline-ondark" href="#quickstart">Documentation</a>
+    </div>
+    <hr>
+    <span class="copy">© 2026 OpenAIThirdParty. Built for OpenAI developers.</span>
+  </div>
+
+</div>
+<script>
+  // Waitlist card: pure client-side demo state (no endpoint, nothing submitted).
+  (function () {
+    var email = document.getElementById('email');
+    var btn = document.getElementById('joinBtn');
+    var signup = document.getElementById('signup');
+    var waitlist = document.getElementById('waitlist');
+    var shown = document.getElementById('waitlistEmail');
+    if (!email || !btn) return;
+    email.addEventListener('input', function () { btn.disabled = email.value.trim() === ''; });
+    btn.addEventListener('click', function () {
+      var v = email.value.trim();
+      if (!v) return;
+      // Basic hygiene: never inject the raw value into HTML.
+      shown.textContent = v;
+      signup.style.display = 'none';
+      waitlist.style.display = 'flex';
+    });
+  })();
+
+  // Build the 5 route branches into the diagram (kept in JS so the SVG stays short).
+  (function () {
+    var g = document.getElementById('routes');
+    if (!g || !g.setAttribute) return;
+    var NS = 'http://www.w3.org/2000/svg';
+    [['GPT-5', 40], ['GPT-5 Mini', 82], ['Responses', 124], ['Embeddings', 166], ['Images', 208]].forEach(function (item) {
+      var y = item[1];
+      var rect = document.createElementNS(NS, 'rect');
+      rect.setAttribute('x', '470'); rect.setAttribute('y', String(y - 12));
+      rect.setAttribute('width', '140'); rect.setAttribute('height', '24'); rect.setAttribute('rx', '8');
+      rect.setAttribute('fill', '#FFFFFF'); rect.setAttribute('stroke', '#D1D5DB');
+      var line = document.createElementNS(NS, 'line');
+      line.setAttribute('x1', '380'); line.setAttribute('y1', '140');
+      line.setAttribute('x2', '470'); line.setAttribute('y2', String(y));
+      line.setAttribute('stroke', '#16A34A'); line.setAttribute('stroke-width', '1.5');
+      line.setAttribute('stroke-linecap', 'round');
+      var text = document.createElementNS(NS, 'text');
+      text.setAttribute('x', '540'); text.setAttribute('y', String(y + 4));
+      text.setAttribute('font-size', '10'); text.setAttribute('text-anchor', 'middle');
+      text.setAttribute('fill', '#111827'); text.textContent = item[0];
+      g.appendChild(line); g.appendChild(rect); g.appendChild(text);
+    });
+  })();
+</script>
+</body>
+</html>

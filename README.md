@@ -5,49 +5,45 @@ Self-hosted, config-driven native-protocol AI gateway. Clients use one gateway A
 ## Routes
 
 - `GET /health` — gateway status, uptime, providers, circuit breakers, active requests
-- `GET /metrics` — per-provider and aggregate metrics (admin-auth protected)
-- `GET /admin` — built-in admin dashboard UI (admin-auth protected)
+- `GET /metrics` — per-provider and aggregate metrics (public through the read-only dashboard session by default)
+- `GET /` — public landing page (static, no auth)
+- `GET /admin` — built-in public, read-only admin dashboard UI
 - `GET /v1/models` — deduplicated public models with protocol metadata
 - `POST /v1/chat/completions` — OpenAI-compatible passthrough
 - `POST /v1/messages` — Anthropic Messages passthrough
 - `POST /v1beta/models/:model:generateContent` — Gemini-style passthrough
-- `GET /v1/debug/routes` — route configuration debug view (admin-auth protected)
+- `GET /v1/debug/routes` — route configuration debug view (public through the read-only dashboard session by default)
 
 No payload translation is performed. A request is routed only to upstreams configured for the same native protocol. Duplicate models use ascending `priority` and fall back to the next compatible upstream after retryable upstream failures.
 
 ## Admin Dashboard
 
-The dashboard auto-detects the gateway URL and API key from environment variables — **zero manual config needed** on Vercel or any self-hosted deployment.
+The dashboard is a static page served at `/admin` (the domain root `/` is the public landing page). By design, opening it creates a signed, read-only session with access to `/metrics`, `/v1/models`, and `/v1/debug/routes`, so those operational views are public when `ADMIN_AUTOAUTH` is enabled (the default). The session cannot call paid proxy routes, which always require a real gateway key.
 
 ### Auto-detection
 
-When the server serves `/admin`, it injects two meta tags into the HTML:
+When the server serves `/admin`, it injects meta tags into the HTML:
 
-| Meta tag | Source | Description |
+| Meta tag | Source | Injected when |
 |---|---|---|
-| `gateway-url` | `VERCEL_URL` env var (prepended with `https://`) or request origin | The gateway's public URL |
-| `gateway-key` | First key from `ADMIN_API_KEYS` (falls back to `GATEWAY_API_KEYS`) | Bearer token for API calls |
+| `gateway-url` | request origin | always (the URL is not a secret) |
+| `gateway-key` | First key from `ADMIN_API_KEYS` (falls back to `GATEWAY_API_KEYS`) | **only when the request already presents a valid Bearer token** |
 
-If both are present, the dashboard **auto-connects immediately** — no manual URL or key entry needed. If only the URL is detected, the key field is shown for manual entry.
+The `gateway-key` is deliberately **not** embedded for anonymous visitors. An earlier version injected the live admin/gateway key into the page for *anyone* who could reach the URL. Now the key is only auto-injected when the request itself is already authenticated. A normal browser visit uses the read-only session automatically; a real key is only needed for paid proxy calls or when `ADMIN_AUTOAUTH=0`.
 
 ### Accessing the dashboard
 
 ```bash
-# On Vercel — auto-connects, just open in browser
+# Open in a browser — read-only dashboard data loads automatically
 open https://your-gateway.vercel.app/admin
 
-# Self-hosted — also auto-connects
-open https://your-gateway.example.com/admin
-
-# Manual connection (if auto-detect is unavailable)
-# Enter gateway URL and API key in the connection bar
-```
-
-Auth is required to access `/admin` — you need a valid `ADMIN_API_KEYS` or `GATEWAY_API_KEYS` Bearer token. In a browser, pass the key as a URL hash:
-
-```bash
+# Or pass the key as a URL hash so the page auto-connects on load
 open https://your-gateway.vercel.app/admin#your-admin-key
 ```
+
+The `#your-admin-key` hash is read client-side and never sent to the server in the request line, so it isn't logged by the gateway or intermediaries.
+
+Set `ADMIN_AUTOAUTH=0` to require an admin or gateway Bearer key for the read-only endpoints.
 
 ### What the dashboard shows
 

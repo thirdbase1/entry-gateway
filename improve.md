@@ -352,3 +352,248 @@ Cannot set headers after they are sent to the client`, connection hangs
 forever past a 5s safety timeout) and passes against the fix (candidate
 #2 receives zero requests, connection closes cleanly, client sees only
 candidate #1's partial data). `npm test` now runs this suite.
+
+## 2026-08-21: Smart routing for FreeModel models across two base URLs
+
+Owner asked to wire both `https://api.freemodel.dev` and
+`https://vip-sg.freemodel.dev` in with "smart routing" for gpt-5.6-sol/
+terra/luna. No server.js code change needed -- `candidates()` already
+sorts ascending by `priority` and `handle()`'s fallback loop already
+tries each candidate until one succeeds; this only needed a route-config
+change in `EXTRA_MODEL_ROUTES_JSON_3` (Vercel env var):
+
+- Added `api.freemodel.dev/v1` as a priority-1 candidate for all three
+  models (`timeoutMs: 5000` for fast failover).
+- Kept the existing `vip-sg.freemodel.dev/v1` candidates as priority-100
+  fallback, untouched.
+- Dedup key in `routes()` includes `upstreamBaseURL`, so both candidates
+  coexist correctly rather than clobbering each other (see the
+  `upstreamApiKeyEnv`-in-dedup-key note earlier in this file for the same
+  class of gotcha).
+
+Verified live via direct probe: gpt-5.6-sol and gpt-5.6-terra both
+return 200 through the new `api.freemodel.dev` candidate. gpt-5.6-luna
+still fails on BOTH domains -- the error payloads carry the identical
+upstream distributor-group/pool id either way, confirming the two
+domains share the same backend pool for Luna specifically. So this
+smart-routing change *does* add real redundancy for Sol/Terra, but
+cannot route around Luna's current outage since there's no second
+underlying pool to fail over to for that model.
+
+Separately, this same edit also folded in the ling-3.0-flash-free fix
+from earlier today (moved from the disconnected EXTRA_MODEL_ROUTES_JSON_4
+slot into this live one) and deduped an accidental double gpt-5.6-luna
+entry left over from an earlier pass.
+
+## 2026-08-27: metrics-store.js Redis calls could hang or crash real requests
+
+Found while checking runtime logs: Upstash rate-limited this project's
+Redis instance (`UpstashError: Your database has been temporarily
+rate-limited`). This exposed two real bugs in metrics-store.js, both
+now fixed:
+
+1. Every exported function did an unguarded `await redis.xxx()` /
+   `await pipeline.exec()` with no try/catch. When Redis errored, that
+   propagated straight up as a raw exception.
+2. In `server.js`'s `handle()` fallback loop, the `isCircuitOpen()` call
+   made *before* the `try { await proxy(...) }` block (used to skip
+   already-open circuits when there are 2+ candidate routes) had nothing
+   to catch it -- an uncaught rejection there just hangs the request with
+   no response ever sent, until Vercel's hard 300s function timeout kills
+   it. Confirmed in real logs: several `/v1/chat/completions` requests hit
+   exactly this, logged as `Unhandled Rejection: UpstashError...` followed
+   by `Vercel Runtime Timeout Error: Task timed out after 300 seconds`.
+   Single-candidate models (e.g. claude-opus-4-6) instead hit bug #1 inside
+   `proxy()`, which *is* wrapped by `handle()`'s own try/catch, so those
+   just got a fast but misleading 502 whose `error` field was the raw
+   Upstash message -- looked like an upstream model failure, but it was
+   actually our own metrics/circuit-breaker store.
+
+Fix: added an in-process Redis-health circuit breaker inside
+metrics-store.js (`isRedisCircuitOpen`/`recordRedisFailure`, 15s cooldown
+-- same pattern as entry-agents' `lib/rate-limit.ts`) and wrapped every
+real Redis call in try/catch that falls back to the existing in-memory
+path on failure. `isCircuitOpen()` specifically is now guaranteed to
+never throw, since `server.js` relies on that at a call site with no
+try/catch of its own by design (documented inline at both ends). New
+`metrics-store-redis-failure.test.js` points the module at a real,
+unreachable host (no mocking lib in this repo, same philosophy as
+`fallback.test.js`) and asserts every exported function resolves quickly
+with a safe fallback instead of throwing/hanging -- confirmed it fails
+hard against the pre-fix code (ENOTFOUND propagates straight through)
+and passes against the fix.
+
+Not fixed / out of scope: the *first* Redis rate-limit event itself is
+an Upstash-side condition (same recurring issue class already seen and
+partly remediated for entry-agents' own Redis instance) -- this fix only
+makes the gateway resilient *to* that condition, it doesn't prevent
+Upstash from rate-limiting the account again.
+
+## 2026-08-27 (same day, follow-up): migrated entirely off Upstash Redis
+
+Owner asked, after the fail-open fix above: why does entry-agents even
+use Upstash, and can the gateway move off it entirely instead of just
+being resilient to its outages? Answer to the first part: Vercel
+serverless functions are stateless between invocations, so anything that
+needs to be shared/consistent across concurrent instances (rate limits,
+skills cache, this gateway's own metrics/circuit-breakers) needs a fast
+external store -- Upstash Redis was the store used for that. But this is
+now the second real incident in about a week traced back to Upstash-side
+throttling (first hit entry-agents' own separate Redis instance, this one
+hit the gateway's), so worth actually removing the dependency here rather
+than just tolerating it.
+
+Migrated metrics-store.js (and gemini-cache.js, which had its own smaller
+Redis usage for the Gemini explicit-cache resource-name lookup) from
+`@upstash/redis` to `@neondatabase/serverless`, pointed at the SAME Neon
+Postgres database entry-agents already runs on (reused rather than
+provisioning new infra -- new `GATEWAY_METRICS_DATABASE_URL` env var,
+namespaced tables `gw_metrics_buckets` / `gw_metrics_gauges` /
+`gw_circuit_breakers` / `gw_kv` so nothing collides with entry-agents' own
+tables in that DB). Chose the Neon serverless HTTP driver specifically
+because it needs no persistent connection/pool, matching how the REST-
+based Upstash client worked -- still a good fit for stateless functions.
+
+Counters use `INSERT ... ON CONFLICT DO UPDATE SET col = table.col +
+EXCLUDED.col` for atomic increments (including a dynamic-key JSONB
+increment for the per-status-code breakdown); latency/ttft samples are
+appended to a Postgres array column and trimmed to the last 500 in the
+same statement. Circuit-breaker state and gauges are straightforward
+upsert tables. `usingRedis()` renamed to `usingDb()` (also updated
+server.js's one call site + the `/health` and `/metrics` `metricsBackend`
+field, now reports `"postgres"` instead of `"redis"`).
+
+Kept the exact same fail-open discipline from the earlier same-day fix
+(15s in-process circuit breaker around DB calls, falls back to the
+existing in-memory path) -- Postgres isn't immune to outages either, this
+just means it's no longer sharing Upstash's specific account/quota with
+everything else.
+
+Verified: renamed `metrics-store-redis-failure.test.js` ->
+`metrics-store-db-failure.test.js`, updated to point at an unreachable
+Postgres host instead of an unreachable Redis host -- all 9 tests pass.
+Separately ran a real manual script against the actual Neon DB
+(recordRequest/recordUpstreamError/gauges/circuit-breaker open-close-
+recover/kv get-set) to confirm the SQL itself is correct, not just the
+fail-open path -- confirmed correct, then cleaned up the test rows.
+Removed `KV_REST_API_URL`/`KV_REST_API_TOKEN` from the Vercel project and
+`@upstash/redis` from package.json -- zero Upstash usage left anywhere in
+this repo.
+
+## 2026-08-28: Wired 3 new models via api.b.ai, fixed dead EXTRA_MODEL_ROUTES_JSON_4
+
+Owner asked to add three models -- deepseek-v4-flash-vision-exp, glm-5.3-flash, qwen3.8-flash --
+via a new reseller, api.b.ai, using a provided key (now stored as the `BAI_API_KEY` Vercel secret,
+type sensitive). Live-tested the key against api.b.ai directly first (`/v1/models` catalog list +
+real chat completions for all three) before wiring anything into the gateway.
+
+Found and fixed a real bug while doing this: `EXTRA_MODEL_ROUTES_JSON_4` already existed on Vercel
+(type "encrypted", has a value) but was never added to `configured()`'s array -- meaning whatever
+routes it holds have been completely inert in production, silently, since whenever it was created.
+Added both `_4` and a new `_5` (used for these 3 new routes) to `configured()`. Also resolved a
+long-running suspicion from the `_2`/`_3` comments above: the opaque base64 `eyJ2...` blob the
+Vercel API returns for `decrypt=true` on an "encrypted"-type var is NOT a double-encryption bug --
+it's just Vercel's normal API representation for that var type. Confirmed by creating `_5` fresh
+with known plaintext JSON and getting the identical envelope shape back immediately in the
+creation response itself, before any encryption round-trip could have mangled it. So `_2`/`_3`/`_4`
+are probably fine underneath; there's just no way to ever read the real plaintext back via this
+API for any "encrypted" var, by design.
+
+Pricing sourced from each model's real creator's own published rate, not api.b.ai's (reseller)
+rate, per owner instruction ("price all of them with the official price of the creator"):
+
+- **deepseek-v4-flash-vision-exp** (DeepSeek's own pricing page, api-docs.deepseek.com): shares
+  deepseek-v4-flash's rate card exactly (not deepseek-v4-pro's higher one). Real pricing has a
+  peak/off-peak split (peak = 01:00-04:00 and 06:00-10:00 UTC Mon-Fri; off-peak = everything else,
+  half price) that this gateway has no time-of-day mechanism to model -- picked the PEAK rate as a
+  flat, conservative choice so we never undercharge: `input: 0.44, output: 1.32, cache_read: 0.014`
+  (all per 1M tokens). Context window 1,048,576 (1M), max output 384K per DeepSeek's own table.
+  Confirmed via live probe: thinking mode default-on, but genuinely toggleable (reasoning_effort
+  "none" zeroes reasoning_content/reasoning_tokens); kept on the app's DEFAULT_LEVELS
+  (low/medium/high) matching deepseek-v4-flash's own established convention rather than exposing
+  the full none-xhigh-max range it technically also accepts.
+- **glm-5.3-flash** (Z.ai's own pricing page, docs.z.ai/guides/overview/pricing): current effective
+  *promotional* rate (50% off through 24:00 Sept 9, 2026 UTC+8) -- `input: 0.075, output: 0.25,
+  cache_read: 0.015` per 1M. List price after the promo ends is double that
+  (0.15/0.50/0.03) -- **needs revisiting after 2026-09-09** or this will undercharge going
+  forward. Context window 1M, max output 128K per Z.ai's own model page. Confirmed via live probe:
+  genuinely cannot disable thinking -- both "none" and "medium" reasoning_effort get a hard 400
+  straight from the upstream itself ("该模型始终思考，不支持关闭思考；请使用 low、high 或
+  max。" -- "this model always thinks, disabling isn't supported; use low, high, or max"). Real
+  accepted vocabulary is exactly low/high/max, added as an explicit override in entry-agents'
+  model-reasoning.ts.
+- **qwen3.8-flash** (Alibaba Cloud's own blog post announcing the model): `input: 0.16, output:
+  0.47` per 1M. No official cache-read rate published anywhere by Alibaba for this specific model,
+  so left unset rather than assuming a discount -- falls back to full input rate on any cache hit,
+  which is the safe direction to be wrong in. Context window 1M (default; natively 262,144,
+  extendable via YaRN) per Alibaba's/Qwen's own announcement. Confirmed via live probe: real
+  accepted reasoning_effort vocabulary is the *full* none/low/medium/high/xhigh/max -- wider than
+  either existing Qwen3.8 model already in this codebase (qwen3.8-max-free: low/medium/xhigh;
+  qwen3.8-27b: none/low/medium/xhigh) -- and "none" genuinely zeroes reasoning output rather than
+  silently ignoring the param. Added as its own explicit override in model-reasoning.ts.
+
+All three verified end-to-end live through entry-agents' own reasoning-probe route (which calls
+*this* gateway, not api.b.ai directly) after both repos redeployed -- real 200s with correct
+reasoning_content and final answers for all three model ids.
+
+No icon-wiring needed: entry-agents' provider-icons.tsx infers the brand from the model id's
+prefix (`deepseek-`, `glm-`, `qwen-`) rather than any field this gateway returns, so all three
+picked up the right @lobehub/icons brand automatically.
+
+## 2026-09-10: Per-day metrics history (unbounded retention, 1 year+ by design)
+
+**Question that prompted this:** "how many days does the metrics track?" Answer: the original
+`gw_metrics_buckets` (Postgres, since the 2026-08-27 Upstash migration) had **no time dimension at
+all** — one cumulative all-time counter per (scope, name). It could never answer "yesterday vs
+today". The /metrics endpoint showed lifetime totals only.
+
+**What shipped:**
+- New `gw_metrics_daily` table (PK: day, scope, name) — same counters as the cumulative table,
+  rolled up per UTC day (`new Date().toISOString().slice(0,10)`). lat/ttft sample arrays are
+  deliberately NOT kept per day (unbounded-ish per row; percentiles stay a cumulative-table
+  feature).
+- `recordRequest()` and `recordUpstreamError()` write the daily rows in the SAME Promise.all
+  batch as the cumulative upserts, so the two can only disagree mid-outage, never permanently.
+- **Retention is deliberately UNBOUNDED** — nothing ever deletes daily rows, so history survives
+  indefinitely (owner asked for "no end", at least a year). Rows only exist for days with traffic,
+  so this stays small in practice; if it ever grows huge, aggregate further rather than truncate.
+- `getMetricsSnapshot()` returns a new `daily` field: flat array of { day, scope, name, requests,
+  requests2xx/4xx/5xx, upstreamErrors, fallbacks, tokens{...}, estimatedSpend }, ordered by day.
+  server.js spreads the snapshot into /metrics, so the field flows through with zero route
+  changes.
+- In-memory fallback tracks daily too (`mem.daily`), on BOTH the `!dbUsable()` early return AND
+  the DB-failure catch path — the regression test caught exactly this gap in the first draft:
+  requests recorded during a DB outage otherwise vanished from the daily view.
+
+**Bugs found while testing (both pre-existing, both fixed):**
+1. The 2026-08-28 session-affinity work (server.js `needsSessionAffinity()` + its unit test) had
+   been left **uncommitted** in the local working tree — it was live in production but absent
+   from git. Committed now as its own commit so git stops lying about what's deployed.
+2. `needs-session-affinity.test.js` imported server.js without the `VERCEL=1` guard
+   fallback.test.js uses, so `node --test *.test.js` made it app.listen on :8787 and whichever
+   file bound the port second crashed with EADDRINUSE. Guard added, matching the established
+   pattern; full suite now exits cleanly (15 pass, 0 fail).
+
+**Follow-up same day:** the daily history also had to be surfaced in the *UIs* -- the /metrics field
+alone rendered as nothing anywhere:
+
+1. `public/admin.html` (the gateway's own /admin dashboard) got a "Daily History" section-card
+   (last 14 UTC days, scope=global only, newest first, requests/2xx/4xx/5xx/errors/spend + a
+   proportional inline bar per day). Hidden only when `daily` is absent (older gateway); shows an
+   explicit "no history recorded yet" empty state when the array is present but empty.
+2. entry-agents' admin Gateway dashboard (same-day commit 8c7cf0f) initially hid its Daily History
+   card whenever the array was empty -- a fresh table with zero traffic rendered as *nothing*, which
+   read as "the feature doesn't exist". Fixed in 977fae9 to render with an empty state whenever the
+   field is present.
+
+Lesson: an API field with zero rows is invisible -- always pair new data surfaces with an explicit
+empty state, or ship the UI in the same change.
+
+**Owner follow-up (same day): daily buckets roll at 12am NIGERIA time, not UTC.**
+`gw_metrics_daily` initially used UTC day keys; the owner wants each day to start at 12am
+Africa/Lagos (WAT). Since Lagos is fixed UTC+1 with no DST (ever), `localDay()` in
+metrics-store.js shifts UTC by +1h before slicing the date: 23:00 UTC = midnight Lagos = new day.
+Exported `localDay` and added `local-day.test.js` with boundary tests (22:59Z vs 23:00Z roll,
+month-end roll). Existing UTC-keyed rows from the first hours (2026-09-10) simply merge into the
+same "2026-09-10" key since UTC and Lagos agree on the date for the first 23h of the UTC day --
+no migration needed. Dashboards' "Day (UTC)" labels renamed to "Day (WAT)".

@@ -10,11 +10,10 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test *.test.js",
-    "test:abort": "node upstream-abort.test.js",
-    "test:fallback": "node --test fallback.test.js"
+    "test:security": "node --test security.test.js"
   },
   "dependencies": {
-    "@upstash/redis": "^1.38.2",
+    "@neondatabase/serverless": "^1.1.0",
     "express": "^4.19.2"
   }
 }
