@@ -593,3 +593,9 @@ pct = input > 0 ? (cacheRead / input) * 100 : 0;
 Fix: stopped re-deriving the rate client-side; reuse the backend's `tokens.cacheHitRate` (fallback to the same `cacheRead / (input + cacheRead + cacheWrite)` formula if that field is ever absent, e.g. against an older gateway response shape). The per-model fraction display and the page-wide avg badge/footer now both use the total-prompt denominator (`input + cacheRead + cacheWrite`), not `input` alone.
 
 LESSON: when a UI computes a derived stat that the backend already computes and exposes, don't re-derive it client-side from raw components — the two formulas silently drifted and nobody caught it because it "looked plausible" (near-100% actually reads as good news, which made it LESS likely to get questioned). Prefer wiring the UI straight to the backend's already-tested field.
+
+## 2026-09-17: Gateway headline token total excluded cached prompt tokens
+
+The gateway metrics store normalizes `tokens.input` to uncached-only prompt input. It correctly kept `cacheRead` and `cacheWrite` separately for pricing and cache-rate calculation, but `serializeFromDb()` and `serializeFromMem()` defined `tokens.total` as `input + output`. The admin headline therefore showed only uncached input plus output, while the cache panel showed the omitted cached tokens separately. Fix: `tokens.total = input + cacheRead + cacheWrite + output`; the headline now represents all prompt and completion tokens, and its subtitle explicitly shows cache-read tokens included.
+
+Important boundary: Entry's `usage_events.input_tokens` already contains the full input total, with `cached_input_tokens` as a detail. The two dashboards use different raw semantics and must not share a formula blindly.

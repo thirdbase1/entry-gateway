@@ -827,7 +827,7 @@
       const stats = [
         { label: 'Total Requests', value: fmtNum(g.requests || 0), sub: (metrics?.activeRequests || 0) + ' active', icon: '📡', accent: false },
         { label: 'Avg Latency', value: g.latency ? fmtLat(g.latency.p50) : '—', sub: g.latency ? 'p95: ' + fmtLat(g.latency.p95) : '', icon: '⏱', accent: false },
-        { label: 'Total Tokens', value: fmtNum((g.tokens?.total) || 0), sub: (metrics?.activeStreams || 0) + ' active streams', icon: '📈', accent: false },
+        { label: 'Total Tokens', value: fmtNum((g.tokens?.total) || 0), sub: fmtNum((g.tokens?.cacheRead || 0)) + ' cache-read included', icon: '📈', accent: false },
         { label: 'Est. Spend', value: fmtMoney(g.estimatedSpend || 0), sub: (g.upstreamErrors || 0) + ' upstream errors', icon: '$', accent: true },
       ];
       document.getElementById('statGrid').innerHTML = stats.map(s => `

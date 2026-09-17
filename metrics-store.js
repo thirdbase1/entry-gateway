@@ -839,7 +839,10 @@ function serializeFromDb(row) {
     tokens: {
       input, output, cacheRead, cacheWrite,
       reasoning: Number(row.tokens_reasoning) || 0,
-      total: input + output,
+      // `input` is uncached-only after server.js normalization. Total prompt
+      // tokens must include cache reads/writes, otherwise the headline
+      // silently undercounts heavily cached traffic.
+      total: input + cacheRead + cacheWrite + output,
       cacheHitRate: cacheHitRateOf(input, cacheRead, cacheWrite),
     },
     estimatedSpend: Number(Number(row.estimated_spend || 0).toFixed(6)),
@@ -864,7 +867,7 @@ function serializeFromMem(b) {
     tokens: {
       input, output: c.tokensOutput || 0, cacheRead, cacheWrite,
       reasoning: c.tokensReasoning || 0,
-      total: input + (c.tokensOutput || 0),
+      total: input + cacheRead + cacheWrite + (c.tokensOutput || 0),
       cacheHitRate: cacheHitRateOf(input, cacheRead, cacheWrite),
     },
     estimatedSpend: Number((c.estimatedSpend || 0).toFixed(6)),
