@@ -1002,24 +1002,44 @@
         dailyCard.style.display = 'none';
       }
 
-      // Cache hit rate by model -- explicit + implicit cache reads as a
-      // share of total input tokens, per model, sorted highest-first so
-      // the models actually benefiting from caching float to the top.
+      // Cache hit rate by model -- cache reads as a share of TOTAL prompt
+      // tokens (uncached input + cache reads + cache writes), per model,
+      // sorted highest-first so the models actually benefiting from
+      // caching float to the top.
+      //
+      // FIXED 2026-09-17: this used to do
+      //   cacheRead = Math.min(t.cacheRead, t.input); pct = cacheRead / input
+      // but t.input is UNCACHED-ONLY input (see metrics-store.js's own
+      // comment on cacheHitRateOf/serializeFromDb) -- for any model
+      // actually benefiting from caching, cacheRead is naturally BIGGER
+      // than that uncached slice, so the Math.min() clamp silently forced
+      // cacheRead down to equal input, then divided input by itself.
+      // Every well-cached model rendered a guaranteed, meaningless 100%
+      // (confirmed: qwen3.8-flash showed 100.0% 57.0M/57.0M while the
+      // real total-prompt hit rate is 83.5%). The backend already
+      // computes the correct rate per-model as tokens.cacheHitRate via
+      // cacheHitRateOf() -- reuse it instead of re-deriving a second,
+      // divergent formula client-side.
       const byModelCache = metrics?.byModel || {};
       const cacheRows = Object.keys(byModelCache)
         .map(name => {
           const t = byModelCache[name].tokens || {};
           const input = t.input || 0;
-          const cacheRead = Math.min(t.cacheRead || 0, input);
-          return { name, input, cacheRead, pct: input > 0 ? (cacheRead / input) * 100 : 0 };
+          const cacheRead = t.cacheRead || 0;
+          const cacheWrite = t.cacheWrite || 0;
+          const denom = input + cacheRead + cacheWrite;
+          const pct = typeof t.cacheHitRate === "number"
+            ? t.cacheHitRate * 100
+            : (denom > 0 ? (cacheRead / denom) * 100 : 0);
+          return { name, input, cacheRead, denom, pct };
         })
-        .filter(r => r.input > 0) // hide models with no traffic yet
-        .sort((a, b) => b.pct - a.pct || b.input - a.input);
+        .filter(r => r.denom > 0) // hide models with no traffic yet
+        .sort((a, b) => b.pct - a.pct || b.denom - a.denom);
 
       if (cacheRows.length) {
-        const totalInput = cacheRows.reduce((s, r) => s + r.input, 0);
+        const totalDenom = cacheRows.reduce((s, r) => s + r.denom, 0);
         const totalCacheRead = cacheRows.reduce((s, r) => s + r.cacheRead, 0);
-        const avgPct = totalInput > 0 ? (totalCacheRead / totalInput) * 100 : 0;
+        const avgPct = totalDenom > 0 ? (totalCacheRead / totalDenom) * 100 : 0;
         document.getElementById('cacheAvgBadge').textContent = avgPct.toFixed(1) + '% avg';
 
         document.getElementById('cacheHitSection').innerHTML = cacheRows.map(r => {
@@ -1033,13 +1053,13 @@
             <div class="cache-row">
               <span class="model-label" title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</span>
               <div class="bar-track"><div class="bar-fill" style="width:${Math.max(r.pct, r.pct > 0 ? 2 : 0)}%;background:${gradient};"></div></div>
-              <span class="val" style="color:${color}">${r.pct.toFixed(1)}%<span class="frac">${fmtNum(r.cacheRead)}/${fmtNum(r.input)}</span></span>
+              <span class="val" style="color:${color}">${r.pct.toFixed(1)}%<span class="frac">${fmtNum(r.cacheRead)}/${fmtNum(r.denom)}</span></span>
             </div>
           `;
         }).join('') + `
           <div class="cache-footer">
             <span>${cacheRows.length} model${cacheRows.length !== 1 ? 's' : ''} with traffic</span>
-            <span>${fmtNum(totalCacheRead)} / ${fmtNum(totalInput)} input tokens served from cache</span>
+            <span>${fmtNum(totalCacheRead)} / ${fmtNum(totalDenom)} prompt tokens served from cache</span>
           </div>
         `;
       } else {

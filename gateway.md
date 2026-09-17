@@ -575,3 +575,21 @@ invalid central-key rejection: passed
 ```
 
 Operational note: the first credential-aware push method was rejected by the fresh clone's Git credential handling before contacting GitHub. The push then succeeded using the securely stored GitHub token through an in-memory authenticated push URL. The token was not printed, committed, or written into project files.
+
+## 2026-09-17: "Cache Hit Rate by Model" widget was mathematically guaranteed to show 100% for any well-cached model
+
+Owner spotted it from the live dashboard: qwen3.8-flash showed *100.0% 57.0M/57.0M* under "Cache Hit Rate by Model", while the real rate (from raw gw_metrics_buckets: 289.2M cache_read / (57.0M input + 289.2M cache_read) computed via metrics-store.js's own `cacheHitRateOf`) is 83.5%.
+
+Root cause: `public/admin.html`'s client-side JS re-derived cache hit rate itself instead of using the `tokens.cacheHitRate` field the backend already computes correctly (`cacheHitRateOf()` in metrics-store.js, `cacheRead / (input + cacheRead + cacheWrite)`). The buggy client formula was:
+
+```js
+const input = t.input || 0;
+const cacheRead = Math.min(t.cacheRead || 0, input);   // clamp!
+pct = input > 0 ? (cacheRead / input) * 100 : 0;
+```
+
+`t.input` (from the store) is documented as UNCACHED-ONLY input — see metrics-store.js's 2026-08-18 comment on `cacheHitRateOf`. For any model actually benefiting from caching, `cacheRead` is naturally *larger* than that uncached remainder (cache hits replace most of the prompt). The `Math.min(cacheRead, input)` clamp silently forced `cacheRead` down to equal `input` whenever this happened, then divided `input` by itself — a guaranteed, meaningless 100% for every well-cached model. The bug only stayed invisible on low-traffic/low-cache models where `cacheRead < input` naturally.
+
+Fix: stopped re-deriving the rate client-side; reuse the backend's `tokens.cacheHitRate` (fallback to the same `cacheRead / (input + cacheRead + cacheWrite)` formula if that field is ever absent, e.g. against an older gateway response shape). The per-model fraction display and the page-wide avg badge/footer now both use the total-prompt denominator (`input + cacheRead + cacheWrite`), not `input` alone.
+
+LESSON: when a UI computes a derived stat that the backend already computes and exposes, don't re-derive it client-side from raw components — the two formulas silently drifted and nobody caught it because it "looked plausible" (near-100% actually reads as good news, which made it LESS likely to get questioned). Prefer wiring the UI straight to the backend's already-tested field.
