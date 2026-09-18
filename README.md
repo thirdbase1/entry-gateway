@@ -148,10 +148,10 @@ Set these server-side in Vercel:
 ~~~text
 TOKEN_HARBOR_BASE_URL=https://tokenharbor.ai/v1
 TOKEN_HARBOR_API_KEY=<server-side-secret>
-EXTRA_MODEL_ROUTES_JSON_6=[{"id":"deepseek-v4.1-flash:free","name":"DeepSeek V4.1 Flash (Token Harbor)","protocol":"openai-chat","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"deepseek-v4.1-flash:free","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","priority":100,"billingMultiplier":0,"cost":{"input":0.30,"cache_read":0.006,"output":1.20,"peak_input":0.30,"peak_cache_read":0.006,"peak_output":1.20},"context_window":1000000},{"id":"deepseek-v4-flash:free","name":"DeepSeek V4 Flash (Token Harbor)","protocol":"openai-chat","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"deepseek-v4-flash:free","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","priority":100,"billingMultiplier":0,"cost":{"input":0.30,"cache_read":0.006,"output":1.20,"peak_input":0.30,"peak_cache_read":0.006,"peak_output":1.20},"context_window":1000000}]
+EXTRA_MODEL_ROUTES_JSON_6=[{"id":"deepseek-v4.1-flash:free","name":"DeepSeek V4.1 Flash","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"deepseek-v4.1-flash:free","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","context_window":1000000,"cost":{"input":0.30,"output":1.20,"cache_read":0.006}},{"id":"deepseek-v4-flash:free","name":"DeepSeek V4 Flash","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"deepseek-v4-flash:free","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","context_window":1000000,"cost":{"input":0.30,"output":1.20,"cache_read":0.006}}]
 ~~~
 
-The cost values above use the official DeepSeek V4.1-Flash **peak-hour** API rates in USD per million tokens: $0.30 input, $0.006 cache-hit input, and $1.20 output. Peak hours are 01:00–04:00 and 06:00–10:00 UTC, Monday–Friday. The legacy deepseek-v4-flash API name is served by DeepSeek as V4.1-Flash at the Flash pricing.
+The cost values above are the official DeepSeek V4.1-Flash peak-hour API rates in USD per million tokens: $0.30 input, $0.006 cache-hit input, and $1.20 output. Entry uses these values directly as its user billing rates, so the gateway charges users at the peak rates. The legacy deepseek-v4-flash API name is served by DeepSeek as V4.1-Flash at the Flash pricing.
 
 The :free Token Harbor relay routes use billingMultiplier: 0, so the gateway does not charge its own users for those relay requests while still exposing the official upstream pricing metadata.
 
