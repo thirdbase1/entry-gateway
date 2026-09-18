@@ -138,6 +138,23 @@ Supported protocol values: `openai-chat`, `anthropic-messages`, `gemini-generate
 
 Optional route properties: `upstreamPath`, `authStyle` (`x-api-key` for providers that need it), `headers`, `timeoutMs`, `enabled`.
 
+
+## Token Harbor / DeepSeek V4.1 Flash
+
+Token Harbor models are configured through the same additive route-environment pattern used by the other provider integrations. The gateway does **not** hardcode Token Harbor routes or credentials.
+
+Set these server-side in Vercel:
+
+~~~text
+TOKEN_HARBOR_BASE_URL=https://tokenharbor.ai/v1
+TOKEN_HARBOR_API_KEY=<server-side-secret>
+EXTRA_MODEL_ROUTES_JSON_6=[{"id":"deepseek-v4.1-flash:free","name":"DeepSeek V4.1 Flash (Token Harbor)","protocol":"openai-chat","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"deepseek-v4.1-flash:free","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","priority":100,"billingMultiplier":0,"cost":{"input":0.15,"cache_read":0.003,"output":0.6,"peak_input":0.30,"peak_cache_read":0.006,"peak_output":1.20},"context_window":1000000},{"id":"deepseek-v4-flash:free","name":"DeepSeek V4 Flash (Token Harbor)","protocol":"openai-chat","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"deepseek-v4-flash:free","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","priority":100,"billingMultiplier":0,"cost":{"input":0.15,"cache_read":0.003,"output":0.6,"peak_input":0.30,"peak_cache_read":0.006,"peak_output":1.20},"context_window":1000000}]
+~~~
+
+The cost values above are the official DeepSeek V4.1-Flash API rates in USD per million tokens: $0.15 input, $0.003 cache-hit input, and $0.60 output off-peak; $0.30, $0.006, and $1.20 respectively during peak hours. The legacy deepseek-v4-flash API name is served by DeepSeek as V4.1-Flash at the Flash pricing.
+
+The :free Token Harbor relay routes use billingMultiplier: 0, so the gateway does not charge its own users for those relay requests while still exposing the official upstream pricing metadata.
+
 ## Model discovery
 
 Set `MODEL_DISCOVERY_JSON` to discover models at startup and every six hours by default:
