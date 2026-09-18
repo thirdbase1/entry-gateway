@@ -148,7 +148,6 @@ const adminKeys = ttlCache(() => new Set((process.env.ADMIN_API_KEYS || "").spli
 // this API for any of them. Wiring in both _4 and a new _5 now (used for
 // the api.b.ai models added this same day: deepseek-v4-flash-vision-exp,
 // glm-5.3-flash, qwen3.8-flash).
-];
 
 const configured = ttlCache(() => [
   ...(Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : []),
@@ -157,7 +156,6 @@ const configured = ttlCache(() => [
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_3", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_3", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_4", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_4", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_5", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_5", []) : []),
-  ...TOKEN_HARBOR_ROUTES,
 ].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r })));
 const routes = ttlCache(() => {
   const m = new Map();
