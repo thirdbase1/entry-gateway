@@ -153,46 +153,31 @@ const adminKeys = ttlCache(() => new Set((process.env.ADMIN_API_KEYS || "").spli
 // Token Harbor upstream is a free relay. TOKEN_HARBOR_API_KEY must be provided
 // server-side; never put the key in MODEL_ROUTES_JSON or source control.
 const TOKEN_HARBOR_BASE_URL = process.env.TOKEN_HARBOR_BASE_URL || "https://tokenharbor.ai/v1";
+// Token Harbor relay aliases. Pricing metadata below is the CURRENT OFFICIAL
+// DeepSeek V4.1-Flash pricing, not Token Harbor's relay price.
+// Official model name is deepseek-flash; legacy deepseek-v4-flash is routed
+// by DeepSeek to V4.1-Flash and billed at the Flash price.
+const TOKEN_HARBOR_BASE_URL = process.env.TOKEN_HARBOR_BASE_URL || "https://tokenharbor.ai/v1";
+const DEEPSEEK_V41_FLASH_PRICING = {
+  input: 0.15,
+  cache_read: 0.003,
+  output: 0.60,
+  peak_input: 0.30,
+  peak_cache_read: 0.006,
+  peak_output: 1.20,
+};
 const TOKEN_HARBOR_ROUTES = [
   {
-    id: "deepseek-v4.1-flash:free",
-    name: "DeepSeek V4.1 Flash (Token Harbor Free)",
-    protocol: "openai-chat",
-    provider: "tokenharbor",
-    upstreamBaseURL: TOKEN_HARBOR_BASE_URL,
-    upstreamModel: "deepseek-v4.1-flash:free",
-    upstreamApiKeyEnv: "TOKEN_HARBOR_API_KEY",
-    priority: 100,
-    billingMultiplier: 0,
-    cost: {
-      input: 0.15,
-      cache_read: 0.003,
-      output: 0.60,
-      peak_input: 0.30,
-      peak_cache_read: 0.006,
-      peak_output: 1.20,
-    },
-    context_window: 1000000,
+    id: "deepseek-v4.1-flash:free", name: "DeepSeek V4.1 Flash (Token Harbor Free)",
+    protocol: "openai-chat", provider: "tokenharbor", upstreamBaseURL: TOKEN_HARBOR_BASE_URL,
+    upstreamModel: "deepseek-flash", upstreamApiKeyEnv: "TOKEN_HARBOR_API_KEY",
+    priority: 100, billingMultiplier: 0, cost: DEEPSEEK_V41_FLASH_PRICING, context_window: 1000000,
   },
   {
-    id: "deepseek-v4-flash:free",
-    name: "DeepSeek V4 Flash (Token Harbor Free)",
-    protocol: "openai-chat",
-    provider: "tokenharbor",
-    upstreamBaseURL: TOKEN_HARBOR_BASE_URL,
-    upstreamModel: "deepseek-v4-flash:free",
-    upstreamApiKeyEnv: "TOKEN_HARBOR_API_KEY",
-    priority: 100,
-    billingMultiplier: 0,
-    cost: {
-      input: 0.15,
-      cache_read: 0.003,
-      output: 0.60,
-      peak_input: 0.30,
-      peak_cache_read: 0.006,
-      peak_output: 1.20,
-    },
-    context_window: 1000000,
+    id: "deepseek-v4-flash:free", name: "DeepSeek V4 Flash (legacy → V4.1 Flash)",
+    protocol: "openai-chat", provider: "tokenharbor", upstreamBaseURL: TOKEN_HARBOR_BASE_URL,
+    upstreamModel: "deepseek-v4-flash", upstreamApiKeyEnv: "TOKEN_HARBOR_API_KEY",
+    priority: 100, billingMultiplier: 0, cost: DEEPSEEK_V41_FLASH_PRICING, context_window: 1000000,
   },
 ];
 
