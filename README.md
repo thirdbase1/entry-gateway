@@ -139,7 +139,7 @@ Supported protocol values: `openai-chat`, `anthropic-messages`, `gemini-generate
 Optional route properties: `upstreamPath`, `authStyle` (`x-api-key` for providers that need it), `headers`, `timeoutMs`, `enabled`.
 
 
-## Token Harbor / DeepSeek V4.1 Flash
+## Token Harbor / GLM 5.3 Flash + DeepSeek V4.1 Flash
 
 Token Harbor models are configured through the same additive route-environment pattern used by the other provider integrations. The gateway does **not** hardcode Token Harbor routes or credentials.
 
@@ -148,12 +148,14 @@ Set these server-side in Vercel:
 ~~~text
 TOKEN_HARBOR_BASE_URL=https://tokenharbor.ai/v1
 TOKEN_HARBOR_API_KEY=<server-side-secret>
-EXTRA_MODEL_ROUTES_JSON_6=[{"id":"deepseek-v4.1-flash:free","name":"DeepSeek V4.1 Flash","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"deepseek-v4.1-flash:free","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","context_window":1000000,"cost":{"input":0.30,"output":1.20,"cache_read":0.006}},{"id":"deepseek-v4-flash:free","name":"DeepSeek V4 Flash","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"deepseek-v4-flash:free","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","context_window":1000000,"cost":{"input":0.30,"output":1.20,"cache_read":0.006}}]
+EXTRA_MODEL_ROUTES_JSON_6=[{"id":"glm-5.3-flash","name":"GLM 5.3 Flash","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"glm-5.3-flash","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","context_window":1000000,"cost":{"input":0.15,"output":0.50}},{"id":"deepseek-v4.1-flash","name":"DeepSeek V4.1 Flash","provider":"tokenharbor","upstreamBaseURL":"https://tokenharbor.ai/v1","upstreamModel":"deepseek-v4.1-flash","upstreamApiKeyEnv":"TOKEN_HARBOR_API_KEY","context_window":1000000,"cost":{"input":0.30,"output":1.20,"cache_read":0.006}}]
 ~~~
 
-The cost values above are the official DeepSeek V4.1-Flash peak-hour API rates in USD per million tokens: $0.30 input, $0.006 cache-hit input, and $1.20 output. Entry uses these values directly as its user billing rates, so the gateway charges users at the peak rates. The legacy deepseek-v4-flash API name is served by DeepSeek as V4.1-Flash at the Flash pricing.
+GLM 5.3 Flash is available on Token Harbor as `glm-5.3-flash`. Its published price is $0.15 per million input tokens and $0.50 per million output tokens. citeturn0search0
 
-The :free Token Harbor relay routes use billingMultiplier: 0, so the gateway does not charge its own users for those relay requests while still exposing the official upstream pricing metadata.
+DeepSeek V4.1 Flash is configured here under the non-`:free` model ID `deepseek-v4.1-flash`, with the gateway pricing metadata set to $0.30 input, $0.006 cache-read, and $1.20 output per million tokens.
+
+These are paid Token Harbor routes; there is no `billingMultiplier: 0` or `:free` route in this configuration. Token Harbor's current catalog separately lists the `:free` DeepSeek variants, so the upstream must support the non-`:free` ID before that route can actually serve requests. citeturn1search0turn0search8
 
 ## Model discovery
 
