@@ -157,6 +157,21 @@ DeepSeek V4.1 Flash is configured here under the non-`:free` model ID `deepseek-
 
 These are paid Token Harbor routes; there is no `billingMultiplier: 0` or `:free` route in this configuration. Token Harbor's current catalog separately lists the `:free` DeepSeek variants, so the upstream must support the non-`:free` ID before that route can actually serve requests. citeturn1search0turn0search8
 
+## StepFun / Step 5 Preview
+
+StepFun's current platform lists Step 5 Preview. Current API pricing reported for the StepFun API is $1.00 per 1M input tokens and $2.70 per 1M output tokens, with a 95% cache discount (about $0.05 per 1M cached input tokens). The model is in the 1M-token context class and exposes an OpenAI-compatible interface. [1]
+
+Set these server-side in Vercel:
+
+~~~text
+STEPFUN_BASE_URL=https://api.stepfun.ai/v1
+STEPFUN_API_KEY=<server-side-secret>
+EXTRA_MODEL_ROUTES_JSON_7=[{"id":"step-5-preview","name":"Step 5 Preview","provider":"stepfun","upstreamBaseURL":"https://api.stepfun.ai/v1","upstreamModel":"step-5-preview","upstreamApiKeyEnv":"STEPFUN_API_KEY","context_window":1000000,"cost":{"input":1.00,"output":2.70,"cache_read":0.05}}]
+~~~
+
+The gateway keeps the route environment-driven; credentials and the active route JSON are not committed to source control.
+
+[1] StepFun's platform currently lists Step 5 Preview; the $1.00/$2.70 pricing and cache discount are reported from the StepFun API by current independent model tracking. [2]
 ## Model discovery
 
 Set `MODEL_DISCOVERY_JSON` to discover models at startup and every six hours by default:
