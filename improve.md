@@ -480,6 +480,15 @@ Removed `KV_REST_API_URL`/`KV_REST_API_TOKEN` from the Vercel project and
 `@upstash/redis` from package.json -- zero Upstash usage left anywhere in
 this repo.
 
+## 2026-09-20: Prepared StepFun Step 5 Preview route slot
+
+Added `EXTRA_MODEL_ROUTES_JSON_7` to the live route assembly so StepFun can be configured without hardcoding provider credentials or model routes in source control.
+
+The intended route is `step-5-preview` through `https://api.stepfun.ai/v1`, with current StepFun API pricing recorded as $1.00/M input, $2.70/M output, and approximately $0.05/M cached input based on the current 95% cache discount. The model is in the 1M-token context class and supports OpenAI-compatible access. [1]
+
+The actual API key and route JSON remain Vercel environment configuration; they are not committed to GitHub.
+
+[1] StepFun platform listing and current API pricing/model tracking references.
 ## 2026-08-28: Wired 3 new models via api.b.ai, fixed dead EXTRA_MODEL_ROUTES_JSON_4
 
 Owner asked to add three models -- deepseek-v4-flash-vision-exp, glm-5.3-flash, qwen3.8-flash --
