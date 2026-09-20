@@ -151,6 +151,8 @@ const adminKeys = ttlCache(() => new Set((process.env.ADMIN_API_KEYS || "").spli
 // EXTRA_MODEL_ROUTES_JSON_6: dedicated additive slot for Token Harbor routes so
 // they follow the same env-driven configuration pattern as the B.AI routes.
 // Keep TOKEN_HARBOR_API_KEY server-side; never place the secret in route JSON.
+// EXTRA_MODEL_ROUTES_JSON_7: dedicated additive slot for StepFun routes.
+// Keep provider API keys server-side; never place secrets in route JSON.
 
 const configured = ttlCache(() => [
   ...(Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : []),
@@ -160,6 +162,7 @@ const configured = ttlCache(() => [
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_4", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_4", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_5", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_5", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_6", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_6", []) : []),
+  ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_7", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_7", []) : []),
 ].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r })));
 const routes = ttlCache(() => {
   const m = new Map();
