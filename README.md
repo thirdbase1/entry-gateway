@@ -5,6 +5,8 @@ Self-hosted, config-driven native-protocol AI gateway. Clients use one gateway A
 ## Routes
 
 - `GET /health` — gateway status, uptime, providers, circuit breakers, active requests
+- `GET /health/live` — liveness probe: pure in-process check, never touches the database or network
+- `GET /health/ready` — readiness probe: 503 until this instance has a usable route table, plus build identity (version, git sha, boot time)
 - `GET /metrics` — per-provider and aggregate metrics (public through the read-only dashboard session by default)
 - `GET /` — public landing page (static, no auth)
 - `GET /admin` — built-in public, read-only admin dashboard UI
@@ -135,6 +137,24 @@ Example route configuration:
 ```
 
 Supported protocol values: `openai-chat`, `anthropic-messages`, `gemini-generate`.
+Optional route properties: `upstreamPath`, `authStyle` (`x-api-key` for providers that need it), `headers`, `timeoutMs`, `enabled`, and `maxBodyBytes` (per-route request-body ceiling in bytes; the tighter of this and the global body limit wins).
+
+### Configuration validation
+
+At startup the gateway validates every route source and the discovery config in one pass and logs a single `config_validation` line listing every problem it found. It does **not** throw: a malformed route must never stop the gateway from booting and serving the routes that are valid. It catches string-typed `priority` / `timeoutMs` / `billingMultiplier` / `maxBodyBytes`, `NaN` / `Infinity` values, non-object `cost` entries, malformed `context_over_Nk` tier objects, unknown `protocol` / `authStyle` values, non-http(s) upstream URLs, and provider-key env vars that are not set. Missing keys are reported by **variable name only** -- never by value.
+
+### Operational probes
+
+| Probe | Use | Reads the database? |
+|---|---|---|
+| `GET /health/live` | orchestrator liveness | no -- pure in-process check |
+| `GET /health/ready` | orchestrator readiness; 503 until a route table exists | no |
+| `GET /health` | full status: providers, circuit breakers, active requests, build identity | yes |
+
+Liveness deliberately never touches Postgres. A slow or unavailable metrics database must not be able to restart a gateway that is otherwise serving traffic, so point container and orchestrator liveness probes at `/health/live`, not `/health`.
+
+Both `/health/ready` and `/health` report build identity from `GATEWAY_VERSION`, `GIT_SHA` (or Vercel's `VERCEL_GIT_COMMIT_SHA`) and the process boot time, so you can tell which deploy is actually serving.
+
 
 Optional route properties: `upstreamPath`, `authStyle` (`x-api-key` for providers that need it), `headers`, `timeoutMs`, `enabled`.
 
@@ -191,6 +211,16 @@ Set `MODEL_DISCOVERY_JSON` to discover models at startup and every six hours by 
 ```
 
 Use `DISCOVERY_REFRESH_MS` to change the interval. Discovery normalizes only the catalog; inference request and response bodies remain native.
+
+## Request IDs and forwarded response headers
+
+Every response -- including 401, 404, 400, 413 and 429 -- carries an `x-gateway-request-id` header. Quote it when asking a provider to look up a failed call.
+
+Upstream response headers are passed through an **allowlist**, not a denylist. Forwarded: `content-type`, `retry-after`, OpenAI and Anthropic rate-limit headers, `openai-version`, `openai-organization`, `openai-processing-ms`. Dropped: `authorization`, `x-api-key`, `proxy-authorization`, `set-cookie`, `www-authenticate`, and `x-gateway-request-id` (which an upstream must never be able to forge).
+
+The upstream's own `x-request-id` is preserved under `x-upstream-request-id`, so provider-side support tickets still work without ever colliding with the gateway's correlation id.
+
+Per-request log lines include a `cache` summary (`inputTokens`, `cachedTokens`, `cacheWriteTokens`, `cacheRatio`, `cacheStatus`). `cacheRatio` is cache-read over total prompt tokens and is always within 0..1.
 
 ## Logging and cost tracking
 

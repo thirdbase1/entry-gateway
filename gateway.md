@@ -599,3 +599,144 @@ LESSON: when a UI computes a derived stat that the backend already computes and 
 The gateway metrics store normalizes `tokens.input` to uncached-only prompt input. It correctly kept `cacheRead` and `cacheWrite` separately for pricing and cache-rate calculation, but `serializeFromDb()` and `serializeFromMem()` defined `tokens.total` as `input + output`. The admin headline therefore showed only uncached input plus output, while the cache panel showed the omitted cached tokens separately. Fix: `tokens.total = input + cacheRead + cacheWrite + output`; the headline now represents all prompt and completion tokens, and its subtitle explicitly shows cache-read tokens included.
 
 Important boundary: Entry's `usage_events.input_tokens` already contains the full input total, with `cached_input_tokens` as a detail. The two dashboards use different raw semantics and must not share a formula blindly.
+
+## 2026-09-21: Response-header, correlation-id, cache-ratio and config-validation hardening
+
+Pass motivated by a direct audit against a live gateway instance (mock upstreams on ephemeral ports, real `server.js`, no provider spend). Four real defects were reproduced before being fixed; none of them were theoretical.
+
+### Defect 1 -- upstream response headers leaked credentials, and the request id was forgeable
+
+`proxy()` copied upstream response headers through a 4-item denylist:
+
+```js
+for (const [k, v] of response.headers)
+  if (!["content-encoding", "content-length", "connection", "transfer-encoding"].includes(k.toLowerCase()))
+    res.setHeader(k, v);
+```
+
+Probed against a mock upstream returning hostile headers; measured on the client:
+
+| Upstream sent | Client received (before) | Client receives (after) |
+|---|---|---|
+| `Authorization: Bearer sk-...` | forwarded verbatim | dropped |
+| `x-api-key: ...` | forwarded verbatim | dropped |
+| `Proxy-Authorization: Basic ...` | forwarded verbatim | dropped |
+| `set-cookie: session=evil; Path=/` | forwarded verbatim | dropped |
+| `www-authenticate: Basic realm=...` | forwarded verbatim | dropped |
+| `x-gateway-request-id: FORGED` | forwarded verbatim | dropped |
+| `x-request-id: req_upstream_abc` | forwarded verbatim | `x-upstream-request-id` |
+| `retry-after`, `x-ratelimit-*`, `anthropic-ratelimit-*`, `openai-version` | forwarded | forwarded (kept) |
+
+Two separate problems in one line. The credential headers mean a compromised or hostile provider can both exfiltrate its own key material to every caller and plant cookies on gateway clients. The `x-gateway-request-id` case is worse in a quieter way: it is the gateway's own correlation header, so an upstream that echoes one back takes over log correlation and any support workflow built on it.
+
+Fix: replaced the denylist with an allowlist (`FORWARDABLE_RESPONSE_HEADERS`) plus an explicit never-forward set (`BLOCKED_RESPONSE_HEADERS`), exported as the pure `forwardableResponseHeader(name)` so the policy is unit-testable without a network mock. A denylist over attacker-influenced input is a guaranteed eventual miss -- a provider only has to start emitting one new secret-bearing header and it ships verbatim. The upstream's own request id is read and re-emitted as `x-upstream-request-id` so provider-side support tickets still work without ever colliding with ours.
+
+### Defect 2 -- `cacheRatio` could exceed 100%
+
+`cacheSummary()` computed `cache_read / usage.input`, which is only correct while `input` still *includes* `cache_read` as a subset. Its caller passes the already-normalized usage from `cacheBreakdownOf()`, whose `input` is uncached-only with `cache_read`/`cache_write` as separate mutually-exclusive buckets. Measured on a plain OpenAI-shaped route (`prompt_tokens: 1000, cached_tokens: 900`):
+
+```
+before: "cache":{"inputTokens":100,"cachedTokens":900,"cacheRatio":9,"cacheStatus":"hit"}
+after:  "cache":{"inputTokens":100,"cachedTokens":900,"cacheRatio":0.9,"cacheStatus":"hit"}
+```
+
+900% is meaningless as "share of prompt served from cache" and silently breaks any dashboard rendering it as a percentage bar. The denominator is now the same total-prompt figure `metrics-store.js`'s `cacheHitRateOf` already uses, so the two can never drift apart again.
+
+### Defect 3 -- rejected requests carried no gateway request id
+
+`rule.md` rule 10 requires that every request receive a gateway request ID. Only `handle()`'s success and final-502 paths set the header. Measured across the error surface:
+
+| Case | Status | `x-gateway-request-id` (before) | (after) |
+|---|---|---|---|
+| invalid Bearer key | 401 | absent | present |
+| missing key | 401 | absent | present |
+| unknown model | 404 | absent | present |
+| missing model | 400 | absent | present |
+| non-object body | 400 | absent | present |
+| malformed JSON | 400 | absent | present |
+| body over 25mb | 413 | absent | present |
+| rate limited | 429 | absent | present |
+
+Fix: mint the id in middleware registered *before* `express.json()`. That ordering is the load-bearing detail -- a 400 from JSON parsing and a 413 from the size limit are raised by the parser itself, before any later middleware or route handler runs, so a request-id middleware placed after the body parser still leaves those two paths unidentified. `handle()` now reads `res.locals.requestId` so the header the client already holds and every subsequent log line agree.
+
+### Defect 4 -- Docker images built since PR #6 were broken
+
+`server.js` imports `upstream-abort.js` (the client-disconnect abort landed in PR #6), but `Dockerfile`'s `COPY` line only ever listed `server.js metrics-store.js gemini-cache.js`. Any `docker build` of this repo fails at startup with `ERR_MODULE_NOT_FOUND`. The Vercel deployment path never noticed because it bundles the whole workspace, so this only ever bit self-hosted/Docker operators -- exactly the deployment mode the README documents first. Fixed by adding both `upstream-abort.js` and the new `config-validation.js` to the `COPY` line.
+
+LESSON: a `COPY`-style file manifest in a container build is a second, independent list of the module graph that nothing keeps in sync with the imports. When adding a new top-level module to a Node service, grep the Dockerfile (and any equivalent deploy manifest) for the existing filenames, not just for the new one.
+
+### New: startup configuration validation
+
+`improve.md` has carried "configuration schema validation at startup with clear errors before listening" since the first backlog draft. Previously a malformed route surfaced only as a user-visible 502 on the first request that hit it. `config-validation.js` now validates every route source and the discovery config in one pass at startup and logs a single consolidated `config_validation` line. Measured end to end:
+
+```json
+{"type":"config_validation","problemCount":5,"problems":[
+  "route[0] (good): env var MISSING_KEY is not set -- this route will fail every request",
+  "route[1] (bad): \"upstreamBaseURL\" must be http(s), got ftp:",
+  "route[1] (bad): unknown protocol \"nope\" (expected one of openai-chat, anthropic-messages, gemini-generate)",
+  "route[1] (bad): env var MISSING_KEY is not set -- this route will fail every request",
+  "route[1] (bad): \"priority\" must be a finite number, got \"10\""]}
+```
+
+It deliberately does **not** throw. A malformed route must never stop the gateway from booting and serving the routes that are valid -- that is precisely the behavior an operator wants mid-fix. Zero new dependencies, matching the repo's existing constraint. It reports every problem in one pass rather than failing on the first, so an operator correcting five typos does not need five deploys.
+
+Notable catches the validator makes that the runtime silently tolerated: string-typed `priority`/`timeoutMs`/`billingMultiplier` (a string priority sorts correctly by accident in some engines and not others, and `"abc"` sorts as `NaN`), `NaN`/`Infinity` numeric values, non-object `cost` entries, malformed `context_over_Nk` tier objects, unknown `protocol`/`authStyle` values, and an unset provider-key env var named by variable name only (never by value).
+
+### Tests
+
+`npm test` grew from 57 to 78 tests, all passing under Node 24:
+
+- `response-headers.test.js` (new, 7 tests) -- credential headers never forwarded; request id unforgeable; upstream request id preserved under a distinct name; actionable rate-limit/retry hints still pass through; unknown provider headers dropped; `cacheRatio` never exceeds 1.0; every rejected request carries a request id.
+- `rate-limit-identity.test.js` (new, 3 tests) -- one key exhausting its budget does not consume another's; the limiter is still enforced at all; bucket keys are sha256 digests, not raw keys.
+- `config-validation.test.js` (new, 11 tests) -- valid route clean; missing key env var reported by name; non-http(s) upstream rejected; wrong-typed numerics flagged; `NaN`/`Infinity` rejected; unknown protocol/authStyle reported; `cost` and tier objects type-checked; all problems reported in one pass; non-array source reported; discovery config validated.
+
+Full suite: `78 tests / 78 pass / 0 fail`, `duration_ms ~20.4s`.
+
+## 2026-09-21 (same day, follow-up): liveness/readiness split, build identity, per-route body ceiling
+
+Closed the next three items from the backlog re-prioritization, all verified with new tests.
+
+### `/health/live` and `/health/ready`
+
+`/health` was the only probe and it did live Postgres reads (two gauges plus every circuit breaker) before answering. That is the exact coupling that turns a metrics-DB outage into a restart loop: an orchestrator's liveness probe fails, the container gets killed, comes back, fails again. `/health/live` is now a pure in-process check that cannot touch the network, and `/health/ready` reports whether this instance has a usable route table (503 with `status: "no-routes"` when it does not) so an orchestrator can hold traffic during a cold start instead of burning user requests on 404s.
+
+Readiness deliberately does **not** probe providers or the metrics DB. Both are allowed to be degraded without the instance being unable to do its job, and the circuit breakers already handle that per request. `/health` keeps its original shape for existing dashboards and uptime checks.
+
+Measured:
+
+```
+GET /health/live  -> 200 {"ok":true,"status":"alive","uptime":0}
+GET /health/ready -> 200 {"ok":true,"status":"ready","routes":2,"routedModels":2,
+                          "version":"1.2.3","gitSha":"abc1234","bootedAt":"2026-09-21T22:38:57.013Z"}
+GET /health/ready (no routes) -> 503 {"ok":false,"status":"no-routes","routes":0,...}
+```
+
+Liveness deliberately omits route and backend detail: it is polled constantly and its response is normally unauthenticated.
+
+### Build identity in `/health` and `/health/ready`
+
+Both now report `version`, `gitSha` and `bootedAt`, sourced from `GATEWAY_VERSION` and `GIT_SHA` / Vercel's `VERCEL_GIT_COMMIT_SHA`. Absent values are omitted rather than filled with a placeholder, so a field being present means it is real.
+
+### Per-route `maxBodyBytes`
+
+`express.json` applied one global 25mb ceiling, so a route for a small model had to accept a 25mb prompt -- a cost and timeout risk its own configuration could not express. Routes can now set `maxBodyBytes`, enforced after auth by `bodySizeGuard` against the actually-received body (the tighter of the route ceiling and the global limit wins). Measured:
+
+```
+route maxBodyBytes: 200, body ~5KB -> 413 {"error":{"type":"InvalidRequestError",
+  "message":"Request body exceeds the 200-byte limit configured for this route."}}
+route without maxBodyBytes, body ~5KB -> reaches the proxy (502 on the dead upstream)
+```
+
+Runs after auth on purpose: an unauthenticated caller should not be able to make the gateway parse and measure a body it is going to reject anyway, and the route is only knowable once the model has been resolved.
+
+### Docker HEALTHCHECK
+
+Added to the Dockerfile, hitting `/health/live` rather than `/health` for the reason above. Alpine's node image ships no `curl` or `wget`, so it uses `node -e` with `fetch` rather than adding a package to a production image's attack surface.
+
+### Tests
+
+`npm test` grew from 78 to 82 tests, all passing:
+
+- `ops-probes.test.js` (new, 4 tests) -- liveness answers without exposing operational detail; readiness is 200 with routes and 503 without; build identity surfaces when configured; `maxBodyBytes` is enforced while the global ceiling still applies to routes that do not set it.
+
+Full suite: `82 tests / 82 pass / 0 fail`, `duration_ms ~20.4s`.

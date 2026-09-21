@@ -617,3 +617,51 @@ with an end-to-end case (client disconnects mid-SSE -> upstream connection torn 
 verified server-side). 57/57 tests. Also: after PR #10's per-model breaker identity
 (`model:<id>:<id>`), both dashboards' provider Health lookups needed to map breakers back
 to provider rows via the live routes list (gateway 91ddae2, entry-agents c2744e7).
+
+## 2026-09-21: audit pass -- four reproduced defects fixed, three resolved backlog items
+
+Ran a defect-hunting pass against a live gateway instance (mock upstreams, real `server.js`, no provider spend). Findings and dispositions:
+
+**Fixed -- upstream response headers leaked credentials; request id was forgeable.**
+`proxy()`'s 4-item denylist let `Authorization`, `x-api-key`, `Proxy-Authorization`, `set-cookie` and `www-authenticate` reach the client verbatim, and let an upstream set `x-gateway-request-id`. Replaced with an allowlist + never-forward set. Resolves the standing "never echo upstream Authorization / x-api-key / secret-bearing headers" item from the Security section. Full before/after table in gateway.md.
+
+**Fixed -- `cacheRatio` exceeded 1.0.** `cacheSummary()` divided by uncached-only input; measured 9.0 (900%) on a 90%-cached request. Now uses the same total-prompt denominator as `cacheHitRateOf`, so the two cannot drift.
+
+**Fixed -- no request id on rejected requests.** rule.md rule 10 says every request gets one; 401/404/400/400/413/429 all arrived without. Id is now minted in middleware placed *before* `express.json()` -- that ordering matters, because the 400 (bad JSON) and 413 (too large) paths are raised by the parser itself, before any later middleware runs.
+
+**Fixed -- Docker builds broken since PR #6.** `upstream-abort.js` was imported by `server.js` but absent from the Dockerfile's `COPY` list, so every image build failed with `ERR_MODULE_NOT_FOUND`. Only the Vercel path worked, because it bundles the whole workspace. Both files are now listed.
+
+**Fixed -- "configuration schema validation at startup" (backlog item since the first draft).**
+`config-validation.js` validates all route sources + discovery config in one pass at startup and logs a single `config_validation` line. Does not throw: a bad route must not stop the gateway serving valid ones. Zero new dependencies. Catches string-typed `priority`/`timeoutMs`/`billingMultiplier`, `NaN`/`Infinity`, malformed `cost`/tier objects, unknown protocol/authStyle, and unset provider-key env vars (reported by variable name only).
+
+### Now genuinely resolved from the backlog
+
+- Persist structured request logs -- superseded by the Postgres metrics store (2026-08-27) plus per-request JSON lines.
+- `/metrics` endpoint -- shipped, and now admin-gated with the read-only dashboard session.
+- Request cancellation propagation -- shipped as `upstream-abort.js` (PR #6, reworked 2026-09-11).
+- Circuit breakers -- shipped with per-model identity, half-open probes, cooldowns.
+- Configuration schema validation at startup -- shipped 2026-09-21 (this pass).
+- Graceful shutdown -- shipped (bounded drain, then force-close).
+- Readiness/liveness separation -- **still open**, see below.
+- Docker healthcheck + non-root user -- non-root shipped (`USER node`); healthcheck **still open**.
+- Structured log correlation with `x-gateway-request-id` -- shipped 2026-09-21 for the error paths too.
+- Deployment version / git commit in `/health` -- **still open**.
+- Automated post-deploy smoke tests per configured route -- **still open**, and now higher value since the validator reports config problems but cannot tell you a route's *provider* is down.
+
+### Remaining backlog, re-prioritized
+
+1. **`/health/live` and `/health/ready` separation.** `/health` currently does live work (Postgres gauge + circuit-breaker reads) before answering, so an orchestrator's liveness probe can fail because the metrics DB is slow, and Kubernetes/Docker will restart a perfectly healthy process. Liveness must be a pure in-process check that never touches the network.
+2. **Docker `HEALTHCHECK`.** Now that `upstream-abort.js` is actually in the image, add a healthcheck hitting `/health/live` so `docker stop`'s drain window is not wasted on an already-dead container.
+3. **`/health` build identity.** Add `version` + git commit + boot time so an operator can tell which deploy is actually serving, instead of matching timestamps by hand.
+4. **Post-deploy route smoke test.** One cheap request per configured route after deploy, recorded in gateway.md. The validator catches config errors; it cannot catch a provider outage.
+5. **Per-route `maxBodyBytes`.** `express.json` has a single global 25mb limit. A route for a small model accepting a 25mb prompt is a cost and timeout risk that config cannot currently express.
+6. **Cost provenance flag.** `improve.md` has asked to "record whether cost is exact, provider-reported, or estimated" for a while. With cache-aware billing and provider-specific multipliers now in play, that flag is what makes a disputed bill debuggable.
+
+### 2026-09-21 follow-up: three more backlog items closed
+
+- **Readiness/liveness separation -- SHIPPED.** `/health/live` (pure in-process, never touches Postgres) and `/health/ready` (503 until a route table exists). The old single `/health` did live DB reads before answering, which is precisely how a metrics outage becomes a restart loop. `/health` keeps its original shape.
+- **Docker healthcheck -- SHIPPED.** Hits `/health/live`; uses `node -e` + `fetch` because Alpine's node image ships neither curl nor wget.
+- **Deployment version / git commit in `/health` -- SHIPPED** as `version` / `gitSha` / `bootedAt`, from `GATEWAY_VERSION` and `GIT_SHA` / `VERCEL_GIT_COMMIT_SHA`.
+- **Per-route request body size -- SHIPPED** as `maxBodyBytes`, enforced after auth by `bodySizeGuard` (tighter of route ceiling and global limit wins).
+- **Automated post-deploy route smoke test -- STILL OPEN.** The validator now catches config errors at startup, which makes this more valuable rather than less: config errors are covered, provider outages are not.
+- **Cost provenance flag (exact / provider-reported / estimated) -- STILL OPEN.** With cache-aware billing and per-route multipliers in play this is what makes a disputed bill debuggable.

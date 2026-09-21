@@ -17,6 +17,7 @@ import {
 } from "./metrics-store.js";
 import { getOrCreateCachedContent } from "./gemini-cache.js";
 import { createUpstreamAbort } from "./upstream-abort.js";
+import { validateStartupConfig } from "./config-validation.js";
 
 const app = express();
 // Vercel (and most PaaS) terminate TLS upstream and forward to this
@@ -27,6 +28,20 @@ const app = express();
 // mixed-content-blocks any fetch() to a plain http:// URL (shows up as
 // yet another opaque "Failed to fetch").
 app.set("trust proxy", true);
+
+// Every response carries a gateway request id (rule.md rule 10). This runs
+// FIRST, before express.json(), so even a 400 from body parsing or a 413 from
+// the size limit -- both of which are raised by the parser itself, before any
+// later middleware or route handler ever runs -- still carries a correlation
+// id the operator can grep for. Previously only handle()'s success/502 paths
+// set the header, so every rejected request arrived with no id at all.
+app.use((req, res, next) => {
+  const id = `gw_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  res.locals.requestId = id;
+  res.setHeader("x-gateway-request-id", id);
+  next();
+});
+
 app.use(express.json({ limit: "25mb" }));
 
 // CORS: the settings/gateway dashboard on entry-agents.vercel.app calls
@@ -86,6 +101,59 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
+
+// ─── Forwardable upstream response headers ──────────────────────────────────
+// An ALLOWLIST, not the previous 4-item denylist. A denylist over
+// attacker-influenced input is a guaranteed eventual miss: a provider only has
+// to start emitting one new secret-bearing header and it is forwarded
+// verbatim. Confirmed live against a mock upstream returning
+// `Authorization: Bearer <upstream key>`, `x-api-key`, `set-cookie`, and a
+// forged `x-gateway-request-id` -- all four reached the client before this.
+// What the client genuinely needs is body/content metadata and rate-limit
+// signals it can act on; everything else upstream-specific is dropped.
+const FORWARDABLE_RESPONSE_HEADERS = new Set([
+  "content-type",
+  // provider rate-limit / retry hints
+  "retry-after",
+  "x-ratelimit-limit-requests",
+  "x-ratelimit-limit-tokens",
+  "x-ratelimit-remaining-requests",
+  "x-ratelimit-remaining-tokens",
+  "x-ratelimit-reset-requests",
+  "x-ratelimit-reset-tokens",
+  "anthropic-ratelimit-requests-limit",
+  "anthropic-ratelimit-requests-remaining",
+  "anthropic-ratelimit-requests-reset",
+  "anthropic-ratelimit-tokens-limit",
+  "anthropic-ratelimit-tokens-remaining",
+  "anthropic-ratelimit-tokens-reset",
+  "anthropic-ratelimit-input-tokens-limit",
+  "anthropic-ratelimit-input-tokens-remaining",
+  "anthropic-ratelimit-input-tokens-reset",
+  "anthropic-ratelimit-output-tokens-limit",
+  "anthropic-ratelimit-output-tokens-remaining",
+  "anthropic-ratelimit-output-tokens-reset",
+  "openai-version",
+  "openai-organization",
+  "openai-processing-ms",
+]);
+// Never forwarded even if a future edit adds them above: the gateway's own
+// correlation header plus every credential and cookie carrier.
+const BLOCKED_RESPONSE_HEADERS = new Set([
+  "x-gateway-request-id",
+  "set-cookie",
+  "authorization",
+  "proxy-authorization",
+  "x-api-key",
+  "api-key",
+  "www-authenticate",
+]);
+export function forwardableResponseHeader(name) {
+  const lower = String(name).toLowerCase();
+  if (BLOCKED_RESPONSE_HEADERS.has(lower)) return false;
+  return FORWARDABLE_RESPONSE_HEADERS.has(lower);
+}
+
 const PORT = Number(process.env.PORT || 8787);
 let discovered = [];
 
@@ -211,8 +279,16 @@ const RATE_LIMIT_BURST = Math.max(1, Number(process.env.RATE_LIMIT_BURST ?? 100)
 const _buckets = new Map(); // key -> { tokens, ts }
 const BUCKET_SWEEP_INTERVAL_MS = 60_000;
 let _lastSweep = Date.now();
+// SECURITY 2026-09-21: the bucket Map was keyed on the RAW API key, which
+// meant every live gateway key sat in process memory for as long as its
+// bucket survived the sweep -- a heap dump, a core file, or any accidental
+// `console.log(buckets)` would expose them. Keys are already SHA-256 hashed
+// for the timingSafeEqual auth comparison, so reuse that digest as the bucket
+// key: it is stable per key, uniform-length, and reveals nothing.
+const bucketKeyFor = (key) => createHash("sha256").update(key).digest("hex");
 function rateLimitAllowed(key) {
   if (!(RATE_LIMIT_RPS > 0)) return { allowed: true, remaining: Infinity };
+  const bucketKey = bucketKeyFor(key);
   const now = Date.now();
   // Opportunistically evict idle buckets so the Map can't grow unbounded with
   // one entry per distinct key ever seen.
@@ -220,8 +296,8 @@ function rateLimitAllowed(key) {
     _lastSweep = now;
     for (const [k, b] of _buckets) if (b.tokens >= RATE_LIMIT_BURST) _buckets.delete(k);
   }
-  let b = _buckets.get(key);
-  if (!b) { b = { tokens: RATE_LIMIT_BURST, ts: now }; _buckets.set(key, b); }
+  let b = _buckets.get(bucketKey);
+  if (!b) { b = { tokens: RATE_LIMIT_BURST, ts: now }; _buckets.set(bucketKey, b); }
   b.tokens = Math.min(RATE_LIMIT_BURST, b.tokens + ((now - b.ts) / 1000) * RATE_LIMIT_RPS);
   b.ts = now;
   if (b.tokens >= 1) { b.tokens -= 1; return { allowed: true, remaining: Math.floor(b.tokens) }; }
@@ -241,6 +317,40 @@ const auth = (req, res, next) => {
     return res.status(429).json({ error: { type: "RateLimitError", message: "Too many requests for this API key. Please slow down." } });
   }
   if (Number.isFinite(rl.remaining)) res.setHeader("X-RateLimit-Remaining", String(rl.remaining));
+  next();
+};
+
+// PER-ROUTE BODY SIZE. express.json applies one global 25mb ceiling, which
+// means a route for a small model accepts a 25mb prompt -- a cost and timeout
+// risk the route's own configuration cannot express. This enforces the
+// selected route's `maxBodyBytes` (falling back to the global ceiling) against
+// the actual received body length, so the tighter of the two always wins.
+// Runs after auth: an unauthenticated caller should not be able to make the
+// gateway parse and measure a body it will reject anyway, and the route is
+// only knowable once the model has been resolved.
+const bodySizeGuard = (req, res, next) => {
+  const p = protocol(req.path);
+  const model = modelFor(req, p);
+  if (!model) return next(); // no model -> handle()'s own 400/404 path
+  const route = candidates(model, p)[0];
+  const limit = Number(route?.maxBodyBytes);
+  if (!Number.isFinite(limit) || limit <= 0) return next();
+  // req.body is already parsed at this point (express.json ran first), so the
+  // serialized length is the real received size rather than a re-encoding.
+  let bytes;
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(req.body ?? {}));
+  } catch {
+    return next(); // unserializable body is handle()'s problem, not ours
+  }
+  if (bytes > limit) {
+    return res.status(413).json({
+      error: {
+        type: "InvalidRequestError",
+        message: `Request body exceeds the ${limit}-byte limit configured for this route.`,
+      },
+    });
+  }
   next();
 };
 const adminAuth = (req, res, next) => {
@@ -629,9 +739,22 @@ const log = x => process.env.REQUEST_LOG !== "false" && console.log(JSON.stringi
 // misleading cache: {ratio: 0} that looks like a real cache miss.
 function cacheSummary(usage) {
   if (!usage) return null;
-  const input = usage.input || 0;
+  // BUGFIX 2026-09-21: this divided cache_read by `usage.input` alone, which
+  // is only correct while `input` still INCLUDES cache_read as a subset. The
+  // caller passes the ALREADY-NORMALIZED usage from cacheBreakdownOf(), whose
+  // `input` is uncached-only and whose cache_read/cache_write are separate,
+  // mutually-exclusive buckets (true for every protocol after normalization).
+  // So a request with uncached input 100 and cache_read 900 produced
+  // cacheRatio: 9 -- i.e. 900% -- meaningless as "share of prompt served from
+  // cache" and it breaks any dashboard rendering it as a percentage bar.
+  // Measured live against a plain OpenAI-shaped route. Denominator is now the
+  // same total-prompt figure metrics-store's cacheHitRateOf uses, so the two
+  // can never disagree.
   const cacheRead = usage.cache_read || 0;
-  const ratio = input > 0 ? cacheRead / input : 0;
+  const cacheWrite = usage.cache_write || 0;
+  const denom = (usage.input || 0) + cacheRead + cacheWrite;
+  const ratio = denom > 0 ? cacheRead / denom : 0;
+  const input = usage.input || 0;
   return {
     inputTokens: input,
     cachedTokens: cacheRead,
@@ -868,8 +991,18 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
 
     res.status(response.status).set("x-gateway-request-id", id);
     for (const [k, v] of response.headers)
-      if (!["content-encoding", "content-length", "connection", "transfer-encoding"].includes(k.toLowerCase()))
+      if (forwardableResponseHeader(k))
         res.setHeader(k, v);
+    // The upstream's own request id is useful for provider-side support
+    // tickets, but it must not share the gateway's header name -- an operator
+    // reading `x-gateway-request-id` has to be able to trust it identifies OUR
+    // request, and a provider echoing back a value of its choosing would let a
+    // hostile upstream forge correlation ids (and poison log joins).
+    const upstreamRequestId = response.headers.get("x-request-id");
+    if (upstreamRequestId) res.setHeader("x-upstream-request-id", upstreamRequestId);
+    // "x-request-id" is deliberately NOT in the allowlist: it is read here and
+    // re-emitted under the gateway's own name above, so it can never arrive at
+    // the client under a header that looks like it might be ours.
 
     let usage = null;
     const contentType = response.headers.get("content-type") || "";
@@ -957,7 +1090,12 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
 }
 
 async function handle(req, res) {
-  const p = protocol(req.path), model = modelFor(req, p), action = actionFor(req, p), id = `gw_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  // Reuse the id minted by the request-id middleware so the header the client
+  // already received and every log line from here on agree. Falling back to a
+  // fresh id keeps this correct even if handle() is ever invoked without that
+  // middleware (e.g. mounted directly in a test).
+  const id = res.locals?.requestId || `gw_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const p = protocol(req.path), model = modelFor(req, p), action = actionFor(req, p);
   if (!model) return res.status(400).json({ error: { type: "ModelError", message: "A model is required." } });
   const available = candidates(model, p);
   if (!available.length) return res.status(404).json({ error: { type: "ModelError", message: `No ${p} route is configured for ${model}.` } });
@@ -1043,6 +1181,47 @@ async function handle(req, res) {
 
 // ─── Endpoints ───────────────────────────────────────────────────────────────
 
+// LIVENESS: is this process alive and able to serve? Must be a pure
+// in-process check -- no database, no network, no upstream. An orchestrator's
+// liveness probe restarts the container when this fails, so a slow or
+// unavailable metrics DB must never be able to take down a gateway that is
+// otherwise serving traffic perfectly well. Previously /health was the only
+// probe and it did live Postgres reads first, which is exactly the coupling
+// that turns a metrics outage into a restart loop.
+app.get("/health/live", (_req, res) => {
+  res.json({
+    ok: true,
+    status: "alive",
+    uptime: Math.floor((Date.now() - startTime) / 1000),
+  });
+});
+
+// READINESS: can this instance usefully serve proxied traffic? Distinguishes
+// "process is up" from "process has a usable route table", so an orchestrator
+// can hold traffic until configuration has loaded instead of burning user
+// requests on 404s during a cold start. Deliberately does NOT probe providers
+// or the metrics DB: both are allowed to be degraded without the instance
+// being unable to do its job, and the circuit breakers already handle that at
+// request time.
+app.get("/health/ready", (_req, res) => {
+  const allRoutes = routes();
+  const ready = allRoutes.length > 0;
+  res.status(ready ? 200 : 503).json({
+    ok: ready,
+    status: ready ? "ready" : "no-routes",
+    routes: allRoutes.length,
+    routedModels: [...new Set(allRoutes.map(r => r.id))].length,
+    // Build identity so an operator can tell which deploy is actually serving
+    // instead of matching timestamps by hand. GIT_SHA / VERCEL_GIT_COMMIT_SHA
+    // are injected by the platform; the rest fall back rather than lying.
+    version: process.env.GATEWAY_VERSION || undefined,
+    gitSha: process.env.GIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA || undefined,
+    bootedAt: new Date(startTime).toISOString(),
+  });
+});
+
+// Detailed health (unchanged shape, still does live reads). Kept at /health so
+// existing dashboards and uptime checks keep working.
 app.get("/health", async (_req, res) => {
   const allRoutes = routes();
   const configuredProviders = [...new Set(allRoutes.map(r => r.provider || r.upstreamApiKeyEnv || "unknown"))];
@@ -1064,6 +1243,9 @@ app.get("/health", async (_req, res) => {
     activeRequests,
     activeStreams,
     metricsBackend: usingDb() ? "postgres" : "in-memory (single instance only)",
+    version: process.env.GATEWAY_VERSION || undefined,
+    gitSha: process.env.GIT_SHA || process.env.VERCEL_GIT_COMMIT_SHA || undefined,
+    bootedAt: new Date(startTime).toISOString(),
   });
 });
 
@@ -1166,9 +1348,9 @@ app.get("/v1/models", modelsAuth, (_req, res) => {
   res.json({ object: "list", data: [...m.values()] });
 });
 
-app.post("/v1/chat/completions", auth, handle);
-app.post("/v1/messages", auth, handle);
-app.post("/v1beta/models/:modelAction", auth, handle);
+app.post("/v1/chat/completions", auth, bodySizeGuard, handle);
+app.post("/v1/messages", auth, bodySizeGuard, handle);
+app.post("/v1beta/models/:modelAction", auth, bodySizeGuard, handle);
 
 app.get("/v1/debug/routes", adminAuth, (_req, res) => {
   res.json({
@@ -1369,6 +1551,26 @@ async function discover() {
 
 await discover();
 setInterval(discover, Number(process.env.DISCOVERY_REFRESH_MS || 21600000)).unref();
+
+// Validate the operator's route/discovery configuration once at startup.
+// Deliberately runs AFTER the first discover() so the report covers the full
+// effective route set, and deliberately does not throw: a malformed route
+// must not stop the gateway from booting and serving the routes that are
+// valid. Everything it reports is a problem that would otherwise only ever
+// surface as a user-visible 502 on the first request that hits it.
+validateStartupConfig({
+  routeSources: [
+    ["MODEL_ROUTES_JSON", parseJson("MODEL_ROUTES_JSON", [])],
+    ["EXTRA_MODEL_ROUTES_JSON", parseJson("EXTRA_MODEL_ROUTES_JSON", [])],
+    ["EXTRA_MODEL_ROUTES_JSON_2", parseJson("EXTRA_MODEL_ROUTES_JSON_2", [])],
+    ["EXTRA_MODEL_ROUTES_JSON_3", parseJson("EXTRA_MODEL_ROUTES_JSON_3", [])],
+    ["EXTRA_MODEL_ROUTES_JSON_4", parseJson("EXTRA_MODEL_ROUTES_JSON_4", [])],
+    ["EXTRA_MODEL_ROUTES_JSON_5", parseJson("EXTRA_MODEL_ROUTES_JSON_5", [])],
+    ["EXTRA_MODEL_ROUTES_JSON_6", parseJson("EXTRA_MODEL_ROUTES_JSON_6", [])],
+    ["EXTRA_MODEL_ROUTES_JSON_7", parseJson("EXTRA_MODEL_ROUTES_JSON_7", [])],
+  ],
+  discoverySources: parseJson("MODEL_DISCOVERY_JSON", []),
+});
 
 if (!process.env.VERCEL) {
   const server = app.listen(PORT, () => console.log(`Entry Gateway listening on :${PORT}; models=${[...new Set(routes().map(r => r.id))].join(",") || "none"}`));
