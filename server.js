@@ -964,7 +964,7 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
     model,
     protocol: p,
     provider,
-    timeoutMs: Number(r.timeoutMs || 120000),
+    timeoutMs: Number(r.timeoutMs || process.env.UPSTREAM_TIMEOUT_MS || 120000),
   });
 
   try {
