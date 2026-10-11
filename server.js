@@ -270,6 +270,12 @@ const keyHashes = ttlCache(() => hashSet((process.env.GATEWAY_API_KEYS || "").sp
 const metricsKeyHashes = ttlCache(() => hashSet((process.env.METRICS_BEARER_KEY || "").split(",").map(x => x.trim()).filter(Boolean)));
 // Vercel OIDC verification config, read lazily so tests can toggle per request.
 // JWKS remote set is cached per URL; verification failures fail CLOSED.
+// Issuer resilience (verified 2026-10-11: Vercel's team and global JWKS are
+// identical key sets, and the operator may toggle federation mode on either
+// project): tokens are accepted from the configured issuer OR the platform
+// global issuer — audience + subject + EXPECT_PROJECT checks still bind every
+// token to this exact dashboard project and environment, so the widened
+// issuer set does not widen who gets in.
 const metricsOidcConfig = () => {
   const issuer = process.env.METRICS_OIDC_ISSUER;
   const audience = process.env.METRICS_OIDC_AUDIENCE;
@@ -279,7 +285,8 @@ const metricsOidcConfig = () => {
     metricsOidcConfig.jwks = createRemoteJWKSet(new URL(jwksUrl));
     metricsOidcConfig.jwksUrl = jwksUrl;
   }
-  return { issuer, audience, subject: process.env.METRICS_OIDC_SUBJECT || "", jwks: metricsOidcConfig.jwks };
+  const issuers = [...new Set([issuer, "https://oidc.vercel.com"])];
+  return { issuers, audience, subject: process.env.METRICS_OIDC_SUBJECT || "", jwks: metricsOidcConfig.jwks };
 };
 const inHashSet = (set, value) => set.has(value) || [...set].some(h => safeEquals(h, createHash("sha256").update(value).digest("hex")));
 
@@ -425,12 +432,19 @@ const metricsAuth = async (req, res, next) => {
   const oidc = metricsOidcConfig();
   if (oidc && supplied.split(".").length === 3) {
     try {
+      // Signature, audience and expiry via jose; issuer and subject are checked
+      // manually below so a mismatch can be diagnosed from the actual claims
+      // (jwtVerify's claim errors hide the received values).
       const { payload } = await jwtVerify(supplied, oidc.jwks, {
-        issuer: oidc.issuer,
         audience: oidc.audience,
-        subject: oidc.subject || undefined,
         clockTolerance: 5,
       });
+      if (!oidc.issuers.includes(String(payload.iss))) {
+        throw new Error(`unexpected issuer: ${payload.iss}`);
+      }
+      if (oidc.subject && payload.sub !== oidc.subject) {
+        throw new Error(`unexpected subject: ${payload.sub}`);
+      }
       // Defense in depth: the subject must bind the dashboard project regardless
       // of an over-broad METRICS_OIDC_SUBJECT configuration.
       if (process.env.METRICS_OIDC_EXPECT_PROJECT && !String(payload.sub || "").includes(`project:${process.env.METRICS_OIDC_EXPECT_PROJECT}`)) {
