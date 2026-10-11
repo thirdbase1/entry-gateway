@@ -33,6 +33,7 @@ const {
   recordBreakerSuccess,
   getAllCircuitBreakers,
   getMetricsSnapshot,
+  flushPendingWrites,
   kvGet,
   kvSet,
 } = await import("./metrics-store.js");
@@ -92,6 +93,12 @@ test("getCircuitBreaker()/recordBreakerFailure()/recordBreakerSuccess() fail ope
 // in-memory daily map -- recordRequest() above ran with the DB down, so
 // those requests were recorded to mem buckets INCLUDING the daily ones.
 test("getMetricsSnapshot() returns a usable in-memory `daily` history when the DB is unreachable", async () => {
+  // Since the 2026-10-10 micro-batcher, recordRequest() in DB mode enqueues
+  // and the flush (which fails against this unreachable host and drains the
+  // window into the in-memory fallback) is what the gateway triggers after
+  // every request via flushPendingWrites(). Flush here to follow the same
+  // contract the server uses.
+  await resolvesWithin(flushPendingWrites(), "flushPendingWrites");
   const snap = await resolvesWithin(getMetricsSnapshot(["providerA"], ["model-x"]), "getMetricsSnapshot (daily)");
   assert.ok(Array.isArray(snap.daily), "daily must be an array in mem-fallback mode");
   // Use the store's own localDay() (Lagos/WAT day boundary), NOT a UTC date
