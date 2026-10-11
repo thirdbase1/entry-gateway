@@ -35,6 +35,13 @@ async function bootGateway(t) {
   ]);
   process.env.RL_KEY = "k";
   process.env.CONFIG_CACHE_MS = "0";
+  // Deterministic limiter margins: with the defaults (burst 100, 50 rps
+  // refill) a slow/CPU-contended machine refills the bucket faster than the
+  // 140-request loop can drain it, so 429 never arrives and the test
+  // spuriously fails. A small burst + slow refill exhausts within a handful
+  // of requests regardless of machine speed.
+  process.env.RATE_LIMIT_BURST = "10";
+  process.env.RATE_LIMIT_RPS = "5";
   const { default: app } = await import(`./server.js?t=${Date.now()}`);
   const gateway = http.createServer(app);
   const port = await listen(gateway);
@@ -90,5 +97,9 @@ test("3. rate limiting is still enforced at all (the fix did not disable it)", a
   const statuses = [];
   for (let i = 0; i < 140; i++) statuses.push((await hit(base, KEY_A)).status);
   assert.ok(statuses.includes(429), "the limiter must still return 429 once the budget is gone");
-  assert.ok(statuses.filter((s) => s === 200 || s === 502).length > 0, "requests before the limit are served");
+  // 503 joined the "served" set in 2026-10-10: after 5 rapid failures the
+  // single-candidate model's breaker opens and later attempts are honestly
+  // classified as 503 ServiceUnavailableError (gateway-side circuit-open
+  // rejection) instead of a misleading 502 "all upstream routes failed".
+  assert.ok(statuses.filter((s) => s === 200 || s === 502 || s === 503).length > 0, "requests before the limit are served");
 });

@@ -9,12 +9,17 @@ import {
   recordBreakerFailure,
   recordBreakerSuccess,
   isCircuitOpen,
-  incrGauge,
-  getGauge,
   getMetricsSnapshot,
   getAllCircuitBreakers,
+  beginActiveLease,
+  endActiveLease,
+  countActiveLeases,
+  getDailySpendUsd,
+  flushPendingWrites,
+  CB_COOLDOWN_MS,
   usingDb,
 } from "./metrics-store.js";
+import { evaluateSpendLimit, secondsUntilNextWatMidnight } from "./spend-guard.js";
 import { getOrCreateCachedContent } from "./gemini-cache.js";
 import { createUpstreamAbort } from "./upstream-abort.js";
 import { validateStartupConfig } from "./config-validation.js";
@@ -156,6 +161,10 @@ export function forwardableResponseHeader(name) {
 
 const PORT = Number(process.env.PORT || 8787);
 let discovered = [];
+// The default per-attempt upstream hard-timeout (routes may override with
+// timeoutMs). Exposed via /metrics definitions so the dashboard can
+// distinguish "p95/p99 sit at the timeout ceiling" from ordinary clusters.
+const DEFAULT_UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 120000);
 
 const parseJson = (name, fallback) => {
   try { return process.env[name] ? JSON.parse(process.env[name]) : fallback; }
@@ -170,11 +179,11 @@ const parseJson = (name, fallback) => {
 // ever read (.has/.size/iteration), never mutated, so sharing the reference
 // across requests is safe.
 const CONFIG_CACHE_MS = Math.max(0, Number(process.env.CONFIG_CACHE_MS ?? 5000));
-function ttlCache(build) {
+function ttlCache(build, ttlMs = CONFIG_CACHE_MS) {
   let at = -Infinity, value = null;
   return () => {
     const now = Date.now();
-    if (now - at > CONFIG_CACHE_MS) { value = build(); at = now; }
+    if (now - at > ttlMs) { value = build(); at = now; }
     return value;
   };
 }
@@ -222,6 +231,28 @@ const adminKeys = ttlCache(() => new Set((process.env.ADMIN_API_KEYS || "").spli
 // EXTRA_MODEL_ROUTES_JSON_7: dedicated additive slot for StepFun routes.
 // Keep provider API keys server-side; never place secrets in route JSON.
 
+// ─── Public model ids: ":free" suffix stripping ──────────────────────────────
+// Provider free tiers are configured with ids like "qwen3.8-flash:free", but
+// clients should never see or type the ":free" suffix. The gateway exposes
+// the STRIPPED id publicly (/v1/models, routing, metrics, breakers) while
+// calling the upstream with the REAL id (kept in upstreamModel). These are
+// genuinely different models from their paid namesakes (different upstream
+// entries), so nothing is merged away: a stripped free route and an explicit
+// paid route for the same public id simply coexist as priority-ordered
+// fallback candidates, exactly like two providers for one model already do.
+const FREE_ID_SUFFIX_RE = /:free$/i;
+function normalizeRouteFreeId(r) {
+  if (typeof r?.id === "string" && FREE_ID_SUFFIX_RE.test(r.id)) {
+    return {
+      ...r,
+      id: r.id.replace(FREE_ID_SUFFIX_RE, ""),
+      // The upstream still knows the model by its real ":free" id.
+      upstreamModel: r.upstreamModel || r.id,
+    };
+  }
+  return r;
+}
+
 const configured = ttlCache(() => [
   ...(Array.isArray(parseJson("MODEL_ROUTES_JSON", [])) ? parseJson("MODEL_ROUTES_JSON", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON", []) : []),
@@ -231,7 +262,7 @@ const configured = ttlCache(() => [
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_5", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_5", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_6", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_6", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_7", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_7", []) : []),
-].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r })));
+].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r })).map(normalizeRouteFreeId));
 const routes = ttlCache(() => {
   const m = new Map();
   // NOTE: upstreamApiKeyEnv is part of the dedup key -- without it, two
@@ -320,6 +351,36 @@ const auth = (req, res, next) => {
   next();
 };
 
+// ─── Optional daily spend ceiling (MAX_DAILY_SPEND_USD) ──────────────────────
+// Server-side cost protection for the paid proxy routes: once the gateway's
+// recorded ESTIMATED spend for the current WAT day reaches the ceiling, new
+// upstream calls are rejected with 429 + Retry-After until the 12am WAT
+// reset. Disabled unless MAX_DAILY_SPEND_USD is set to a positive number.
+// See spend-guard.js for the enforcement model (best-effort: the check is
+// cached for SPEND_CHECK_TTL_MS and a request's future output cost is
+// unknowable, so in-flight traffic can overshoot within that window). A
+// metrics-store failure degrades this to disabled (fail-open), consistent
+// with "metrics must never block the proxy path".
+const MAX_DAILY_SPEND_USD = Number(process.env.MAX_DAILY_SPEND_USD ?? 0);
+const SPEND_CHECK_TTL_MS = Math.max(1000, Number(process.env.SPEND_CHECK_TTL_MS ?? 15000));
+const cachedDailySpend = ttlCache(() => getDailySpendUsd(), SPEND_CHECK_TTL_MS);
+const spendLimitGuard = async (req, res, next) => {
+  if (!(MAX_DAILY_SPEND_USD > 0)) return next();
+  // The cached read holds the promise itself, so concurrent requests within
+  // one TTL window share a single database round-trip.
+  const decision = evaluateSpendLimit(await cachedDailySpend(), MAX_DAILY_SPEND_USD);
+  if (decision.allowed) return next();
+  const retryAfter = secondsUntilNextWatMidnight();
+  res.setHeader("Retry-After", String(retryAfter));
+  log({ type: "spend_limit_reached", spent: decision.spent, limit: decision.limit, retryAfter });
+  return res.status(429).json({
+    error: {
+      type: "SpendLimitError",
+      message: `Daily estimated spend ceiling reached ($${decision.spent.toFixed(2)} of $${decision.limit.toFixed(2)}). Resets at 12am WAT.`,
+    },
+  });
+};
+
 // PER-ROUTE BODY SIZE. express.json applies one global 25mb ceiling, which
 // means a route for a small model accepts a 25mb prompt -- a cost and timeout
 // risk the route's own configuration cannot express. This enforces the
@@ -353,13 +414,19 @@ const bodySizeGuard = (req, res, next) => {
   }
   next();
 };
+// When ADMIN_STRICT_KEYS=1, ordinary gateway API keys are rejected on the
+// admin/read-only endpoints (everything below) -- only ADMIN_API_KEYS (or
+// the dashboard session cookie) authorize them. Default OFF: single-key
+// deployments and the entry-agents settings dashboard authenticate with the
+// gateway key, so flipping the default would lock operators out.
+const adminStrict = () => process.env.ADMIN_STRICT_KEYS === "1";
 const adminAuth = (req, res, next) => {
   const supplied = bearerToken(req);
   const valid = keyHashes();
   const admins = adminKeyHashes();
   if (!valid.size && !admins.size) return res.status(500).json({ error: { type: "ConfigError", message: "No keys configured." } });
   if (admins.size && inHashSet(admins, supplied)) return next();
-  if (inHashSet(valid, supplied)) return next();
+  if (!adminStrict() && inHashSet(valid, supplied)) return next();
   // Read-only dashboard session: auto-issued by the dashboard page itself, so
   // opening /admin authenticates the viewer with no key entry at all.
   if (autoAuthEnabled() && dashTokenValid(cookieValue(req, DASH_COOKIE))) return next();
@@ -435,6 +502,11 @@ const modelsAuth = (req, res, next) => {
   // A dedicated admin key is valid for this read-only endpoint but is not a
   // gateway key, so sending it through auth() would incorrectly reject it.
   if (admins.size && inHashSet(admins, supplied)) return next();
+  // /v1/models is an ordinary OpenAI-compatible endpoint that gateway-key
+  // clients call with their own credentials, so it is deliberately NOT
+  // affected by ADMIN_STRICT_KEYS (which only hardens the admin/metrics
+  // surface). Gateway keys go through auth() so they keep per-key rate
+  // limiting and headers.
   if (inHashSet(valid, supplied)) return auth(req, res, next);
   if (autoAuthEnabled() && dashTokenValid(cookieValue(req, DASH_COOKIE))) return next();
   return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
@@ -730,6 +802,20 @@ const startTime = Date.now();
 
 const log = x => process.env.REQUEST_LOG !== "false" && console.log(JSON.stringify({ type: "request", at: new Date().toISOString(), ...x }));
 
+// Client-facing upstream failure detail. The 502/503 `failures` array is the
+// only place upstream response content is relayed verbatim into a caller's
+// payload, so it is redacted (credential-shaped strings stripped) and
+// tightened from 500 to 200 chars. Server-side logs keep the fuller detail
+// via upstream_failure lines, and request credentials are never logged.
+const CLIENT_ERROR_SNIPPET_MAX = 200;
+export function redactUpstreamDetail(text) {
+  return String(text)
+    .replace(/\b(?:sk|rk)-[A-Za-z0-9_-]{8,}/g, "[redacted]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]")
+    .replace(/\b(x-api-key|api-key|apikey|api_key|access-token|token)\s*[=:]\s*[^\s,;"']{8,}/gi, "$1=[redacted]")
+    .slice(0, CLIENT_ERROR_SNIPPET_MAX);
+}
+
 // Per-request cache summary attached to the request log line (see the
 // call site in handle() below) -- input already includes cache_read as a
 // subset (every provider's usage schema reports it that way, see the
@@ -847,7 +933,28 @@ function derivePromptCacheKey(body) {
 // (isCircuitOpen) stay awaited -- they gate routing -- and metrics-store keeps
 // a synchronous in-memory overlay so a deferred write still trips the breaker
 // immediately on this instance.
-const defer = p => { if (p && typeof p.catch === "function") p.catch(e => console.error(JSON.stringify({ type: "metrics_bg_error", error: e instanceof Error ? e.message : String(e) }))); };
+//
+// On Vercel the invocation may be frozen shortly after res.end() -- before
+// plain fire-and-forget promises finish -- which silently dropped usage/
+// spend records and, worse, half of every active-request gauge update (the
+// direct cause of the phantom "1124 active requests"). When the platform's
+// request context exposes waitUntil (the same Symbol.for("@vercel/request-
+// context") contract @vercel/functions wraps -- used directly so no
+// dependency is added), deferred work is registered with it so the runtime
+// keeps the invocation alive until the writes settle. Outside Vercel (long-
+// lived Docker/node processes) the old fire-and-forget path is correct.
+const VERCEL_REQ_CONTEXT = Symbol.for("@vercel/request-context");
+const defer = (p) => {
+  if (!p || typeof p.catch !== "function") return;
+  const guarded = p.catch(e => console.error(JSON.stringify({ type: "metrics_bg_error", error: e instanceof Error ? e.message : String(e) })));
+  try {
+    const ctx = globalThis[VERCEL_REQ_CONTEXT]?.get?.();
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(guarded);
+      return;
+    }
+  } catch {}
+};
 
 async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) {
   const key = process.env[r.upstreamApiKeyEnv];
@@ -876,19 +983,29 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
 
   // Circuit breaker check
   if (await isCircuitOpen(breakerId, model)) {
-    // Record both the provider-level error counter AND a per-model request
-    // (status 0 = failed before any upstream response) so this attempt is
-    // visible in that model's own row, not just an orphaned provider-level
-    // error number that doesn't reconcile against any visible request.
-    defer(recordUpstreamError(provider, model));
-    defer(recordRequest(provider, model, 0, null, null, null, null, isFallback));
-    throw new Error(`Circuit breaker open for ${provider}:${model}`);
+    // Record the attempt (status 0 = rejected before any upstream response)
+    // so it is visible in the model's own row, but do NOT count it as an
+    // upstream error: nothing reached the provider, so inflating
+    // upstream_errors here made provider health look worse than it is and
+    // made the error total irreconcilable with actual upstream failures.
+    // The rejection is surfaced to the client as a 503 (see handle()).
+    recordRequest(provider, model, 0, null, null, null, null, isFallback);
+    const e = new Error(`Circuit breaker open for ${provider}:${model}`);
+    e.circuitOpen = true;
+    throw e;
   }
 
   const started = Date.now();
   let ttft = null;
   let streaming = false;
-  defer(incrGauge("activeRequests", 1));
+  // Self-healing in-flight tracking (see beginActiveLease in metrics-store):
+  // the old +/- gauge permanently leaked +1 on every dropped decrement and
+  // drifted into the thousands. The lease is begun immediately (not awaited
+  // -- it must not delay the upstream call) and the end is CHAINED after the
+  // begin settles so the DELETE can never race ahead of the INSERT.
+  const leaseId = `${id}:${Math.random().toString(36).slice(2, 10)}`;
+  const requestLease = beginActiveLease("requests", leaseId);
+  defer(requestLease.then(() => endActiveLease("requests", leaseId)).catch(() => {}));
 
   // CRITICAL: the client sends OUR public model id (e.g. "hy3"), but the
   // upstream provider may expose that model under a different literal
@@ -982,8 +1099,8 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
       // anonymous provider-level error) so failed attempts on one model
       // (e.g. a circuit-tripping route) don't show up as unexplained
       // provider errors sitting next to a different model's clean 2xx row.
-      defer(recordUpstreamError(provider, model));
-      defer(recordRequest(provider, model, response.status, Date.now() - started, ttft, null, null, isFallback));
+      recordUpstreamError(provider, model);
+      recordRequest(provider, model, response.status, Date.now() - started, ttft, null, null, isFallback);
       const e = new Error(`Upstream ${response.status}: ${text.slice(0, 500)}`);
       e.retryable = true;
       throw e;
@@ -1013,7 +1130,8 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
       res.send(text);
     } else {
       streaming = true;
-      defer(incrGauge("activeStreams", 1));
+      const streamLease = beginActiveLease("streams", `${leaseId}:s`);
+      defer(streamLease.then(() => endActiveLease("streams", `${leaseId}:s`)).catch(() => {}));
       const reader = response.body.getReader();
       // Persistent decoder + carry-over buffer: an SSE "data: {...}" frame
       // (especially the final one carrying usage) can land split across two
@@ -1062,30 +1180,35 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
     const normalizedUsage = usage ? { ...usage, input: cacheBreakdownOf(r, usage).uncachedInput, cache_read: cacheBreakdownOf(r, usage).cacheRead, cache_write: cacheBreakdownOf(r, usage).cacheWrite } : usage;
 
     defer(recordBreakerSuccess(breakerId, model));
-    defer(recordRequest(provider, model, response.status, latencyMs, ttft, normalizedUsage, estimatedCost, isFallback));
+    recordRequest(provider, model, response.status, latencyMs, ttft, normalizedUsage, estimatedCost, isFallback);
     log({ requestId: id, model, protocol: p, provider, status: response.status, latencyMs, ttftMs: ttft, usage: normalizedUsage, cache: cacheSummary(normalizedUsage), estimatedCost, isFallback });
   } catch (e) {
     // The 5xx/429 branch records the failure before throwing so it can retain
     // the real upstream status. Only network-level failures reach this catch
     // unrecorded; counting retryable responses again would trip the breaker
     // twice per failed attempt and double the upstream-error metric.
-    if (!e.retryable && !e.configError) {
+    if (upstreamAbort.reason() === "client") {
+      // The CALLER hung up (abandoned request or mid-stream disconnect).
+      // Record the attempt (status 0) so volume still reconciles, but no
+      // breaker failure and no upstream error: the provider did nothing
+      // wrong, and counting client aborts against it opened breakers on
+      // healthy providers and polluted upstream_errors.
+      recordRequest(provider, model, 0, Date.now() - started, ttft, null, null, isFallback);
+    } else if (!e.retryable && !e.configError) {
       defer(recordBreakerFailure(breakerId, model));
-      defer(recordUpstreamError(provider, model));
-      defer(recordRequest(provider, model, 0, Date.now() - started, ttft, null, null, isFallback));
+      recordUpstreamError(provider, model);
+      recordRequest(provider, model, 0, Date.now() - started, ttft, null, null, isFallback);
     } else if (e.configError) {
-      // Config errors are deterministic: count them as requests/errors for
-      // observability but NEVER against the circuit breaker (handle()'s catch
-      // skips the breaker for configError too, so exactly one recordRequest
-      // lands per failed attempt).
-      defer(recordUpstreamError(provider, model));
-      defer(recordRequest(provider, model, 0, Date.now() - started, ttft, null, null, isFallback));
+      // Config errors are deterministic GATEWAY-side problems (missing
+      // secret / invalid upstream URL): count the attempt for observability
+      // but neither the breaker nor upstream_errors -- the provider was
+      // never validly called (handle()'s catch skips the breaker for
+      // configError too, so exactly one recordRequest lands per attempt).
+      recordRequest(provider, model, 0, Date.now() - started, ttft, null, null, isFallback);
     }
     throw e;
   } finally {
     upstreamAbort.cleanup();
-    defer(incrGauge("activeRequests", -1));
-    if (streaming) defer(incrGauge("activeStreams", -1));
   }
 }
 
@@ -1095,7 +1218,13 @@ async function handle(req, res) {
   // fresh id keeps this correct even if handle() is ever invoked without that
   // middleware (e.g. mounted directly in a test).
   const id = res.locals?.requestId || `gw_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const p = protocol(req.path), model = modelFor(req, p), action = actionFor(req, p);
+  const p = protocol(req.path);
+  let model = modelFor(req, p);
+  // Accept legacy ":free"-suffixed client requests too: they route to the
+  // same stripped public id, so old callers keep working after the public
+  // catalog switched to clean ids.
+  if (typeof model === "string" && FREE_ID_SUFFIX_RE.test(model)) model = model.replace(FREE_ID_SUFFIX_RE, "");
+  const action = actionFor(req, p);
   if (!model) return res.status(400).json({ error: { type: "ModelError", message: "A model is required." } });
   const available = candidates(model, p);
   if (!available.length) return res.status(404).json({ error: { type: "ModelError", message: `No ${p} route is configured for ${model}.` } });
@@ -1112,6 +1241,12 @@ async function handle(req, res) {
   // Providers whose routes are known-bad for THIS request (missing secret /
   // invalid upstream URL) -- deterministic config errors, skip immediately.
   const brokenProviders = new Set();
+  // Rejection accounting so the final status can distinguish "every route
+  // was refused locally by its circuit breaker" (gateway-side: 503) from
+  // "we really called upstream and it failed" (502), per the counting rules
+  // in the README.
+  let openCircuitRejections = 0;
+  let otherFailures = 0;
   // STABILITY: one breaker/metrics identity per model id, regardless of how
   // many provider routes serve it. Every failure path in this handler and in
   // proxy() records against THIS key rather than the individual candidate's
@@ -1136,6 +1271,7 @@ async function handle(req, res) {
     const provider = r.provider || r.upstreamApiKeyEnv || "unknown";
     if (brokenProviders.has(provider)) {
       failures.push(`${provider}: skipped (known-bad configuration)`);
+      otherFailures += 1;
       continue;
     }
     // isCircuitOpen() is guaranteed to never throw (fails open internally
@@ -1143,7 +1279,10 @@ async function handle(req, res) {
     // of real requests hanging until Vercel's 300s function timeout during
     // a 2026-08-27 Upstash rate-limit incident, since it sat outside the
     // try/catch below with nothing to catch a raw Redis error escaping it.
-    if (available.length > 1 && (await isCircuitOpen(cbProvider, model))) continue; // skip open circuits if alternatives exist
+    if (available.length > 1 && (await isCircuitOpen(cbProvider, model))) {
+      openCircuitRejections += 1;
+      continue; // skip open circuits if alternatives exist
+    }
     try {
       await proxy(req, res, r, p, model, action, id, i > 0, cbProvider);
       return;
@@ -1161,14 +1300,33 @@ async function handle(req, res) {
         failures.push(`${provider}: configuration error`);
         console.error(JSON.stringify({ type: "upstream_config_error", requestId: id, model, protocol: p, provider, error: e.message }));
         brokenProviders.add(provider);
+        otherFailures += 1;
       } else {
-        failures.push(`${provider}: ${e.message}`);
+        failures.push(`${provider}: ${redactUpstreamDetail(e.message)}`);
         console.error(JSON.stringify({ type: "upstream_failure", requestId: id, model, protocol: p, provider, error: e.message }));
+        if (e.circuitOpen) openCircuitRejections += 1;
+        else otherFailures += 1;
       }
     }
   }
+  // Persist this request's queued metrics. On Vercel this registers the
+  // window flush with the invocation's waitUntil so the runtime stays alive
+  // until the batch containing this request's events is written; on
+  // long-lived processes it flushes immediately (a no-op when the queue is
+  // empty). See metrics-store.js's micro-batcher.
+  defer(flushPendingWrites());
   if (!res.headersSent) {
-    res.status(502).json({ error: { type: "UpstreamError", message: "All compatible upstream routes failed.", requestId: id, failures } });
+    if (openCircuitRejections > 0 && otherFailures === 0) {
+      // Every candidate was refused locally by its circuit breaker -- no
+      // upstream was contacted on this request, so a 502 "All compatible
+      // upstream routes failed" would misattribute a gateway-side rejection
+      // to the providers. 503 + Retry-After matched to the breaker cooldown
+      // is the honest classification (and what retry-aware clients expect).
+      res.setHeader("Retry-After", String(Math.ceil(CB_COOLDOWN_MS / 1000)));
+      res.status(503).json({ error: { type: "ServiceUnavailableError", message: `All routes for ${model} are temporarily unavailable: circuit breaker open after repeated upstream failures.`, requestId: id, failures } });
+    } else {
+      res.status(502).json({ error: { type: "UpstreamError", message: "All compatible upstream routes failed.", requestId: id, failures } });
+    }
   } else if (!res.writableEnded) {
     // Headers (and likely partial body) already went out on a prior
     // candidate that then failed mid-stream. There is no way to signal
@@ -1226,8 +1384,8 @@ app.get("/health", async (_req, res) => {
   const allRoutes = routes();
   const configuredProviders = [...new Set(allRoutes.map(r => r.provider || r.upstreamApiKeyEnv || "unknown"))];
   const [activeRequests, activeStreams, cbDetails] = await Promise.all([
-    getGauge("activeRequests"),
-    getGauge("activeStreams"),
+    countActiveLeases("requests"),
+    countActiveLeases("streams"),
     getAllCircuitBreakers(),
   ]);
   const circuitBreakers = {};
@@ -1240,6 +1398,9 @@ app.get("/health", async (_req, res) => {
     routedModels: [...new Set(allRoutes.map(r => r.id))],
     providers: configuredProviders,
     circuitBreakers,
+    // Leases alive right now: genuinely in-flight upstream attempts /
+    // streams, self-healing (see beginActiveLease) -- the old +/- gauge
+    // drifted to thousands on dropped decrements.
     activeRequests,
     activeStreams,
     metricsBackend: usingDb() ? "postgres" : "in-memory (single instance only)",
@@ -1249,12 +1410,16 @@ app.get("/health", async (_req, res) => {
   });
 });
 
-app.get("/metrics", adminAuth, async (_req, res) => {
+app.get("/metrics", adminAuth, async (req, res) => {
   const allRoutes = routes();
   const configuredProviders = [...new Set(allRoutes.map(r => r.provider || r.upstreamApiKeyEnv || "unknown"))];
   const configuredModels = [...new Set(allRoutes.map(r => r.id))];
 
-  const snapshot = await getMetricsSnapshot(configuredProviders, configuredModels);
+  // ?daily=global trims the daily-history payload to the scope the built-in
+  // dashboard renders (the entry-agents dashboard consumes the unfiltered
+  // shape and does not pass this param, so its behavior is unchanged).
+  const dailyScope = ["global", "provider", "model"].includes(req.query.daily) ? req.query.daily : undefined;
+  const snapshot = await getMetricsSnapshot(configuredProviders, configuredModels, { dailyScope });
 
   // Attach estimatedCacheSavingsUsd per model: what those cacheRead tokens
   // WOULD have cost at the route's full input rate, minus what they
@@ -1281,6 +1446,21 @@ app.get("/metrics", adminAuth, async (_req, res) => {
     uptime: Math.floor((Date.now() - startTime) / 1000),
     ...snapshot,
     metricsBackend: usingDb() ? "postgres" : "in-memory (single instance only)",
+    // Explicit metric definitions so every consumer (and operator) reads
+    // these numbers the same way they are produced. Additive metadata only.
+    definitions: {
+      upstreamTimeoutMs: DEFAULT_UPSTREAM_TIMEOUT_MS,
+      requests: "upstream attempts, one record per candidate tried (fallback attempts included); a client request that exhausted N routes counts N - use requests minus fallbacks for an approximation of client-visible requests",
+      status0: "status code 0 marks an attempt that produced no upstream response: client disconnect, timeout, circuit-open rejection, or gateway config error",
+      upstreamErrors: "attempts that failed against an actual upstream: 5xx/429 responses, transport errors, and timeouts - excludes client disconnects, circuit-open rejections, and gateway config errors",
+      activeRequests: "upstream attempts with a live lease right now (self-healing; see ACTIVE_LEASE_TTL_MS)",
+      activeStreams: "streaming responses with a live lease right now",
+      latency: `percentiles (nearest-rank) plus arithmetic mean (avg), over the most recent ${500} recorded attempts per bucket`,
+      tokens: "input is uncached-only input; cacheRead/cacheWrite are separate buckets; total = input + cacheRead + cacheWrite + output",
+      estimatedSpend: "estimate from each route's configured per-million prices times recorded tokens - not a provider invoice",
+      dayBoundary: "Africa/Lagos (WAT, UTC+1, no DST) - daily rollups start at 12am WAT",
+      dailyRetention: "unbounded (gw_metrics_daily rows are never deleted)",
+    },
   });
 });
 
@@ -1348,9 +1528,9 @@ app.get("/v1/models", modelsAuth, (_req, res) => {
   res.json({ object: "list", data: [...m.values()] });
 });
 
-app.post("/v1/chat/completions", auth, bodySizeGuard, handle);
-app.post("/v1/messages", auth, bodySizeGuard, handle);
-app.post("/v1beta/models/:modelAction", auth, bodySizeGuard, handle);
+app.post("/v1/chat/completions", auth, spendLimitGuard, bodySizeGuard, handle);
+app.post("/v1/messages", auth, spendLimitGuard, bodySizeGuard, handle);
+app.post("/v1beta/models/:modelAction", auth, spendLimitGuard, bodySizeGuard, handle);
 
 app.get("/v1/debug/routes", adminAuth, (_req, res) => {
   res.json({
@@ -1399,8 +1579,15 @@ function safeGatewayUrl(req) {
   return vercel && HOST_RE.test(vercel) ? `https://${vercel}` : null;
 }
 
-// When serving /admin, inject the gateway URL (and, only for an already-
-// authenticated visitor, the admin key) so the dashboard can auto-connect.
+// When serving /admin, inject ONLY the gateway URL. No credential is ever
+// embedded in the page, in any form, for any visitor: the dashboard
+// auto-authenticates through the short-lived signed HttpOnly session cookie
+// (which JavaScript cannot read, so it is invisible even in DevTools), and
+// an operator who explicitly pastes a key into the page keeps it in a
+// closure variable that never touches the DOM after connect. The previous
+// behavior of echoing a validated Bearer token back into a <meta> tag meant
+// the credential sat in View Source / DevTools for the whole session -- a
+// shoulder-surf / screen-share / extension-read leak waiting to happen.
 const serveAdminDashboard = (req, res) => {
   try {
     let html = readFileSync(join(__dirname, "public", "admin.html"), "utf-8");
@@ -1412,38 +1599,27 @@ const serveAdminDashboard = (req, res) => {
     // fetch() below a cross-origin request depending on CORS, when it
     // could just be same-origin and need no CORS at all.
     const gatewayUrl = safeGatewayUrl(req);
-    // CRITICAL SECURITY FIX: this route used to inject the live ADMIN_API_KEYS
-    // (or GATEWAY_API_KEYS) value into the served HTML for EVERY visitor with
-    // no auth whatsoever. The gateway URL is public, so anyone who could load
-    // `/` or `/admin` got a fully valid, long-lived credential straight out of
-    // the page source -- the old comment's claim that the key was "only as
-    // exposed as the URL itself" was simply wrong (the URL is public; the key
-    // is not). The key is now auto-injected ONLY when the request already
-    // presents a valid admin/gateway Bearer token, so the operator who holds
-    // the key still gets zero-config auto-connect while an anonymous visitor
-    // gets nothing. admin.html already handles "URL present, key absent" by
-    // pre-filling the URL and showing the manual key-entry bar, so no UX is
-    // lost for legitimate first visits -- only the credential leak is closed.
-    const supplied = bearerToken(req);
-    const authorized = (adminKeyHashes().size > 0 && inHashSet(adminKeyHashes(), supplied)) || inHashSet(keyHashes(), supplied);
-    const adminKey = authorized
-      ? ((process.env.ADMIN_API_KEYS || process.env.GATEWAY_API_KEYS || "").split(",").map(x => x.trim()).filter(Boolean)[0] || "")
-      : "";
-    const keyMeta = adminKey ? `  <meta name="gateway-key" content="${escapeHtmlAttr(adminKey)}" />\n` : "";
-    // Inject into HTML as meta tags the frontend reads. Skipped entirely for a
-    // hostile/unparseable Host with no VERCEL_URL fallback -- admin.html then
-    // shows its manual URL-entry bar instead of a poisoned auto-connect URL.
+    // Inject into HTML as a meta tag the frontend reads. Skipped entirely for
+    // a hostile/unparseable Host with no VERCEL_URL fallback -- admin.html
+    // then shows its manual URL-entry bar instead of a poisoned URL.
     if (gatewayUrl) {
-      html = html.replace("</head>", `  <meta name="gateway-url" content="${escapeHtmlAttr(gatewayUrl)}" />\n${keyMeta}</head>`);
+      html = html.replace("</head>", `  <meta name="gateway-url" content="${escapeHtmlAttr(gatewayUrl)}" />\n</head>`);
     } else {
       res.setHeader("Cache-Control", "private, no-store");
     }
-    // Never let a browser/proxy/CDN cache this page -- when authenticated it
-    // can carry the operator's key, and even unauthenticated it reflects the
-    // request Host, so it must not be stored or shared. (The `private` variant
-    // above additionally stops a shared cache from ever storing a response
-    // served under an attacker-supplied Host header.)
+    // Never let a browser/proxy/CDN cache this page -- it reflects the
+    // request Host, so it must not be stored or shared.
     res.setHeader("Cache-Control", gatewayUrl ? "no-store" : "private, no-store");
+    // HARDENING: strict CSP for the dashboard. Everything the page needs is
+    // inline (script/style) and same-origin fetches; `connect-src 'self'
+    // https:` keeps the cross-origin dashboard use case working while
+    // guaranteeing that even injected script could not exfiltrate anything
+    // to non-https origins. This is defense-in-depth on top of the escaping
+    // and no-credential-in-page guarantees, not a substitute for them.
+    res.setHeader("Content-Security-Policy",
+      "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+      + "connect-src 'self' https:; img-src 'self' data:; base-uri 'none'; "
+      + "form-action 'none'; frame-ancestors 'none'; object-src 'none'");
 
     // Dashboard auto-auth: hand every visitor a short-lived, signed, HttpOnly
     // session cookie so the page can load read-only admin data with NO key
@@ -1478,9 +1654,14 @@ const serveAdminDashboard = (req, res) => {
 
 // Public landing page at the bare domain root. Fully static -- no request
 // data (Host, origin, path) is reflected into it, so unlike the admin page it
-// needs no escaping, no no-store, and can be cached by browsers/CDNs.
+// needs no escaping, no no-store, and can be cached by browsers/CDNs. The CSP
+// blocks every network operation from the page (it is purely presentational)
+// and only permits its two inline demo scripts.
 const serveLandingPage = (_req, res) => {
   try {
+    res.setHeader("Content-Security-Policy",
+      "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+      + "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'");
     res.set("Content-Type", "text/html").send(readFileSync(join(__dirname, "public", "landing.html")));
   } catch {
     res.status(404).send("Landing page not found.");
@@ -1534,7 +1715,7 @@ async function discover() {
       const upstreamModel = typeof item === "string" ? item : item.id || item.name;
       if (!upstreamModel) continue;
       for (const p of s.protocols || ["openai-chat"])
-        fresh.push({ id: s.aliases?.[upstreamModel] || upstreamModel, upstreamModel, protocol: p, provider: s.provider, upstreamBaseURL: s.baseURL, upstreamApiKeyEnv: s.apiKeyEnv, priority: s.priority ?? 100, cost: s.cost, context_window: item.context_window || s.context_window });
+        fresh.push(normalizeRouteFreeId({ id: s.aliases?.[upstreamModel] || upstreamModel, upstreamModel, protocol: p, provider: s.provider, upstreamBaseURL: s.baseURL, upstreamApiKeyEnv: s.apiKeyEnv, priority: s.priority ?? 100, cost: s.cost, context_window: item.context_window || s.context_window }));
     }
   } catch (e) { console.error(`Discovery failed for ${s.provider || s.url}: ${e.message}`); }
   // STABILITY: if EVERY source errored this round, treat it as a transient
@@ -1574,6 +1755,14 @@ validateStartupConfig({
 
 if (!process.env.VERCEL) {
   const server = app.listen(PORT, () => console.log(`Entry Gateway listening on :${PORT}; models=${[...new Set(routes().map(r => r.id))].join(",") || "none"}`));
+  // LONG STREAMS: Node's default requestTimeout (300s) kills legitimately
+  // long streaming completions (max-reasoning turns can run longer). The
+  // upstream hard timeout (route timeoutMs / UPSTREAM_TIMEOUT_MS) already
+  // governs every proxied request, so the HTTP server layer must not impose
+  // a second, tighter ceiling. headersTimeout stays at its default so slow
+  // clients cannot hold headers forever; an idle keep-alive socket still
+  // times out normally. Vercel enforces its own maxDuration regardless.
+  server.requestTimeout = 0;
 
   // STABILITY: graceful shutdown for the self-hosted/Docker path. On SIGTERM
   // (docker stop, orchestrator rollout) stop accepting new connections, give

@@ -160,6 +160,19 @@ async function ensureSchema() {
       value BIGINT NOT NULL DEFAULT 0
     )
   `;
+  // Short-TTL leases for genuinely in-flight upstream work (see
+  // beginActiveLease above). Rows are deleted on completion and TTL-evicted
+  // on read, so this table stays at roughly the size of the real in-flight
+  // set. Additive 2026-10-10; the old gw_metrics_gauges rows are left
+  // untouched (no destructive migration -- the counters there are simply no
+  // longer read for activeRequests/activeStreams).
+  await sql`
+    CREATE TABLE IF NOT EXISTS gw_active_leases (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      expires_at_ms BIGINT NOT NULL
+    )
+  `;
   await sql`
     CREATE TABLE IF NOT EXISTS gw_circuit_breakers (
       provider TEXT NOT NULL,
@@ -220,14 +233,24 @@ function memBucket(key) {
   return mem.buckets.get(key);
 }
 
+// Percentiles use the nearest-rank method (ceil(p/100 * n), 1-indexed), the
+// textbook definition, computed over the bucket's retained sample window (the
+// most recent MAX_SAMPLES recorded attempts -- see MAX_SAMPLES above). The
+// previous implementation used floor(p/100 * n) capped at the last index,
+// which for even-sized samples reported the UPPER element as the median
+// (n=2, p50 -> sorted[1]) instead of the nearest-rank lower one. `avg` is the
+// arithmetic mean over the same window -- the dashboard's "average latency"
+// used to show p50 mislabeled as an average.
 function percentiles(arr) {
-  if (!arr.length) return { p50: 0, p95: 0, p99: 0, min: 0, max: 0, count: 0 };
+  if (!arr.length) return { p50: 0, p95: 0, p99: 0, avg: 0, min: 0, max: 0, count: 0 };
   const sorted = [...arr].sort((a, b) => a - b);
-  const idx = (p) => Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  const idx = (p) => Math.min(sorted.length, Math.max(1, Math.ceil((p / 100) * sorted.length))) - 1;
+  const avg = sorted.reduce((s, x) => s + x, 0) / sorted.length;
   return {
     p50: sorted[idx(50)],
     p95: sorted[idx(95)],
     p99: sorted[idx(99)],
+    avg: Math.round(avg * 100) / 100,
     min: sorted[0],
     max: sorted[sorted.length - 1],
     count: sorted.length,
@@ -278,39 +301,149 @@ function recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, est
   mem.sets.get("models").add(model);
 }
 
-// Upserts one bucket row, incrementing counters atomically via
-// ON CONFLICT ... DO UPDATE SET col = table.col + EXCLUDED.col. The
-// status-code breakdown is a dynamic-key JSONB increment; lat/ttft are
-// appended and trimmed to the last MAX_SAMPLES in the same statement.
-async function upsertBucket(scope, name, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
-  const is2xx = status >= 200 && status < 300 ? 1 : 0;
-  const is4xx = status >= 400 && status < 500 ? 1 : 0;
-  const is5xx = status >= 500 ? 1 : 0;
-  const statusStr = String(status);
-  // Same finite/non-negative clamp as bumpMem -- see num()'s comment. These
-  // values go straight into DOUBLE PRECISION columns where a NaN would be
-  // stored permanently and poison every later aggregate read.
-  const u = usage
-    ? { input: num(usage.input), output: num(usage.output), cache_read: num(usage.cache_read), cache_write: num(usage.cache_write), reasoning: num(usage.reasoning) }
-    : null;
-  await sql`
+// ─── Micro-batched DB writes (concurrency scaling) ────────────────────────────
+//
+// Under high load the previous per-event write path cost up to 6 database
+// round-trips PER REQUEST (3 bucket upserts + 3 daily upserts, plus 2 lease
+// writes) -- at a thousand concurrent requests that is thousands of Neon HTTP
+// calls per second, which throttles the database, opens the DB health
+// circuit, and degrades every metric to the per-instance in-memory fallback.
+//
+// The batcher coalesces those writes: record* functions now MERGE their event
+// into per-(scope,name) accumulators (a synchronous Map update -- zero
+// hot-path DB cost), and a flush writes ONE statement per touched bucket
+// every METRICS_FLUSH_MS. 1000 rps across 10 providers/30 models becomes
+// ~40 statements per 200ms window instead of ~6000 single-row writes.
+//
+// Durability is preserved by the caller: server.js registers
+// flushPendingWrites() with the request's waitUntil, so the serverless
+// runtime stays alive until the window containing that request's events has
+// been persisted. On long-lived processes a 1s safety interval covers any
+// straggler events. If a flush fails, the whole window drains into the
+// in-memory fallback (same fail-open discipline as everything else here).
+
+const METRICS_FLUSH_MS = Math.max(50, Number(process.env.METRICS_FLUSH_MS || 200));
+const pendingBuckets = new Map(); // "scope|name"      -> merged delta
+const pendingDaily = new Map();   // "day|scope|name"   -> merged delta
+const pendingLeases = new Map();  // leaseId -> { id, kind, expiresAtMs, ended }
+const pendingLeaseDeletes = new Set();
+
+function newDelta() {
+  return { requests: 0, r2xx: 0, r4xx: 0, r5xx: 0, upstreamErrors: 0, fallbacks: 0, tokens: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 }, spend: 0, statuses: {}, lat: [], ttft: [] };
+}
+
+// Merges event delta b into accumulator a. Every numeric field passes the
+// same num() clamp as bumpMem below -- a NaN in one event must not poison
+// the merged accumulator.
+function mergeDelta(a, b) {
+  a.requests += b.requests;
+  a.r2xx += b.r2xx;
+  a.r4xx += b.r4xx;
+  a.r5xx += b.r5xx;
+  a.upstreamErrors += b.upstreamErrors;
+  a.fallbacks += b.fallbacks;
+  for (const k of ["input", "output", "cache_read", "cache_write", "reasoning"]) a.tokens[k] += b.tokens[k];
+  a.spend += b.spend;
+  for (const [code, n] of Object.entries(b.statuses)) a.statuses[code] = (a.statuses[code] || 0) + n;
+  for (const v of b.lat) a.lat.push(v);
+  for (const v of b.ttft) a.ttft.push(v);
+}
+
+function requestDelta(status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
+  const d = newDelta();
+  d.requests = 1;
+  if (status >= 200 && status < 300) d.r2xx = 1;
+  else if (status >= 400 && status < 500) d.r4xx = 1;
+  else if (status >= 500) d.r5xx = 1;
+  d.statuses[String(status)] = 1;
+  if (isFallback) d.fallbacks = 1;
+  if (usage) {
+    d.tokens.input = num(usage.input);
+    d.tokens.output = num(usage.output);
+    d.tokens.cache_read = num(usage.cache_read);
+    d.tokens.cache_write = num(usage.cache_write);
+    d.tokens.reasoning = num(usage.reasoning);
+  }
+  if (estimatedCost != null) d.spend = num(estimatedCost);
+  if (latencyMs != null) d.lat.push(num(latencyMs));
+  if (ttftMs != null) d.ttft.push(num(ttftMs));
+  return d;
+}
+
+function upstreamErrorDelta() {
+  const d = newDelta();
+  d.upstreamErrors = 1;
+  return d;
+}
+
+function enqueueBucketDelta(scope, name, d) {
+  const key = `${scope}|${name}`;
+  const cur = pendingBuckets.get(key);
+  if (cur) mergeDelta(cur, d);
+  else pendingBuckets.set(key, d);
+}
+
+function enqueueDailyDelta(day, scope, name, d) {
+  const key = `${day}|${scope}|${name}`;
+  const cur = pendingDaily.get(key);
+  if (cur) mergeDelta(cur, d);
+  else pendingDaily.set(key, d);
+}
+
+// ONE parameterized statement per bucket per flush: summed counters, the
+// dynamic status-code chain, and lat/ttft sample appends (trimmed to
+// MAX_SAMPLES). Built as a pure {text, params} pair (no driver call) so the
+// exact SQL is unit-testable against a real Postgres; performFlush executes
+// it via the Neon driver. Every value travels as a bound parameter.
+//
+// NOTE (found by the real-Postgres verification): BOTH branches matter. The
+// INSERT VALUES branch serves a bucket's very first flush -- its statuses
+// and samples must be complete there too, not only in the ON CONFLICT
+// branch. lat/ttft are sliced in JS to MAX_SAMPLES for the insert branch;
+// the conflict branch slices in SQL because it must trim old + new together.
+export function buildBucketFlushStatement(scope, name, acc) {
+  const latSamples = acc.lat.slice(-MAX_SAMPLES);
+  const ttftSamples = acc.ttft.slice(-MAX_SAMPLES);
+  const params = [
+    scope, name,
+    acc.requests, acc.r2xx, acc.r4xx, acc.r5xx, acc.upstreamErrors, acc.fallbacks,
+    acc.tokens.input, acc.tokens.output, acc.tokens.cache_read, acc.tokens.cache_write, acc.tokens.reasoning,
+    acc.spend, latSamples, ttftSamples,
+  ];
+  // INSERT-branch status_breakdown: the merged window statuses as one jsonb.
+  let sbInsertExpr = "'{}'::jsonb";
+  if (Object.keys(acc.statuses).length) {
+    const args = [];
+    for (const [code, count] of Object.entries(acc.statuses)) {
+      args.push(`$${params.push(code)}::text`, `$${params.push(count)}::bigint`);
+    }
+    sbInsertExpr = `jsonb_build_object(${args.join(", ")})`;
+  }
+  // ON CONFLICT-branch status chain over the existing row's jsonb.
+  let sbExpr = "gw_metrics_buckets.status_breakdown";
+  for (const [code, count] of Object.entries(acc.statuses)) {
+    const pCode = params.push(String(code));
+    const pCount = params.push(count);
+    sbExpr = `jsonb_set(${sbExpr}, ARRAY[$${pCode}::text], to_jsonb(COALESCE((${sbExpr} ->> $${pCode}::text)::bigint, 0) + $${pCount}::bigint))`;
+  }
+  const text = `
     INSERT INTO gw_metrics_buckets (
       scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
       upstream_errors, fallbacks, tokens_input, tokens_output,
       tokens_cache_read, tokens_cache_write, tokens_reasoning,
       estimated_spend, status_breakdown, lat, ttft
     ) VALUES (
-      ${scope}, ${name}, 1, ${is2xx}, ${is4xx}, ${is5xx},
-      0, ${isFallback ? 1 : 0}, ${u?.input || 0}, ${u?.output || 0},
-      ${u?.cache_read || 0}, ${u?.cache_write || 0}, ${u?.reasoning || 0},
-      ${estimatedCost != null ? num(estimatedCost) : 0}, jsonb_build_object(${statusStr}::text, 1),
-      ${latencyMs != null ? [num(latencyMs)] : []}, ${ttftMs != null ? [num(ttftMs)] : []}
+      $1::text, $2::text, $3::bigint, $4::bigint, $5::bigint, $6::bigint,
+      $7::bigint, $8::bigint, $9::bigint, $10::bigint,
+      $11::bigint, $12::bigint, $13::bigint,
+      $14::double precision, ${sbInsertExpr}, $15::double precision[], $16::double precision[]
     )
     ON CONFLICT (scope, name) DO UPDATE SET
       requests = gw_metrics_buckets.requests + EXCLUDED.requests,
       requests_2xx = gw_metrics_buckets.requests_2xx + EXCLUDED.requests_2xx,
       requests_4xx = gw_metrics_buckets.requests_4xx + EXCLUDED.requests_4xx,
       requests_5xx = gw_metrics_buckets.requests_5xx + EXCLUDED.requests_5xx,
+      upstream_errors = gw_metrics_buckets.upstream_errors + EXCLUDED.upstream_errors,
       fallbacks = gw_metrics_buckets.fallbacks + EXCLUDED.fallbacks,
       tokens_input = gw_metrics_buckets.tokens_input + EXCLUDED.tokens_input,
       tokens_output = gw_metrics_buckets.tokens_output + EXCLUDED.tokens_output,
@@ -318,21 +451,282 @@ async function upsertBucket(scope, name, status, latencyMs, ttftMs, usage, estim
       tokens_cache_write = gw_metrics_buckets.tokens_cache_write + EXCLUDED.tokens_cache_write,
       tokens_reasoning = gw_metrics_buckets.tokens_reasoning + EXCLUDED.tokens_reasoning,
       estimated_spend = gw_metrics_buckets.estimated_spend + EXCLUDED.estimated_spend,
-      status_breakdown = jsonb_set(
-        gw_metrics_buckets.status_breakdown, ARRAY[${statusStr}::text],
-        to_jsonb(COALESCE((gw_metrics_buckets.status_breakdown ->> ${statusStr})::bigint, 0) + 1)
-      ),
-      lat = CASE WHEN ${latencyMs != null} THEN
-        (array_append(gw_metrics_buckets.lat, ${latencyMs}::double precision))[
-          greatest(1, cardinality(array_append(gw_metrics_buckets.lat, ${latencyMs}::double precision)) - ${MAX_SAMPLES - 1}):
+      status_breakdown = ${sbExpr},
+      lat = CASE WHEN cardinality($15::double precision[]) > 0 THEN
+        (gw_metrics_buckets.lat || $15::double precision[])[
+          greatest(1, cardinality(gw_metrics_buckets.lat || $15::double precision[]) - ${MAX_SAMPLES - 1}):
         ]
         ELSE gw_metrics_buckets.lat END,
-      ttft = CASE WHEN ${ttftMs != null} THEN
-        (array_append(gw_metrics_buckets.ttft, ${ttftMs}::double precision))[
-          greatest(1, cardinality(array_append(gw_metrics_buckets.ttft, ${ttftMs}::double precision)) - ${MAX_SAMPLES - 1}):
+      ttft = CASE WHEN cardinality($16::double precision[]) > 0 THEN
+        (gw_metrics_buckets.ttft || $16::double precision[])[
+          greatest(1, cardinality(gw_metrics_buckets.ttft || $16::double precision[]) - ${MAX_SAMPLES - 1}):
         ]
         ELSE gw_metrics_buckets.ttft END
   `;
+  return { text, params };
+}
+
+export function buildDailyFlushStatement(day, scope, name, acc) {
+  const params = [
+    day, scope, name,
+    acc.requests, acc.r2xx, acc.r4xx, acc.r5xx, acc.upstreamErrors, acc.fallbacks,
+    acc.tokens.input, acc.tokens.output, acc.tokens.cache_read, acc.tokens.cache_write, acc.tokens.reasoning,
+    acc.spend,
+  ];
+  // INSERT-branch statuses (a brand-new day/bucket row must carry them too).
+  let sbInsertExpr = "'{}'::jsonb";
+  if (Object.keys(acc.statuses).length) {
+    const args = [];
+    for (const [code, count] of Object.entries(acc.statuses)) {
+      args.push(`$${params.push(code)}::text`, `$${params.push(count)}::bigint`);
+    }
+    sbInsertExpr = `jsonb_build_object(${args.join(", ")})`;
+  }
+  let sbExpr = "gw_metrics_daily.status_breakdown";
+  for (const [code, count] of Object.entries(acc.statuses)) {
+    const pCode = params.push(String(code));
+    const pCount = params.push(count);
+    sbExpr = `jsonb_set(${sbExpr}, ARRAY[$${pCode}::text], to_jsonb(COALESCE((${sbExpr} ->> $${pCode}::text)::bigint, 0) + $${pCount}::bigint))`;
+  }
+  const text = `
+    INSERT INTO gw_metrics_daily (
+      day, scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
+      upstream_errors, fallbacks, tokens_input, tokens_output,
+      tokens_cache_read, tokens_cache_write, tokens_reasoning, estimated_spend, status_breakdown
+    ) VALUES (
+      $1::date, $2::text, $3::text, $4::bigint, $5::bigint, $6::bigint, $7::bigint,
+      $8::bigint, $9::bigint, $10::bigint, $11::bigint,
+      $12::bigint, $13::bigint, $14::bigint, $15::double precision, ${sbInsertExpr}
+    )
+    ON CONFLICT (day, scope, name) DO UPDATE SET
+      requests = gw_metrics_daily.requests + EXCLUDED.requests,
+      requests_2xx = gw_metrics_daily.requests_2xx + EXCLUDED.requests_2xx,
+      requests_4xx = gw_metrics_daily.requests_4xx + EXCLUDED.requests_4xx,
+      requests_5xx = gw_metrics_daily.requests_5xx + EXCLUDED.requests_5xx,
+      upstream_errors = gw_metrics_daily.upstream_errors + EXCLUDED.upstream_errors,
+      fallbacks = gw_metrics_daily.fallbacks + EXCLUDED.fallbacks,
+      tokens_input = gw_metrics_daily.tokens_input + EXCLUDED.tokens_input,
+      tokens_output = gw_metrics_daily.tokens_output + EXCLUDED.tokens_output,
+      tokens_cache_read = gw_metrics_daily.tokens_cache_read + EXCLUDED.tokens_cache_read,
+      tokens_cache_write = gw_metrics_daily.tokens_cache_write + EXCLUDED.tokens_cache_write,
+      tokens_reasoning = gw_metrics_daily.tokens_reasoning + EXCLUDED.tokens_reasoning,
+      estimated_spend = gw_metrics_daily.estimated_spend + EXCLUDED.estimated_spend,
+      status_breakdown = ${sbExpr}
+  `;
+  return { text, params };
+}
+
+export function buildLeaseFlushStatements(upserts, deletes) {
+  const statements = [];
+  const live = upserts.filter((l) => !l.ended);
+  if (live.length) {
+    // Multi-row insert via unnest: one round-trip for the whole window's
+    // lease begins. "ended" leases are already excluded -- an end that
+    // arrived before its begin was flushed simply cancels it.
+    statements.push({
+      text: `INSERT INTO gw_active_leases (id, kind, expires_at_ms)
+       SELECT * FROM unnest($1::text[], $2::text[], $3::bigint[])
+       ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind, expires_at_ms = EXCLUDED.expires_at_ms`,
+      params: [live.map((l) => l.id), live.map((l) => l.kind), live.map((l) => l.expiresAtMs)],
+    });
+  }
+  if (deletes.length) {
+    statements.push({
+      text: `DELETE FROM gw_active_leases WHERE id = ANY($1::text[])`,
+      params: [deletes],
+    });
+  }
+  return statements;
+}
+
+// Applies an unflushable delta to the in-memory fallback so a failed flush
+// degrades to per-instance visibility instead of vanishing.
+function drainBucketDeltaToMem(scope, name, acc) {
+  const b = memBucket(scope === "global" ? "global:_" : `${scope}:${name}`);
+  const c = b.counters;
+  c.requests = (c.requests || 0) + acc.requests;
+  c.requests2xx = (c.requests2xx || 0) + acc.r2xx;
+  c.requests4xx = (c.requests4xx || 0) + acc.r4xx;
+  c.requests5xx = (c.requests5xx || 0) + acc.r5xx;
+  c.upstreamErrors = (c.upstreamErrors || 0) + acc.upstreamErrors;
+  c.fallbacks = (c.fallbacks || 0) + acc.fallbacks;
+  c.tokensInput = (c.tokensInput || 0) + acc.tokens.input;
+  c.tokensOutput = (c.tokensOutput || 0) + acc.tokens.output;
+  c.tokensCacheRead = (c.tokensCacheRead || 0) + acc.tokens.cache_read;
+  c.tokensCacheWrite = (c.tokensCacheWrite || 0) + acc.tokens.cache_write;
+  c.tokensReasoning = (c.tokensReasoning || 0) + acc.tokens.reasoning;
+  c.estimatedSpend = (c.estimatedSpend || 0) + acc.spend;
+  for (const [code, n] of Object.entries(acc.statuses)) b.status[code] = (b.status[code] || 0) + n;
+  for (const v of acc.lat) { b.lat.push(v); if (b.lat.length > MAX_SAMPLES) b.lat.shift(); }
+  for (const v of acc.ttft) { b.ttft.push(v); if (b.ttft.length > MAX_SAMPLES) b.ttft.shift(); }
+  if (scope === "provider") { if (!mem.sets.has("providers")) mem.sets.set("providers", new Set()); mem.sets.get("providers").add(name); }
+  if (scope === "model") { if (!mem.sets.has("models")) mem.sets.set("models", new Set()); mem.sets.get("models").add(name); }
+}
+
+function drainDailyDeltaToMem(day, scope, name, acc) {
+  const b = memDailyBucket(day, scope, name);
+  b.requests += acc.requests;
+  b.requests2xx += acc.r2xx;
+  b.requests4xx += acc.r4xx;
+  b.requests5xx += acc.r5xx;
+  b.upstreamErrors += acc.upstreamErrors;
+  b.fallbacks += acc.fallbacks;
+  b.tokensInput += acc.tokens.input;
+  b.tokensOutput += acc.tokens.output;
+  b.tokensCacheRead += acc.tokens.cache_read;
+  b.tokensCacheWrite += acc.tokens.cache_write;
+  b.tokensReasoning += acc.tokens.reasoning;
+  b.estimatedSpend += acc.spend;
+}
+
+let flushChainTail = Promise.resolve();
+let flushInFlight = false;
+
+// Writes every pending accumulator to the database. One flush = one
+// statement per touched (scope,name) bucket, one per touched daily row, and
+// at most one lease upsert + one lease delete statement -- all in parallel.
+async function performFlush() {
+  if (pendingBuckets.size === 0 && pendingDaily.size === 0 && pendingLeases.size === 0 && pendingLeaseDeletes.size === 0) return;
+  if (!dbUsable()) {
+    // DB health circuit is open: these events cannot reach the database
+    // right now, so degrade the whole window to the in-memory fallback
+    // instead of stranding it until the next flush after recovery.
+    for (const [key, acc] of pendingBuckets) {
+      const [scope, name] = key.split("|");
+      drainBucketDeltaToMem(scope, name, acc);
+    }
+    for (const [key, acc] of pendingDaily) {
+      const [day, scope, name] = key.split("|");
+      drainDailyDeltaToMem(day, scope, name, acc);
+    }
+    for (const l of pendingLeases.values()) if (!l.ended) memLeaseBucket(l.kind).set(l.id, l.expiresAtMs);
+    for (const id of pendingLeaseDeletes) for (const ids of memLeases.values()) ids.delete(id);
+    pendingBuckets.clear();
+    pendingDaily.clear();
+    pendingLeases.clear();
+    pendingLeaseDeletes.clear();
+    return;
+  }
+  const buckets = [...pendingBuckets.entries()];
+  const daily = [...pendingDaily.entries()];
+  const leaseUpserts = [...pendingLeases.values()];
+  const leaseDeletes = [...pendingLeaseDeletes];
+  pendingBuckets.clear();
+  pendingDaily.clear();
+  pendingLeases.clear();
+  pendingLeaseDeletes.clear();
+  try {
+    await ensureSchema();
+    await Promise.all([
+      ...buckets.map(([key, acc]) => {
+        const [scope, name] = key.split("|");
+        const stmt = buildBucketFlushStatement(scope, name, acc);
+        return sql(stmt.text, stmt.params);
+      }),
+      ...daily.map(([key, acc]) => {
+        const [day, scope, name] = key.split("|");
+        const stmt = buildDailyFlushStatement(day, scope, name, acc);
+        return sql(stmt.text, stmt.params);
+      }),
+      ...buildLeaseFlushStatements(leaseUpserts, leaseDeletes).map((stmt) => sql(stmt.text, stmt.params)),
+    ]);
+  } catch (error) {
+    recordDbFailure(error);
+    // Degrade this whole window to the in-memory fallback rather than lose
+    // it: the same events the DB missed remain visible on this instance.
+    for (const [key, acc] of buckets) {
+      const [scope, name] = key.split("|");
+      drainBucketDeltaToMem(scope, name, acc);
+    }
+    for (const [key, acc] of daily) {
+      const [day, scope, name] = key.split("|");
+      drainDailyDeltaToMem(day, scope, name, acc);
+    }
+    for (const l of leaseUpserts) if (!l.ended) memLeaseBucket(l.kind).set(l.id, l.expiresAtMs);
+    for (const id of leaseDeletes) for (const ids of memLeases.values()) ids.delete(id);
+  }
+}
+
+// Resolves after a flush that is guaranteed to include everything enqueued
+// BEFORE this call. Callers register this with the request's waitUntil so
+// deferred metric writes actually persist on serverless (a plain
+// fire-and-forget enqueue would be frozen away with the invocation).
+export function flushPendingWrites() {
+  if (flushInFlight) {
+    // A flush is running; its snapshot may already exclude newer events, so
+    // chain one more flush (a no-op when nothing arrived meanwhile).
+    flushInFlight = false;
+    const run = flushChainTail.then(() => performFlush());
+    flushChainTail = run.then(() => {}, () => {});
+    return run;
+  }
+  flushInFlight = true;
+  const run = flushChainTail.then(() => performFlush()).finally(() => { flushInFlight = false; });
+  flushChainTail = run.then(() => {}, () => {});
+  return run;
+}
+
+// Safety net for events enqueued outside a request lifecycle (local dev,
+// tests, CLI usage): flush about once a second while anything is pending.
+// unref'd so it never keeps a process or serverless invocation alive.
+setInterval(() => { if (pendingBuckets.size || pendingDaily.size || pendingLeases.size || pendingLeaseDeletes.size) void flushPendingWrites(); }, Math.max(200, METRICS_FLUSH_MS)).unref?.();
+
+export function recordRequest(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
+  provider = provider || "unknown";
+  model = model || "unknown";
+
+  if (!dbUsable()) {
+    recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    bumpDailyMem("global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    bumpDailyMem("provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    bumpDailyMem("model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+    return;
+  }
+
+  // DB mode: synchronous merge into the batch accumulators -- zero DB
+  // round-trips on the hot path. The caller registers flushPendingWrites()
+  // (server.js does this once per request) for durability.
+  const d = requestDelta(status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
+  enqueueBucketDelta("global", "_", d);
+  enqueueBucketDelta("provider", provider, d);
+  enqueueBucketDelta("model", model, d);
+  const day = localDay();
+  enqueueDailyDelta(day, "global", "_", d);
+  enqueueDailyDelta(day, "provider", provider, d);
+  enqueueDailyDelta(day, "model", model, d);
+}
+
+function recordUpstreamErrorMem(provider, model) {
+  const pb = memBucket(`provider:${provider}`);
+  pb.counters.upstreamErrors = (pb.counters.upstreamErrors || 0) + 1;
+  const gb = memBucket("global:_");
+  gb.counters.upstreamErrors = (gb.counters.upstreamErrors || 0) + 1;
+  if (model) {
+    const mb = memBucket(`model:${model}`);
+    mb.counters.upstreamErrors = (mb.counters.upstreamErrors || 0) + 1;
+  }
+}
+
+export function recordUpstreamError(provider, model) {
+  provider = provider || "unknown";
+
+  if (!dbUsable()) {
+    recordUpstreamErrorMem(provider, model);
+    const day = localDay();
+    memDailyBucket(day, "global", "_").upstreamErrors += 1;
+    memDailyBucket(day, "provider", provider).upstreamErrors += 1;
+    if (model) memDailyBucket(day, "model", model).upstreamErrors += 1;
+    return;
+  }
+
+  const d = upstreamErrorDelta();
+  enqueueBucketDelta("global", "_", d);
+  enqueueBucketDelta("provider", provider, d);
+  if (model) enqueueBucketDelta("model", model, d);
+  const day = localDay();
+  enqueueDailyDelta(day, "global", "_", d);
+  enqueueDailyDelta(day, "provider", provider, d);
+  if (model) enqueueDailyDelta(day, "model", model, d);
 }
 
 // ─── Per-day history (added 2026-09-10) ─────────────────────────────────────────
@@ -374,142 +768,6 @@ function bumpDailyMem(scope, name, status, latencyMs, ttftMs, usage, estimatedCo
   b.estimatedSpend += estimatedCost != null ? num(estimatedCost) : 0;
 }
 
-// Same shape as upsertBucket but targeting gw_metrics_daily with the WAT
-// day in the key. Written alongside the cumulative bucket in the same
-// request's Promise.all batch so the two can only disagree mid-outage,
-// never permanently drift.
-async function upsertDailyBucket(day, scope, name, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
-  const statusStr = String(status);
-  const u = usage
-    ? { input: num(usage.input), output: num(usage.output), cache_read: num(usage.cache_read), cache_write: num(usage.cache_write), reasoning: num(usage.reasoning) }
-    : null;
-  await sql`
-    INSERT INTO gw_metrics_daily (
-      day, scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
-      fallbacks, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
-      tokens_reasoning, estimated_spend, status_breakdown
-    ) VALUES (
-      ${day}, ${scope}, ${name}, 1, ${status >= 200 && status < 300 ? 1 : 0}, ${status >= 400 && status < 500 ? 1 : 0}, ${status >= 500 ? 1 : 0},
-      ${isFallback ? 1 : 0}, ${u?.input || 0}, ${u?.output || 0}, ${u?.cache_read || 0}, ${u?.cache_write || 0},
-      ${u?.reasoning || 0}, ${estimatedCost != null ? num(estimatedCost) : 0}, jsonb_build_object(${statusStr}::text, 1)
-    )
-    ON CONFLICT (day, scope, name) DO UPDATE SET
-      requests = gw_metrics_daily.requests + EXCLUDED.requests,
-      requests_2xx = gw_metrics_daily.requests_2xx + EXCLUDED.requests_2xx,
-      requests_4xx = gw_metrics_daily.requests_4xx + EXCLUDED.requests_4xx,
-      requests_5xx = gw_metrics_daily.requests_5xx + EXCLUDED.requests_5xx,
-      fallbacks = gw_metrics_daily.fallbacks + EXCLUDED.fallbacks,
-      tokens_input = gw_metrics_daily.tokens_input + EXCLUDED.tokens_input,
-      tokens_output = gw_metrics_daily.tokens_output + EXCLUDED.tokens_output,
-      tokens_cache_read = gw_metrics_daily.tokens_cache_read + EXCLUDED.tokens_cache_read,
-      tokens_cache_write = gw_metrics_daily.tokens_cache_write + EXCLUDED.tokens_cache_write,
-      tokens_reasoning = gw_metrics_daily.tokens_reasoning + EXCLUDED.tokens_reasoning,
-      estimated_spend = gw_metrics_daily.estimated_spend + EXCLUDED.estimated_spend,
-      status_breakdown = jsonb_set(
-        gw_metrics_daily.status_breakdown, ARRAY[${statusStr}::text],
-        to_jsonb(COALESCE((gw_metrics_daily.status_breakdown ->> ${statusStr})::bigint, 0) + 1)
-      )
-  `;
-}
-
-async function bumpDailyUpstreamErrors(day, scope, name) {
-  await sql`
-    INSERT INTO gw_metrics_daily (day, scope, name, upstream_errors)
-    VALUES (${day}, ${scope}, ${name}, 1)
-    ON CONFLICT (day, scope, name) DO UPDATE SET
-      upstream_errors = gw_metrics_daily.upstream_errors + EXCLUDED.upstream_errors
-  `;
-}
-
-export async function recordRequest(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback) {
-  provider = provider || "unknown";
-  model = model || "unknown";
-
-  if (!dbUsable()) {
-    recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    bumpDailyMem("global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    bumpDailyMem("provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    bumpDailyMem("model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    return;
-  }
-
-  try {
-    await ensureSchema();
-    const day = localDay();
-    await Promise.all([
-      upsertBucket("global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
-      upsertBucket("provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
-      upsertBucket("model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
-      upsertDailyBucket(day, "global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
-      upsertDailyBucket(day, "provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
-      upsertDailyBucket(day, "model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback),
-    ]);
-  } catch (error) {
-    recordDbFailure(error);
-    recordRequestMem(provider, model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    // 2026-09-10: daily history must be recorded on the DB-FAILURE catch
-    // path too (not just the !dbUsable() early return) -- the unreachable-
-    // DB regression test proved requests recorded during a DB outage
-    // otherwise vanished from the daily view entirely.
-    bumpDailyMem("global", "_", status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    bumpDailyMem("provider", provider, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-    bumpDailyMem("model", model, status, latencyMs, ttftMs, usage, estimatedCost, isFallback);
-  }
-}
-
-function recordUpstreamErrorMem(provider, model) {
-  const pb = memBucket(`provider:${provider}`);
-  pb.counters.upstreamErrors = (pb.counters.upstreamErrors || 0) + 1;
-  const gb = memBucket("global:_");
-  gb.counters.upstreamErrors = (gb.counters.upstreamErrors || 0) + 1;
-  if (model) {
-    const mb = memBucket(`model:${model}`);
-    mb.counters.upstreamErrors = (mb.counters.upstreamErrors || 0) + 1;
-  }
-}
-
-async function bumpUpstreamErrors(scope, name) {
-  await sql`
-    INSERT INTO gw_metrics_buckets (scope, name, upstream_errors)
-    VALUES (${scope}, ${name}, 1)
-    ON CONFLICT (scope, name) DO UPDATE SET
-      upstream_errors = gw_metrics_buckets.upstream_errors + 1
-  `;
-}
-
-export async function recordUpstreamError(provider, model) {
-  provider = provider || "unknown";
-
-  if (!dbUsable()) {
-    recordUpstreamErrorMem(provider, model);
-    const day = localDay();
-    memDailyBucket(day, "global", "_").upstreamErrors += 1;
-    memDailyBucket(day, "provider", provider).upstreamErrors += 1;
-    if (model) memDailyBucket(day, "model", model).upstreamErrors += 1;
-    return;
-  }
-
-  try {
-    await ensureSchema();
-    const day = localDay();
-    await Promise.all([
-      bumpUpstreamErrors("global", "_"),
-      bumpUpstreamErrors("provider", provider),
-      ...(model ? [bumpUpstreamErrors("model", model)] : []),
-      bumpDailyUpstreamErrors(day, "global", "_"),
-      bumpDailyUpstreamErrors(day, "provider", provider),
-      ...(model ? [bumpDailyUpstreamErrors(day, "model", model)] : []),
-    ]);
-  } catch (error) {
-    recordDbFailure(error);
-    recordUpstreamErrorMem(provider, model);
-    const dayOnFail = localDay();
-    memDailyBucket(dayOnFail, "global", "_").upstreamErrors += 1;
-    memDailyBucket(dayOnFail, "provider", provider).upstreamErrors += 1;
-    if (model) memDailyBucket(dayOnFail, "model", model).upstreamErrors += 1;
-  }
-}
-
 // ─── Gauges (activeRequests / activeStreams) ─────────────────────────────────
 
 export async function incrGauge(name, delta) {
@@ -541,17 +799,125 @@ export async function getGauge(name) {
   }
 }
 
+// ─── Active-request leases (self-healing "in-flight" counts) ─────────────────
+//
+// The old activeRequests/activeStreams gauges were +/- counters in
+// gw_metrics_gauges, incremented at the start of an upstream attempt and
+// decremented in a `finally` block. Both writes are fire-and-forget across
+// independent serverless instances, so ANY dropped decrement (a transient DB
+// error landing on the in-memory fallback while later reads hit the DB, a
+// lambda frozen right after res.end(), a mid-request crash) leaked +1 into
+// the gauge FOREVER. Production drifted to "activeRequests: 1124" with ~39
+// minutes of uptime -- the number was meaningless.
+//
+// A counter cannot self-heal; a LEASE can. Each attempt now inserts a
+// short-TTL row keyed by a per-attempt id and deletes it on completion, and
+// reads COUNT the unexpired rows. A dropped delete only leaves one row until
+// its TTL passes -- the count converges back to the real in-flight work
+// without any operator intervention. TTL must exceed the longest possible
+// request (Vercel maxDuration is 300s; route timeoutMs can reach it) so a
+// still-running request's lease never lapses mid-flight.
+// TTL floor of 1s guards against footgun configs (0/negative would expire
+// every lease instantly and report 0 active forever); read lazily so tests
+// (and operators) can tune it without a redeploy.
+const activeLeaseTtlMs = () => Math.max(1_000, Number(process.env.ACTIVE_LEASE_TTL_MS || 360_000));
+const memLeases = new Map(); // kind -> Map(id -> expiresAtMs)
+
+function memLeaseBucket(kind) {
+  if (!memLeases.has(kind)) memLeases.set(kind, new Map());
+  return memLeases.get(kind);
+}
+function sweepMemLeases(now) {
+  for (const [kind, ids] of memLeases) {
+    for (const [id, exp] of ids) if (exp <= now) ids.delete(id);
+    if (!ids.size) memLeases.delete(kind);
+  }
+}
+
+export async function beginActiveLease(kind, id) {
+  id = String(id);
+  if (!dbUsable()) {
+    memLeaseBucket(kind).set(id, Date.now() + activeLeaseTtlMs());
+    return;
+  }
+  // Batched: the lease is merged into the pending set (a synchronous Map
+  // update) and written with one multi-row statement per flush window.
+  pendingLeases.set(id, { id, kind, expiresAtMs: Date.now() + activeLeaseTtlMs(), ended: false });
+}
+
+// The caller MUST call end after its begin promise settles (see server.js's
+// chained defer). An end that lands while the begin is still pending marks it
+// ended, so the window's flush never even inserts that lease -- the DELETE
+// racing the INSERT problem disappears entirely in the batched form.
+export async function endActiveLease(kind, id) {
+  id = String(id);
+  const pending = pendingLeases.get(id);
+  if (pending) {
+    pending.ended = true;
+    return;
+  }
+  if (!dbUsable()) {
+    memLeaseBucket(kind).delete(id);
+    return;
+  }
+  pendingLeaseDeletes.add(id);
+  // Drop any stale local-overlay entry so fail-open reads agree immediately.
+  for (const ids of memLeases.values()) ids.delete(id);
+}
+
+export async function countActiveLeases(kind) {
+  const now = Date.now();
+  if (!dbUsable()) {
+    sweepMemLeases(now);
+    let n = 0;
+    for (const exp of memLeaseBucket(kind).values()) if (exp > now) n += 1;
+    return n;
+  }
+  try {
+    await ensureSchema();
+    // Opportunistic TTL eviction: expired leases are garbage, and deleting
+    // them here keeps the table at roughly the size of the real in-flight set.
+    await sql`DELETE FROM gw_active_leases WHERE expires_at_ms <= ${now}`;
+    const rows = await sql`SELECT count(*)::int AS n FROM gw_active_leases WHERE kind = ${kind} AND expires_at_ms > ${now}`;
+    let n = Math.max(0, Number(rows[0]?.n) || 0);
+    // Include leases queued for insert but not yet flushed (ids are unique
+    // per attempt, so these cannot double-count rows already in the table)
+    // so a brand-new attempt is visible within the same flush window.
+    for (const l of pendingLeases.values()) {
+      if (l.kind === kind && !l.ended && l.expiresAtMs > now) n += 1;
+    }
+    return n;
+  } catch (error) {
+    recordDbFailure(error);
+    sweepMemLeases(now);
+    let n = 0;
+    for (const exp of memLeaseBucket(kind).values()) if (exp > now) n += 1;
+    // A flush failure may have left the window's leases queued (they drain
+    // to the mem overlay only on the flush path) -- count the live ones.
+    for (const l of pendingLeases.values()) {
+      if (l.kind === kind && !l.ended && l.expiresAtMs > now) n += 1;
+    }
+    return n;
+  }
+}
+
 // ─── Circuit breakers (shared across instances) ──────────────────────────────
 
 const CB_THRESHOLD = 5;
 const CB_COOLDOWN_MS = 30000;
+// Exported for the 503 Retry-After hint in server.js so the two can't drift.
+export { CB_THRESHOLD, CB_COOLDOWN_MS };
 
 function defaultCircuitBreaker() {
   return { state: "closed", failures: 0, openedAt: null, threshold: CB_THRESHOLD, cooldownMs: CB_COOLDOWN_MS };
 }
 
 function cbMemKey(provider, model) {
-  return `${provider || "unknown"}:${model || "unknown"}`;
+  // Normalized so the in-memory overlay (no-DB mode and fail-open fallbacks)
+  // uses the same "model:<id>" keys the DB path reports -- otherwise the two
+  // paths disagreed and consumers parsing the key after "model:" (the
+  // dashboard's provider-health lookup) failed for ids containing ":".
+  return circuitBreakerKey(provider, model);
 }
 
 export async function getCircuitBreaker(provider, model) {
@@ -712,6 +1078,21 @@ export async function recordBreakerSuccess(provider, model) {
   });
 }
 
+// Display/API key for a breaker row. Since the per-model hardening, rows are
+// written with provider="model:<id>" and model="<id>" (see server.js's
+// cbProvider), which cbMemKey-style concatenation rendered as the redundant
+// "model:<id>:<id>" -- and model ids that themselves contain ":" (e.g.
+// "qwen3.8-flash:free") broke every consumer that split the key on ":".
+// Collapse that redundant suffix so keys read "model:<id>"; pre-hardening
+// "provider:model" rows keep their shape and gain identity:"legacy" so the
+// dashboard can tell them apart.
+export function circuitBreakerKey(provider, model) {
+  if (typeof provider === "string" && provider.startsWith("model:") && model === provider.slice(6)) {
+    return provider;
+  }
+  return `${provider || "unknown"}:${model || "unknown"}`;
+}
+
 export async function getAllCircuitBreakers() {
   if (!dbUsable()) {
     const out = {};
@@ -723,10 +1104,11 @@ export async function getAllCircuitBreakers() {
     const rows = await sql`SELECT provider, model, state, failures, opened_at FROM gw_circuit_breakers`;
     const out = {};
     for (const raw of rows) {
-      out[`${raw.provider}:${raw.model}`] = {
+      out[circuitBreakerKey(raw.provider, raw.model)] = {
         state: raw.state,
         failures: Number(raw.failures) || 0,
         openedAt: raw.opened_at ? Number(raw.opened_at) : null,
+        identity: typeof raw.provider === "string" && raw.provider.startsWith("model:") ? "model" : "legacy",
       };
     }
     return out;
@@ -785,24 +1167,8 @@ export async function kvSet(key, value, ttlSeconds) {
 }
 
 // ─── Snapshot for /metrics and /health ───────────────────────────────────────
-
-async function readBucket(scope, name) {
-  if (!dbUsable()) {
-    const b = memBucket(scope === "global" ? "global:_" : `${scope}:${name}`);
-    return serializeFromMem(b);
-  }
-  try {
-    await ensureSchema();
-    const rows = await sql`
-      SELECT * FROM gw_metrics_buckets WHERE scope = ${scope} AND name = ${name}
-    `;
-    return serializeFromDb(rows[0] || null);
-  } catch (error) {
-    recordDbFailure(error);
-    const b = memBucket(scope === "global" ? "global:_" : `${scope}:${name}`);
-    return serializeFromMem(b);
-  }
-}
+// (Bucket reads happen inline in getMetricsSnapshot via one table scan; the
+// former per-bucket readBucket() helper was retired with the N+1 queries.)
 
 // CORRECTED 2026-08-18 (twice, back in the Redis-backed version): the
 // caller (server.js) feeds this store an already-normalized usage object
@@ -877,43 +1243,80 @@ function serializeFromMem(b) {
   };
 }
 
-export async function getMetricsSnapshot(knownProviders, knownModels) {
-  const global = await readBucket("global", "_");
-
-  let providerNames, modelNames;
-  if (!dbUsable()) {
-    providerNames = [...new Set([...(mem.sets.get("providers") || []), ...knownProviders])];
-    modelNames = [...new Set([...(mem.sets.get("models") || []), ...knownModels])];
-  } else {
+export async function getMetricsSnapshot(knownProviders, knownModels, opts = {}) {
+  // EFFICIENCY: this used to issue 2 DISTINCT-name queries and then one
+  // SELECT per provider AND per model (2 + P + M round-trips per /metrics
+  // call). One full read of gw_metrics_buckets yields every row the loop
+  // needed -- the table holds one small row per (scope, name), so a single
+  // scan is both fewer round-trips and less total work.
+  let rows = null;
+  if (dbUsable()) {
     try {
       await ensureSchema();
-      const [providerRows, modelRows] = await Promise.all([
-        sql`SELECT DISTINCT name FROM gw_metrics_buckets WHERE scope = 'provider'`,
-        sql`SELECT DISTINCT name FROM gw_metrics_buckets WHERE scope = 'model'`,
-      ]);
-      providerNames = [...new Set([...providerRows.map((r) => r.name), ...knownProviders])];
-      modelNames = [...new Set([...modelRows.map((r) => r.name), ...knownModels])];
+      rows = await sql`SELECT * FROM gw_metrics_buckets`;
     } catch (error) {
       recordDbFailure(error);
-      providerNames = [...new Set([...(mem.sets.get("providers") || []), ...knownProviders])];
-      modelNames = [...new Set([...(mem.sets.get("models") || []), ...knownModels])];
+      rows = null;
     }
   }
 
+  const globalRow = rows?.find((r) => r.scope === "global" && r.name === "_") || null;
+  const global = globalRow ? serializeFromDb(globalRow) : serializeFromMem(memBucket("global:_"));
+
+  let providerNames, modelNames;
+  const providerPending = new Set();
+  const modelPending = new Set();
+  if (rows) {
+    // Include providers/models that only exist in the not-yet-flushed batch
+    // accumulators, so a brand-new provider's first request is visible in
+    // the snapshot within the same window instead of after the flush.
+    for (const key of pendingBuckets.keys()) {
+      const [scope, name] = key.split("|");
+      if (scope === "provider") providerPending.add(name);
+      else if (scope === "model") modelPending.add(name);
+    }
+    providerNames = [...new Set([
+      ...rows.filter((r) => r.scope === "provider").map((r) => r.name),
+      ...providerPending,
+      ...knownProviders,
+    ])];
+    modelNames = [...new Set([
+      ...rows.filter((r) => r.scope === "model").map((r) => r.name),
+      ...modelPending,
+      ...knownModels,
+    ])];
+  } else {
+    providerNames = [...new Set([...(mem.sets.get("providers") || []), ...knownProviders])];
+    modelNames = [...new Set([...(mem.sets.get("models") || []), ...knownModels])];
+  }
+
+  const bucketFromDb = (scope, name) => {
+    const row = rows?.find((r) => r.scope === scope && r.name === name);
+    return row ? serializeFromDb(row) : serializeFromMem(memBucket(`${scope}:${name}`));
+  };
   const byProvider = {};
-  await Promise.all(providerNames.map(async (name) => { byProvider[name] = await readBucket("provider", name); }));
+  await Promise.all(providerNames.map(async (name) => { byProvider[name] = bucketFromDb("provider", name); }));
   const byModel = {};
-  await Promise.all(modelNames.map(async (name) => { byModel[name] = await readBucket("model", name); }));
+  await Promise.all(modelNames.map(async (name) => { byModel[name] = bucketFromDb("model", name); }));
 
   const circuitBreakers = await getAllCircuitBreakers();
 
-  const activeRequests = await getGauge("activeRequests");
-  const activeStreams = await getGauge("activeStreams");
+  // "Active" now means leases that are alive right now (see
+  // beginActiveLease): genuinely in-flight upstream attempts / streams,
+  // self-healing against dropped cleanup writes.
+  const [activeRequests, activeStreams] = await Promise.all([
+    countActiveLeases("requests"),
+    countActiveLeases("streams"),
+  ]);
 
   // Per-day history (added 2026-09-10). Unbounded retention -- every day
   // that ever had traffic stays queryable forever, so a full year (or
   // more) of daily trends is always available. Rows only exist for days
-  // with traffic, so this stays small in practice.
+  // with traffic, so this stays small in practice. An optional
+  // opts.dailyScope ("global"|"provider"|"model") trims the payload for
+  // callers that only consume one scope (the built-in dashboard only ever
+  // renders global rows); omitted keeps the historical all-scopes shape.
+  const dailyScope = ["global", "provider", "model"].includes(opts.dailyScope) ? opts.dailyScope : null;
   let daily = null;
   if (!dbUsable()) {
     daily = [...mem.daily.entries()]
@@ -927,18 +1330,27 @@ export async function getMetricsSnapshot(knownProviders, knownModels) {
           estimatedSpend: b.estimatedSpend,
         };
       })
+      .filter((r) => !dailyScope || r.scope === dailyScope)
       .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
   } else {
     try {
       await ensureSchema();
-      const rows = await sql`
-        SELECT day, scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
-               upstream_errors, fallbacks, tokens_input, tokens_output,
-               tokens_cache_read, tokens_cache_write, tokens_reasoning, estimated_spend
-        FROM gw_metrics_daily
-        ORDER BY day ASC
-      `;
-      daily = rows.map((r) => ({
+      const rowsDaily = dailyScope
+        ? await sql`
+            SELECT day, scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
+                   upstream_errors, fallbacks, tokens_input, tokens_output,
+                   tokens_cache_read, tokens_cache_write, tokens_reasoning, estimated_spend
+            FROM gw_metrics_daily WHERE scope = ${dailyScope}
+            ORDER BY day ASC
+          `
+        : await sql`
+            SELECT day, scope, name, requests, requests_2xx, requests_4xx, requests_5xx,
+                   upstream_errors, fallbacks, tokens_input, tokens_output,
+                   tokens_cache_read, tokens_cache_write, tokens_reasoning, estimated_spend
+            FROM gw_metrics_daily
+            ORDER BY day ASC
+          `;
+      daily = rowsDaily.map((r) => ({
         day: r.day instanceof Date ? r.day.toISOString().slice(0, 10) : String(r.day),
         scope: r.scope, name: r.name,
         requests: Number(r.requests) || 0,
@@ -974,4 +1386,27 @@ export async function getMetricsSnapshot(knownProviders, knownModels) {
     modelCount: modelNames.length,
     providerCount: providerNames.length,
   };
+}
+
+// Today's (WAT-day) recorded estimated spend for the global bucket. Read by
+// the optional MAX_DAILY_SPEND_USD spend ceiling in server.js. Never throws:
+// on any failure it reports what the in-memory fallback knows (usually 0),
+// so a metrics-store outage degrades the ceiling to "disabled" instead of
+// blocking traffic -- consistent with the fail-open discipline everywhere
+// else in this file.
+export async function getDailySpendUsd(day = localDay()) {
+  if (!dbUsable()) {
+    return mem.daily.get(`${day}|global|_`)?.estimatedSpend || 0;
+  }
+  try {
+    await ensureSchema();
+    const rows = await sql`
+      SELECT estimated_spend FROM gw_metrics_daily
+      WHERE day = ${day} AND scope = 'global' AND name = '_'
+    `;
+    return Number(rows[0]?.estimated_spend) || 0;
+  } catch (error) {
+    recordDbFailure(error);
+    return mem.daily.get(`${day}|global|_`)?.estimatedSpend || 0;
+  }
 }
