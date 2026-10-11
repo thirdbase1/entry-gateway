@@ -66,8 +66,53 @@
       border-radius: 50%;
     }
     .status-dot.connected { background: var(--emerald); }
+    .status-dot.reconnecting { background: var(--amber); }
     .status-dot.disconnected { background: var(--muted-foreground); }
+    .status-dot.stale { background: var(--amber); }
     .status-dot.error { background: var(--red); }
+
+    /* Keyboard focus visibility (a11y): every interactive element gets a
+       visible outline; the browser default is suppressed by nothing here --
+       we simply make it loud enough to see on the dark background. */
+    button:focus-visible, input:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    /* Visually hidden but available to screen readers */
+    .sr-only {
+      position: absolute;
+      width: 1px; height: 1px;
+      padding: 0; margin: -1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    /* Partial-data warning: softer than the red error banner so a flaky
+       sub-fetch (e.g. routes only) doesn't look like a total outage. */
+    .stale-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      border-radius: var(--radius);
+      border: 1px solid rgba(255, 138, 61, 0.25);
+      background: rgba(255, 138, 61, 0.06);
+      margin-bottom: 16px;
+      font-size: 13px;
+      color: var(--amber);
+    }
+
+    /* Footnotes under sections: counting-rule explanations, kept quiet. */
+    .section-footnote {
+      padding: 10px 20px 14px;
+      border-top: 1px solid var(--border);
+      font-size: 11.5px;
+      color: var(--muted-foreground);
+      line-height: 1.5;
+    }
 
     /* Connection bar */
     .conn-bar {
@@ -159,12 +204,10 @@
     /* Stat grid */
     .stat-grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
       gap: 16px;
       margin-bottom: 24px;
     }
-    @media (max-width: 900px) { .stat-grid { grid-template-columns: repeat(2, 1fr); } }
-    @media (max-width: 500px) { .stat-grid { grid-template-columns: 1fr; } }
 
     .stat-card {
       padding: 20px;
@@ -589,32 +632,37 @@
       <div class="subtitle">Real-time monitoring — per-provider and aggregate metrics</div>
     </div>
     <div style="display:flex;align-items:center;gap:12px;">
-      <div id="refreshInfo" class="refresh-info hidden">
-        <div class="spinner"></div>
+      <div id="refreshInfo" class="refresh-info hidden" aria-live="polite">
+        <div class="spinner" aria-hidden="true"></div>
         <span id="refreshTime">—</span>
       </div>
-      <div id="statusBadge" class="status-badge">
-        <span class="status-dot disconnected"></span>
+      <div id="statusBadge" class="status-badge" role="status" aria-live="polite">
+        <span class="status-dot disconnected" aria-hidden="true"></span>
         <span id="statusText">Disconnected</span>
       </div>
     </div>
   </div>
 
+  <div id="staleBanner" class="stale-banner hidden" role="status">
+    <span aria-hidden="true">⏳</span>
+    <span id="staleText">Showing data from the last successful update.</span>
+  </div>
+
   <!-- Connection bar -->
   <div class="conn-bar" id="conn-bar">
     <div class="field">
-      <label>Gateway URL</label>
-      <input type="url" id="gwUrl" placeholder="https://your-gateway.example.com" value="">
+      <label for="gwUrl">Gateway URL</label>
+      <input type="url" id="gwUrl" name="gateway-url" autocomplete="off" spellcheck="false" placeholder="https://your-gateway.example.com" value="">
     </div>
     <div class="field">
-      <label>Admin API Key</label>
-      <input type="password" id="gwKey" placeholder="gw_live_...">
+      <label for="gwKey">Admin API Key (only if auto-auth is disabled)</label>
+      <input type="password" id="gwKey" name="gateway-key" autocomplete="off" placeholder="gw_live_...">
     </div>
-    <button class="btn btn-primary" id="connectBtn" onclick="connect()">Connect</button>
-    <button class="btn btn-outline hidden" id="refreshBtn" onclick="refresh()">↻</button>
+    <button class="btn btn-primary" id="connectBtn">Connect</button>
+    <button class="btn btn-outline hidden" id="refreshBtn" aria-label="Refresh now">↻</button>
   </div>
 
-  <div id="errorBanner" class="error-banner hidden"></div>
+  <div id="errorBanner" class="error-banner hidden" role="alert"></div>
 
   <!-- Empty state -->
   <div id="emptyState" class="empty-state">
@@ -638,22 +686,24 @@
     <div class="two-col">
       <div class="section-card">
         <div class="section-header">
-          <h2><span class="sec-icon">⏱</span> Latency Distribution</h2>
+          <h2><span class="sec-icon" aria-hidden="true">⏱</span> Latency Distribution</h2>
         </div>
         <div class="section-body" id="latencySection"></div>
+        <div class="section-footnote">Percentiles (nearest-rank) and mean over the most recent 500 recorded upstream attempts, all-time. TTFT = time to first streamed byte. A p95/p99 clustered at the upstream timeout ceiling means that share of attempts is hitting the hard timeout, not that every request is slow.</div>
       </div>
       <div class="section-card">
         <div class="section-header">
-          <h2><span class="sec-icon">📡</span> Request Status</h2>
+          <h2><span class="sec-icon" aria-hidden="true">📡</span> Request Status</h2>
         </div>
         <div class="section-body" id="statusSection"></div>
+        <div class="section-footnote">Counts upstream attempts (a request retried on a fallback route counts once per attempt). Status 0 = the attempt produced no upstream response: client disconnect, timeout, circuit-open rejection, or gateway config error. All proxied traffic is POST.</div>
       </div>
     </div>
 
     <!-- Per-provider table -->
     <div class="section-card">
       <div class="section-header">
-        <h2><span class="sec-icon">🔌</span> Per-Provider Breakdown</h2>
+        <h2><span class="sec-icon" aria-hidden="true">🔌</span> Per-Provider Breakdown</h2>
         <span class="badge" id="providerCount">0 providers</span>
       </div>
       <div class="section-body" style="padding:0;overflow-x:auto;">
@@ -664,7 +714,7 @@
     <!-- Daily history (gw_metrics_daily, since 2026-09-10) -->
     <div class="section-card" id="dailyCard" style="display:none;">
       <div class="section-header">
-        <h2><span class="sec-icon">📅</span> Daily History (Nigeria time)</h2>
+        <h2><span class="sec-icon" aria-hidden="true">📅</span> Daily History (Nigeria time)</h2>
         <span class="badge" id="dailyBadge">—</span>
       </div>
       <div class="section-body" style="padding:0;overflow-x:auto;">
@@ -675,7 +725,7 @@
     <!-- Cache hit rate by model -->
     <div class="section-card">
       <div class="section-header">
-        <h2><span class="sec-icon">💎</span> Cache Hit Rate by Model</h2>
+        <h2><span class="sec-icon" aria-hidden="true">💎</span> Cache Hit Rate by Model</h2>
         <span class="badge" id="cacheAvgBadge">—</span>
       </div>
       <div class="section-body" id="cacheHitSection"></div>
@@ -684,7 +734,7 @@
     <!-- Circuit breakers -->
     <div class="section-card">
       <div class="section-header">
-        <h2><span class="sec-icon">⚡</span> Circuit Breakers</h2>
+        <h2><span class="sec-icon" aria-hidden="true">⚡</span> Circuit Breakers</h2>
       </div>
       <div class="section-body" id="circuitSection"></div>
     </div>
@@ -692,7 +742,7 @@
     <!-- Routes -->
     <div class="section-card">
       <div class="section-header">
-        <h2><span class="sec-icon">🛤</span> Model Routes</h2>
+        <h2><span class="sec-icon" aria-hidden="true">🛤</span> Model Routes</h2>
         <span class="badge" id="routeCount">0 routes</span>
       </div>
       <div class="section-body" style="padding:0;overflow-x:auto;">
@@ -703,7 +753,7 @@
     <!-- Models -->
     <div class="section-card">
       <div class="section-header">
-        <h2><span class="sec-icon">✦</span> Available Models</h2>
+        <h2><span class="sec-icon" aria-hidden="true">✦</span> Available Models</h2>
         <span class="badge" id="modelCount">0 models</span>
       </div>
       <div class="section-body" id="modelsSection"></div>
@@ -712,10 +762,64 @@
   </div>
 
   <script>
+    // Everything below runs inside an IIFE on purpose: no dashboard state
+    // (connection settings, the optional pasted API key, poll timers, last
+    // payloads) is reachable from the DevTools console as a global, and no
+    // credential is ever written into the DOM after connect (the key input
+    // is cleared; a pasted key lives only in this closure). The page's
+    // read-only auth normally flows through the HttpOnly session cookie,
+    // which JavaScript cannot read at all.
+    (function () {
+    'use strict';
     let baseUrl = '';
     let apiKey = '';
-    let connected = false;
+    let connected = false;      // at least one fully successful fetch has happened
     let pollTimer = null;
+    let pollIntervalMs = 5000;
+    let fetchInFlight = false;  // never overlap polls
+    let fetchGeneration = 0;    // out-of-order response guard
+    let consecutiveFailures = 0;
+    let lastGoodUpdate = 0;     // epoch ms of the last successful fetchAll
+    const BASE_POLL_MS = 5000, MAX_POLL_MS = 30000, STALE_AFTER_MS = 15000;
+    // Last-known-good payloads per source, so a transient failure of ONE
+    // sub-fetch (e.g. /v1/debug/routes) keeps rendering its previous data
+    // instead of blanking that section to an empty state.
+    const lastGood = { health: null, metrics: null, models: null, routes: null };
+
+    const $ = id => document.getElementById(id);
+
+    function setStatus(state, text) {
+      const badge = $('statusBadge');
+      if (!badge) return;
+      const dotClass = { connected: 'connected', reconnecting: 'reconnecting', stale: 'stale', disconnected: 'disconnected', error: 'error' }[state] || 'disconnected';
+      badge.innerHTML = `<span class="status-dot ${dotClass}" aria-hidden="true"></span><span id="statusText">${text}</span>`;
+    }
+
+    function showError(msg) {
+      const b = $('errorBanner');
+      if (!b) return;
+      b.textContent = '⚠ ' + msg;
+      b.classList.remove('hidden');
+    }
+    function clearError() { $('errorBanner')?.classList.add('hidden'); }
+    function showStale(on, text) {
+      const b = $('staleBanner');
+      if (!b) return;
+      if (text) $('staleText').textContent = text;
+      b.classList.toggle('hidden', !on);
+    }
+
+    function scheduleNextPoll() {
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(pollTick, pollIntervalMs);
+    }
+
+    async function pollTick() {
+      if (document.hidden) { scheduleNextPoll(); return; } // don't hammer a hidden tab
+      if (fetchInFlight) { scheduleNextPoll(); return; }
+      try { await fetchAll(); } catch { /* surfaced via status/banner */ }
+      scheduleNextPoll();
+    }
 
     // ─── Helpers ─────────────────────────────────────────────────
     function fmtNum(n) {
@@ -749,185 +853,322 @@
       return '';
     }
 
+    // Write only when the markup actually changed: at a 5s cadence most
+    // sections are identical, and skipping identical innerHTML avoids both
+    // needless DOM churn and the CSS animations (cache bar sheen) visibly
+    // restarting on every poll.
+    function setSection(id, html) {
+      const el = $(id);
+      if (!el || el.innerHTML === html) return;
+      el.innerHTML = html;
+    }
+
     // ─── Connection ──────────────────────────────────────────────
     async function connect() {
-      const urlEl = document.getElementById('gwUrl');
-      const keyEl = document.getElementById('gwKey');
-      baseUrl = urlEl.value.trim().replace(/\/+$/, '');
-      apiKey = keyEl.value.trim();
+      const urlEl = $('gwUrl');
+      const keyEl = $('gwKey');
+      baseUrl = (urlEl?.value || '').trim().replace(/\/+$/, '');
+      apiKey = (keyEl?.value || '').trim();
+      // The key must not linger in the DOM: after reading it once, keep it
+      // only in this closure. (The input is type=password and stays masked
+      // while typing; it is only ever a fallback for ADMIN_AUTOAUTH=0.)
+      if (keyEl) keyEl.value = '';
       if (!baseUrl) return;
 
-      document.getElementById('connectBtn').textContent = 'Connecting…';
-      document.getElementById('errorBanner').classList.add('hidden');
+      const btn = $('connectBtn');
+      btn.disabled = true;
+      btn.textContent = 'Connecting…';
+      clearError();
+      setStatus('reconnecting', 'Connecting…');
 
       try {
         await fetchAll();
-        connected = true;
-        document.getElementById('emptyState').classList.add('hidden');
-        document.getElementById('dashboard').classList.remove('hidden');
-        document.getElementById('connectBtn').textContent = 'Reconnect';
-        document.getElementById('refreshBtn').classList.remove('hidden');
-        document.getElementById('statusBadge').innerHTML = '<span class="status-dot connected"></span><span>Connected</span>';
-
-        if (pollTimer) clearInterval(pollTimer);
-        pollTimer = setInterval(fetchAll, 5000);
+        pollIntervalMs = BASE_POLL_MS;
+        consecutiveFailures = 0;
+        scheduleNextPoll();
       } catch (e) {
         connected = false;
-        document.getElementById('errorBanner').textContent = '⚠ ' + e.message;
-        document.getElementById('errorBanner').classList.remove('hidden');
-        document.getElementById('connectBtn').textContent = 'Connect';
-        document.getElementById('statusBadge').innerHTML = '<span class="status-dot error"></span><span>Error</span>';
+        showError(e.message || 'Failed to connect');
+        setStatus('error', 'Error');
+        btn.textContent = 'Connect';
+      } finally {
+        btn.disabled = false;
       }
     }
 
     async function refresh() {
-      try { await fetchAll(); } catch (e) {
-        document.getElementById('errorBanner').textContent = '⚠ ' + e.message;
-        document.getElementById('errorBanner').classList.remove('hidden');
-      }
+      try { await fetchAll(); } catch (e) { showError(e.message || 'Refresh failed'); }
+    }
+
+    function fetchJson(source, path) {
+      const headers = {};
+      if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+      return fetch(baseUrl + path, { headers }).then(r => {
+        if (!r.ok) throw new Error(source + ': HTTP ' + r.status);
+        return r.json();
+      });
     }
 
     async function fetchAll() {
-      const headers = {};
-      if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+      if (fetchInFlight) return;
+      fetchInFlight = true;
+      const gen = ++fetchGeneration;
+      $('refreshInfo')?.classList.remove('hidden');
 
-      document.getElementById('refreshInfo').classList.remove('hidden');
-
-      const [healthRes, metricsRes, modelsRes, routesRes] = await Promise.allSettled([
-        fetch(baseUrl + '/health', { headers }).then(r => r.ok ? r.json() : Promise.reject(new Error('Health: ' + r.status))),
-        fetch(baseUrl + '/metrics', { headers }).then(r => r.ok ? r.json() : Promise.reject(new Error('Metrics: ' + r.status))),
-        fetch(baseUrl + '/v1/models', { headers }).then(r => r.ok ? r.json() : Promise.reject(new Error('Models: ' + r.status))),
-        fetch(baseUrl + '/v1/debug/routes', { headers }).then(r => r.ok ? r.json() : Promise.reject(new Error('Routes: ' + r.status))),
+      const results = await Promise.allSettled([
+        fetchJson('Health', '/health'),
+        fetchJson('Metrics', '/metrics?daily=global'),
+        fetchJson('Models', '/v1/models'),
+        fetchJson('Routes', '/v1/debug/routes'),
       ]);
+      const [healthRes, metricsRes, modelsRes, routesRes] = results;
+      const failed = results.filter(r => r.status === 'rejected');
 
-      const health = healthRes.status === 'fulfilled' ? healthRes.value : null;
-      const metrics = metricsRes.status === 'fulfilled' ? metricsRes.value : null;
-      const models = modelsRes.status === 'fulfilled' ? modelsRes.value : null;
-      const routes = routesRes.status === 'fulfilled' ? routesRes.value : null;
+      // A newer fetch already completed (or a fresh connect() cycle began):
+      // drop this stale snapshot entirely so an old response can never
+      // overwrite newer dashboard data.
+      if (gen !== fetchGeneration) { fetchInFlight = false; return; }
+      fetchInFlight = false;
 
-      const rejected = [metricsRes, modelsRes, routesRes].filter(r => r.status === 'rejected');
-      if (!health) throw new Error(healthRes.reason?.message || 'Failed to connect');
-      if (rejected.length === 3) {
-        // Auto-auth session rejected or expired -- re-open the key bar so a
-        // key can still be entered manually.
-        document.getElementById('conn-bar')?.style && (document.getElementById('conn-bar').style.display = '');
-        throw new Error(rejected[0].reason?.message || 'Unauthorized');
+      const allFailed = failed.length === results.length;
+      if (allFailed) {
+        consecutiveFailures += 1;
+        // Exponential backoff, capped; reset on the next success.
+        pollIntervalMs = Math.min(MAX_POLL_MS, BASE_POLL_MS * Math.pow(2, consecutiveFailures - 1));
+        if (connected) {
+          setStatus(consecutiveFailures >= 3 ? 'error' : 'reconnecting',
+            consecutiveFailures >= 3 ? 'Disconnected — retrying' : 'Reconnecting…');
+          showStale(true, lastGoodUpdate
+            ? `Connection problem — showing data from ${new Date(lastGoodUpdate).toLocaleTimeString()}. Retrying every ${Math.round(pollIntervalMs / 1000)}s.`
+            : 'Connection problem — no data received yet.');
+        } else {
+          setStatus('error', 'Error');
+        }
+        showError(failed[0].reason?.message || 'All gateway requests failed');
+        $('refreshInfo')?.classList.add('hidden');
+        throw failed[0].reason || new Error('Failed to connect');
       }
 
-      render(health, metrics, models, routes);
-      document.getElementById('refreshTime').textContent = new Date().toLocaleTimeString();
-      document.getElementById('refreshInfo').classList.add('hidden');
+      // Partial failure: keep rendering. Sections whose sub-fetch failed keep
+      // their last-known-good payload and a soft amber note explains why the
+      // numbers may lag; a full red banner is reserved for total outages.
+      const partial = failed.length > 0;
+      if (healthRes.status === 'fulfilled') lastGood.health = healthRes.value;
+      if (metricsRes.status === 'fulfilled') lastGood.metrics = metricsRes.value;
+      if (modelsRes.status === 'fulfilled') lastGood.models = modelsRes.value;
+      if (routesRes.status === 'fulfilled') lastGood.routes = routesRes.value;
+
+      if (!lastGood.health) {
+        // Health is the one payload the dashboard cannot render without.
+        throw (healthRes.status === 'rejected' && healthRes.reason) || new Error('Health: unavailable');
+      }
+
+      consecutiveFailures = 0;
+      pollIntervalMs = BASE_POLL_MS;
+      lastGoodUpdate = Date.now();
+      clearError();
+      showStale(partial, 'Partial update: ' + failed.map(f => f.reason?.message).filter(Boolean).join(', ') + ' failed — other sections show data from ' + new Date(lastGoodUpdate).toLocaleTimeString() + '.');
+      // Authed endpoints rejected while /health (unauthenticated) still
+      // worked: the auto-auth session expired or ADMIN_AUTOAUTH is off.
+      // Re-open the connection bar so a key can be entered manually.
+      if (failed.some(f => /HTTP 40[13]/.test(f.reason?.message || ''))) {
+        const bar = $('conn-bar');
+        if (bar) {
+          bar.style.display = '';
+          bar.querySelector('#gwKey')?.closest('.field')?.classList.remove('hidden');
+        }
+      }
+
+      const firstConnect = !connected;
+      connected = true;
+      setStatus('connected', 'Connected');
+      if (firstConnect) {
+        $('emptyState').classList.add('hidden');
+        $('dashboard').classList.remove('hidden');
+        $('connectBtn').textContent = 'Reconnect';
+        $('refreshBtn')?.classList.remove('hidden');
+      }
+
+      render(lastGood.health, lastGood.metrics, lastGood.models, lastGood.routes);
+
+      $('refreshTime').textContent = 'Updated ' + new Date(lastGoodUpdate).toLocaleTimeString();
+      $('refreshInfo')?.classList.add('hidden');
     }
+
+    // Staleness watch: if no good snapshot arrives for STALE_AFTER_MS while
+    // polling is healthy, visibly downgrade to "stale" without killing the
+    // connection state (the next successful poll clears it).
+    setInterval(() => {
+      if (!connected || fetchInFlight) return;
+      const age = Date.now() - lastGoodUpdate;
+      if (age > STALE_AFTER_MS && consecutiveFailures === 0) {
+        setStatus('stale', 'Stale — retrying');
+        showStale(true, 'No successful update for ' + Math.round(age / 1000) + 's — data may be out of date.');
+      }
+    }, 3000);
 
     // ─── Rendering ──────────────────────────────────────────────
     function render(health, metrics, models, routes) {
       const g = metrics?.global || {};
 
-      // Stat cards
+      // Stat cards. Hierarchy: volume -> latency -> errors -> tokens -> spend.
+      // "Avg" is the mean the backend now reports (the old card showed p50
+      // mislabeled as an average); active = genuinely in-flight upstream
+      // attempts (lease-based, see the backend definitions object).
+      const errRate = g.requests ? ((g.upstreamErrors || 0) / g.requests) * 100 : 0;
       const stats = [
-        { label: 'Total Requests', value: fmtNum(g.requests || 0), sub: (metrics?.activeRequests || 0) + ' active', icon: '📡', accent: false },
-        { label: 'Avg Latency', value: g.latency ? fmtLat(g.latency.p50) : '—', sub: g.latency ? 'p95: ' + fmtLat(g.latency.p95) : '', icon: '⏱', accent: false },
-        { label: 'Total Tokens', value: fmtNum((g.tokens?.total) || 0), sub: fmtNum((g.tokens?.cacheRead || 0)) + ' cache-read included', icon: '📈', accent: false },
-        { label: 'Est. Spend', value: fmtMoney(g.estimatedSpend || 0), sub: (g.upstreamErrors || 0) + ' upstream errors', icon: '$', accent: true },
+        { label: 'Upstream Attempts', value: fmtNum(g.requests || 0), sub: (metrics?.activeRequests ?? 0) + ' in-flight now', icon: '📡', accent: false, title: 'One record per upstream attempt; fallback retries count once per attempt.' },
+        { label: 'Avg Latency', value: g.latency ? fmtLat(g.latency.avg || g.latency.p50) : '—', sub: g.latency ? 'p50 ' + fmtLat(g.latency.p50) + ' · p95 ' + fmtLat(g.latency.p95) : '', icon: '⏱', accent: false, title: 'Arithmetic mean of the last 500 recorded attempts; p50/p95 below.' },
+        { label: 'Upstream Errors', value: fmtNum(g.upstreamErrors || 0), sub: g.requests ? errRate.toFixed(1) + '% of attempts' : 'no attempts yet', icon: '⚠️', accent: (g.upstreamErrors || 0) > 0, title: '5xx/429 responses, transport errors and timeouts. Excludes client disconnects and circuit-open rejections.' },
+        { label: 'Total Tokens', value: fmtNum((g.tokens?.total) || 0), sub: fmtNum((g.tokens?.cacheRead || 0)) + ' cache-read · ' + fmtNum((g.tokens?.cacheWrite || 0)) + ' cache-write', icon: '📈', accent: false, title: 'input (uncached) + cacheRead + cacheWrite + output.' },
+        { label: 'Est. Spend', value: fmtMoney(g.estimatedSpend || 0), sub: 'estimated · all-time', icon: '$', accent: true, title: 'Computed from each route\'s configured per-million prices — an estimate, not a provider invoice.' },
       ];
-      document.getElementById('statGrid').innerHTML = stats.map(s => `
+      setSection('statGrid', stats.map(s => `
         <div class="stat-card">
-          <div class="icon-wrap ${s.accent ? 'accent' : ''}" style="font-size:16px;">${s.icon}</div>
+          <div class="icon-wrap ${s.accent ? 'accent' : ''}" style="font-size:16px;" aria-hidden="true">${s.icon}</div>
           <div class="label">${s.label}</div>
-          <div class="value ${s.accent ? 'accent' : ''}">${s.value}</div>
+          <div class="value ${s.accent ? 'accent' : ''}" title="${escapeHtml(s.title || '')}">${s.value}</div>
           ${s.sub ? `<div class="sublabel">${s.sub}</div>` : ''}
         </div>
-      `).join('');
+      `).join(''));
 
       // Latency
       const lat = g.latency;
       if (lat && lat.count) {
+        const max = Math.max(lat.p50, lat.p95, lat.p99, lat.avg || 0, 1);
         const segs = [
-          { label: 'p50', val: lat.p50, max: Math.max(lat.p50, lat.p95, lat.p99, 1) },
-          { label: 'p95', val: lat.p95, max: Math.max(lat.p50, lat.p95, lat.p99, 1) },
-          { label: 'p99', val: lat.p99, max: Math.max(lat.p50, lat.p95, lat.p99, 1) },
-        ];
-        document.getElementById('latencySection').innerHTML = segs.map(s => `
+          { label: 'avg', val: lat.avg },
+          { label: 'p50', val: lat.p50 },
+          { label: 'p95', val: lat.p95 },
+          { label: 'p99', val: lat.p99 },
+        ].filter(s => s.val != null);
+        // Timeout-ceiling cluster: when p95 and p99 both sit at (or within a
+        // rounding of) the configured hard upstream timeout, the "tail" is
+        // not slow requests -- it is the timeout population stacked at one
+        // value. Gated on the gateway-reported timeout so ordinary tight
+        // clusters at low latency never trigger it.
+        const ceilingMs = Number(metrics?.definitions?.upstreamTimeoutMs) || 120000;
+        const clustered = lat.p95 > 0 && lat.p99 >= ceilingMs * 0.9;
+        setSection('latencySection', segs.map(s => `
           <div class="latency-row">
             <span class="pct-label">${s.label}</span>
-            <div class="bar-track"><div class="bar-fill" style="width:${(s.val / s.max) * 100}%"></div></div>
+            <div class="bar-track"><div class="bar-fill" style="width:${(s.val / max) * 100}%"></div></div>
             <span class="val">${fmtLat(s.val)}</span>
           </div>
-        `).join('') + `
+        `).join('') + (clustered ? `
+          <div class="section-footnote" style="border:none;padding:6px 0 0;color:var(--amber);">p95–p99 cluster at ${fmtLat(lat.p99)} — that tail is the upstream timeout population, not gradual slowness.</div>
+        ` : '') + `
           <div class="latency-footer">
             <span>min: ${fmtLat(lat.min)}</span>
             <span>max: ${fmtLat(lat.max)}</span>
-            <span>count: ${lat.count}</span>
+            <span>samples: ${lat.count}</span>
+            ${g.ttft && g.ttft.count ? `<span>ttft p50: ${fmtLat(g.ttft.p50)}</span>` : ''}
           </div>
-        `;
+        `);
       } else {
-        document.getElementById('latencySection').innerHTML = '<div style="color:var(--muted-foreground);font-size:13px;">No latency data yet</div>';
+        setSection('latencySection', '<div style="color:var(--muted-foreground);font-size:13px;">No latency data yet</div>');
       }
 
-      // Status breakdown
+      // Status breakdown — attempts by resulting status. There is no method
+      // column: the gateway only records proxied POST traffic, and the old
+      // hardcoded "GET" label on every row was simply wrong.
       const sb = g.statusBreakdown || {};
       const entries = Object.entries(sb).map(([k, v]) => ({ status: parseInt(k), count: v })).sort((a, b) => b.count - a.count);
       const total = entries.reduce((s, e) => s + e.count, 0);
       if (entries.length) {
-        document.getElementById('statusSection').innerHTML = entries.map(e => {
+        setSection('statusSection', entries.map(e => {
           const pct = (e.count / total) * 100;
           const cls = e.status >= 200 && e.status < 300 ? 'var(--emerald)' : e.status >= 400 && e.status < 500 ? 'var(--amber)' : 'var(--red)';
-          const textCls = e.status >= 200 && e.status < 300 ? 'var(--emerald)' : e.status >= 400 && e.status < 500 ? 'var(--amber)' : 'var(--red)';
+          const label = e.status === 0 ? 'no upstream response' : 'HTTP ' + e.status;
           return `
             <div class="status-row">
-              <span class="method">GET</span>
-              <span class="code" style="color:${textCls}">${e.status}</span>
+              <span class="code" style="color:${cls};width:44px;" title="${escapeHtml(label)}">${e.status === 0 ? 'n/a' : e.status}</span>
               <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${cls}"></div></div>
               <span class="count">${e.count}</span>
             </div>
           `;
-        }).join('');
+        }).join('') + `
+          <div class="section-footnote" style="border:none;padding:8px 0 0;">Share of ${total} recorded attempts. Status <span class="mono">n/a</span> rows had no upstream response (disconnect, timeout, circuit open, or config error).</div>
+        `);
       } else {
-        document.getElementById('statusSection').innerHTML = '<div style="color:var(--muted-foreground);font-size:13px;">No request data yet</div>';
+        setSection('statusSection', '<div style="color:var(--muted-foreground);font-size:13px;">No request data yet</div>');
       }
 
-      // Per-provider table
+      // Per-provider table. Health is the WORST breaker state across all of
+      // that provider's models (the old code took the FIRST matching key,
+      // so one closed breaker could hide an open one), parsed with the
+      // "model:" prefix stripped -- model ids containing ":" (e.g.
+      // "qwen3.8-flash:free") broke the old split(':')[1] parsing. A
+      // provider with no breaker rows has never tripped one, which is not
+      // the same as "verified healthy": absence is labelled as such, and
+      // the error rate is always shown next to the state so a green
+      // breaker with a high 4xx/5xx rate is still visible.
       const byProv = metrics?.byProvider || {};
       const provNames = Object.keys(byProv);
       document.getElementById('providerCount').textContent = provNames.length + ' provider' + (provNames.length !== 1 ? 's' : '');
 
+      const CB_RANK = { open: 3, half_open: 2, closed: 1 };
+      const worstBreakerState = states => states.reduce((worst, s) => (CB_RANK[s] || 0) > (CB_RANK[worst] || 0) ? s : worst, '');
+      const breakerModel = key => key.startsWith('model:') ? key.slice('model:'.length) : (key.includes(':') ? key.slice(key.indexOf(':') + 1) : key);
+      // Unified breaker view: /metrics carries full objects (state, failures,
+      // openedAt, identity) while /health carries bare state strings -- the
+      // provider table needs the worst state AND openedAt, so normalize both
+      // into one map (snapshot wins; /health fills anything it has extra).
+      const cbStates = {};
+      for (const [k, v] of Object.entries(metrics?.circuitBreakers || {})) {
+        cbStates[k] = typeof v === 'string' ? { state: v } : v;
+      }
+      for (const [k, v] of Object.entries(health.circuitBreakers || {})) {
+        if (!cbStates[k]) cbStates[k] = typeof v === 'string' ? { state: v } : v;
+      }
+
       if (provNames.length) {
-        const cbStates = health.circuitBreakers || {};
-        document.getElementById('providerTable').innerHTML = `
+        const now = Date.now();
+        setSection('providerTable', `
           <thead><tr>
-            <th>Provider</th>
-            <th class="num">Requests</th>
-            <th class="num">2xx</th>
-            <th class="num">4xx</th>
-            <th class="num">5xx</th>
-            <th class="num">Tokens In</th>
-            <th class="num">Tokens Out</th>
-            <th class="num">Spend</th>
-            <th class="num">p50</th>
-            <th class="num">Errors</th>
-            <th>Health</th>
+            <th scope="col">Provider</th>
+            <th scope="col" class="num">Attempts</th>
+            <th scope="col" class="num">2xx</th>
+            <th scope="col" class="num">4xx</th>
+            <th scope="col" class="num">5xx</th>
+            <th scope="col" class="num">Tokens In</th>
+            <th scope="col" class="num">Tokens Out</th>
+            <th scope="col" class="num">Spend</th>
+            <th scope="col" class="num">p50</th>
+            <th scope="col" class="num">Upstream Err</th>
+            <th scope="col">Breaker / Health</th>
           </tr></thead>
           <tbody>
             ${provNames.map(name => {
               const p = byProv[name];
-              // Breakers are per-model since the 2026-09 hardening pass
-              // (keys like "model:<id>:<id>"), so a provider row's health is
-              // the worst state across all of that provider's models. The
-              // model->provider mapping comes from the live routes list;
-              // legacy pre-hardening keys ("provider:model") still match the
-              // old prefix during the transition.
               const provModels = new Set(
                 (routes?.routes || []).filter(r => (r.provider || r.upstreamApiKeyEnv || 'unknown') === name).map(r => r.id)
               );
-              const cbKey = Object.keys(cbStates).find(k =>
-                k.startsWith('model:') && provModels.has(k.split(':')[1])
-              ) || Object.keys(cbStates).find(k => k.startsWith(name + ':'));
-              const cbState = cbKey ? cbStates[cbKey] : 'closed';
-              const healthColor = cbState === 'closed' ? 'var(--emerald)' : cbState === 'half_open' ? 'var(--amber)' : 'var(--red)';
+              const matchingKeys = Object.keys(cbStates).filter(k =>
+                (k.startsWith('model:') && provModels.has(k.slice('model:'.length)))
+                || k.startsWith(name + ':')
+              );
+              const worst = worstBreakerState(matchingKeys.map(k => cbStates[k]?.state || 'closed'));
+              const breakerState = worst || 'no breaker';
+              const breakerColor = worst === 'open' ? 'var(--red)' : worst === 'half_open' ? 'var(--amber)' : 'var(--emerald)';
+              // A breaker left "open" past its 30s cooldown only transitions
+              // when the next request reads it -- if no traffic has arrived,
+              // it still displays as open. Say so instead of looking like a
+              // live outage.
+              const staleOpen = worst === 'open' && matchingKeys.some(k => {
+                const openedAt = cbStates[k]?.openedAt || 0;
+                return openedAt && now - openedAt > 30000;
+              });
+              const attemptCount = p.requests || 0;
+              const errCount = (p.upstreamErrors || 0);
+              const errPct = attemptCount ? (errCount / attemptCount) * 100 : 0;
+              const healthTitle = worst
+                ? `Worst circuit-breaker state across ${matchingKeys.length} breaker row(s) for this provider's models.`
+                : 'No circuit-breaker rows exist for this provider — it has never tripped one. Not a guarantee of health; check the error rate.';
               return `
                 <tr>
                   <td class="provider-name">${escapeHtml(name)}</td>
-                  <td class="num">${p.requests || 0}</td>
+                  <td class="num">${attemptCount}</td>
                   <td class="num" style="color:var(--emerald)">${p.requests2xx || 0}</td>
                   <td class="num" style="color:var(--amber)">${p.requests4xx || 0}</td>
                   <td class="num" style="color:var(--red)">${p.requests5xx || 0}</td>
@@ -935,15 +1176,18 @@
                   <td class="num">${fmtNum(p.tokens?.output || 0)}</td>
                   <td class="num" style="color:var(--accent)">${fmtMoney(p.estimatedSpend || 0)}</td>
                   <td class="num">${p.latency ? fmtLat(p.latency.p50) : '—'}</td>
-                  <td class="num">${p.upstreamErrors || 0}</td>
-                  <td><span class="health-dot" style="background:${healthColor}"></span>${cbState}</td>
+                  <td class="num" style="${errPct >= 5 ? 'color:var(--red);font-weight:600;' : ''}" title="upstream errors / attempts (5xx, 429, transport, timeout)">${errCount}${attemptCount ? ` <span style="color:var(--muted-foreground);font-weight:400">(${errPct.toFixed(1)}%)</span>` : ''}</td>
+                  <td title="${escapeHtml(healthTitle)}">
+                    <span class="health-dot" style="background:${breakerColor}"></span>${escapeHtml(breakerState)}${staleOpen ? ' <span style="color:var(--muted-foreground);font-size:11px;" title="Cooldown elapsed -- the breaker probes again on the next request">(cooldown elapsed)</span>' : ''}
+                    ${attemptCount ? `<div style="font-size:11px;color:${errPct >= 5 ? 'var(--red)' : 'var(--muted-foreground)'};margin-top:2px;">${errPct.toFixed(1)}% upstream err</div>` : ''}
+                  </td>
                 </tr>
               `;
             }).join('')}
           </tbody>
-        `;
+        `);
       } else {
-        document.getElementById('providerTable').innerHTML = '<tbody><tr><td style="padding:20px;color:var(--muted-foreground);">No provider data yet</td></tr></tbody>';
+        setSection('providerTable', '<tbody><tr><td style="padding:20px;color:var(--muted-foreground);">No provider data yet</td></tr></tbody>');
       }
 
       // Daily history (per-day rollups at 12am Nigeria/WAT time, unbounded retention).
@@ -962,15 +1206,15 @@
           dailyRows.length + ' day' + (dailyRows.length !== 1 ? 's' : '') + ' · unbounded retention';
         const maxReq = Math.max(...dailyRows.map(r => r.requests || 0), 1);
         if (dailyRows.length) {
-          document.getElementById('dailyTable').innerHTML = `
+          setSection('dailyTable', `
             <thead><tr>
-              <th>Day (WAT)</th>
-              <th class="num">Requests</th>
-              <th class="num">2xx</th>
-              <th class="num">4xx</th>
-              <th class="num">5xx</th>
-              <th class="num">Errors</th>
-              <th class="num">Spend</th>
+              <th scope="col">Day (WAT)</th>
+              <th scope="col" class="num">Requests</th>
+              <th scope="col" class="num">2xx</th>
+              <th scope="col" class="num">4xx</th>
+              <th scope="col" class="num">5xx</th>
+              <th scope="col" class="num">Errors</th>
+              <th scope="col" class="num">Spend</th>
             </tr></thead>
             <tbody>
               ${dailyRows.map(r => `
@@ -990,13 +1234,13 @@
                 </tr>
               `).join('')}
             </tbody>
-          `;
+          `);
         } else {
-          document.getElementById('dailyTable').innerHTML = `
+          setSection('dailyTable', `
             <tbody><tr><td style="color:var(--muted-foreground);font-size:13px;padding:16px 20px;">
               No history recorded yet — days appear here as requests flow. Retention is unbounded (nothing is ever trimmed).
             </td></tr></tbody>
-          `;
+          `);
         }
       } else {
         dailyCard.style.display = 'none';
@@ -1042,7 +1286,7 @@
         const avgPct = totalDenom > 0 ? (totalCacheRead / totalDenom) * 100 : 0;
         document.getElementById('cacheAvgBadge').textContent = avgPct.toFixed(1) + '% avg';
 
-        document.getElementById('cacheHitSection').innerHTML = cacheRows.map(r => {
+        setSection('cacheHitSection', cacheRows.map(r => {
           const color = r.pct >= 60 ? 'var(--emerald)' : r.pct >= 25 ? 'var(--accent)' : r.pct > 0 ? 'var(--amber)' : 'var(--muted-foreground)';
           const gradient = r.pct >= 60
             ? 'linear-gradient(90deg, var(--accent), var(--emerald))'
@@ -1061,35 +1305,60 @@
             <span>${cacheRows.length} model${cacheRows.length !== 1 ? 's' : ''} with traffic</span>
             <span>${fmtNum(totalCacheRead)} / ${fmtNum(totalDenom)} prompt tokens served from cache</span>
           </div>
-        `;
+        `);
       } else {
         document.getElementById('cacheAvgBadge').textContent = '—';
-        document.getElementById('cacheHitSection').innerHTML = '<div style="color:var(--muted-foreground);font-size:13px;">No request traffic yet</div>';
+        setSection('cacheHitSection', '<div style="color:var(--muted-foreground);font-size:13px;">No request traffic yet</div>');
       }
 
-      // Circuit breakers
-      const cbEntries = Object.entries(health.circuitBreakers || {});
+      // Circuit breakers. Prefer the /metrics snapshot (full details:
+      // failures, openedAt, identity) over /health's bare state strings, so
+      // an "open" breaker whose 30s cooldown already elapsed can be
+      // annotated instead of reading like a live outage. "closed" means the
+      // breaker tripped before and has recovered -- it is NOT a promise the
+      // provider is healthy right now; the per-provider error rates above
+      // carry that signal.
+      const cbSnapshot = metrics?.circuitBreakers || {};
+      const cbEntries = Object.entries(cbSnapshot).map(([key, cb]) => ({
+        key,
+        state: typeof cb === 'string' ? cb : (cb?.state || 'closed'),
+        failures: typeof cb === 'object' ? cb?.failures : null,
+        openedAt: typeof cb === 'object' ? cb?.openedAt : null,
+        identity: typeof cb === 'object' ? cb?.identity : null,
+      }));
       if (cbEntries.length === 0) {
-        document.getElementById('circuitSection').innerHTML = '<div style="color:var(--emerald);font-size:13px;display:flex;align-items:center;gap:8px;">✓ No circuit breakers tripped</div>';
+        setSection('circuitSection', '<div style="color:var(--emerald);font-size:13px;display:flex;align-items:center;gap:8px;" role="status">✓ No circuit breakers recorded</div>');
       } else {
-        document.getElementById('circuitSection').innerHTML = `
+        const nowCb = Date.now();
+        setSection('circuitSection', `
           <div class="cb-grid">
-            ${cbEntries.map(([key, state]) => `
-              <div class="cb-item">
-                <span class="name">${escapeHtml(key)}</span>
-                <span class="state ${stateClass(state)}">${state}</span>
+            ${cbEntries.map(e => {
+              const staleOpen = e.state === 'open' && e.openedAt && nowCb - e.openedAt > 30000;
+              // Keep the chip text short so the breaker key stays visible;
+              // the full explanation lives in the title tooltip.
+              const note = staleOpen
+                ? ' *'
+                : e.state === 'closed'
+                  ? ' (recovered)'
+                  : '';
+              const legacy = e.identity === 'legacy' ? ' · legacy key' : '';
+              return `
+              <div class="cb-item" title="${staleOpen ? 'Cooldown elapsed -- the breaker probes again on the next request. ' : ''}closed = no open circuit (recovered from a trip, or never tripped); not a live health guarantee${e.failures != null ? `. Failures recorded: ${e.failures}.` : ''}">
+                <span class="name">${escapeHtml(e.key)}${escapeHtml(legacy)}</span>
+                <span class="state ${stateClass(e.state)}">${escapeHtml(e.state + note)}</span>
               </div>
-            `).join('')}
+            `;}).join('')}
           </div>
-        `;
+          <div class="section-footnote" style="border:none;padding:8px 0 0;">* cooldown elapsed — the breaker probes again on the next request. Rows for models no longer configured (or pre-2026-09 provider keys) persist until they next see traffic; they cannot trip or recover while unused.</div>
+        `);
       }
 
       // Routes
       const routeList = routes?.routes || [];
       document.getElementById('routeCount').textContent = routeList.length + ' route' + (routeList.length !== 1 ? 's' : '');
       if (routeList.length) {
-        document.getElementById('routesTable').innerHTML = `
-          <thead><tr><th>ID</th><th>Protocol</th><th>Provider</th><th>Priority</th><th>Status</th></tr></thead>
+        setSection('routesTable', `
+          <thead><tr><th scope="col">ID</th><th scope="col">Protocol</th><th scope="col">Provider</th><th scope="col">Priority</th><th scope="col">Status</th></tr></thead>
           <tbody>
             ${routeList.map(r => `
               <tr>
@@ -1101,16 +1370,16 @@
               </tr>
             `).join('')}
           </tbody>
-        `;
+        `);
       } else {
-        document.getElementById('routesTable').innerHTML = '<tbody><tr><td style="padding:20px;color:var(--muted-foreground);">No routes configured</td></tr></tbody>';
+        setSection('routesTable', '<tbody><tr><td style="padding:20px;color:var(--muted-foreground);">No routes configured</td></tr></tbody>');
       }
 
       // Models
       const modelList = models?.data || [];
       document.getElementById('modelCount').textContent = modelList.length + ' model' + (modelList.length !== 1 ? 's' : '');
       if (modelList.length) {
-        document.getElementById('modelsSection').innerHTML = `
+        setSection('modelsSection', `
           <div class="model-grid">
             ${modelList.map(m => `
               <div class="model-card">
@@ -1122,41 +1391,47 @@
               </div>
             `).join('')}
           </div>
-        `;
+        `);
       } else {
-        document.getElementById('modelsSection').innerHTML = '<div style="color:var(--muted-foreground);font-size:13px;">No models available</div>';
+        setSection('modelsSection', '<div style="color:var(--muted-foreground);font-size:13px;">No models available</div>');
       }
     }
 
-    // Auto-detect gateway URL and API key from meta tags injected by the server.
-    // Works on Vercel (VERCEL_URL) and self-hosted (request origin) with zero config.
+    // Auto-detect gateway URL from the meta tag injected by the server
+    // (the URL is public by design; no credential is ever injected).
     const metaUrl = document.querySelector('meta[name="gateway-url"]');
-    const metaKey = document.querySelector('meta[name="gateway-key"]');
     if (metaUrl && metaUrl.content) {
       baseUrl = metaUrl.content;
       document.getElementById('gwUrl').value = baseUrl;
     }
-    if (metaKey && metaKey.content) {
-      apiKey = metaKey.content;
-      document.getElementById('gwKey').value = apiKey;
+
+    // Buttons are wired here (not inline onclick) so the dashboard's
+    // functions never need to be globals.
+    document.getElementById('connectBtn')?.addEventListener('click', () => { connect(); });
+    document.getElementById('refreshBtn')?.addEventListener('click', () => { refresh(); });
+    // Enter in the URL or key field connects, like clicking the button.
+    for (const id of ['gwUrl', 'gwKey']) {
+      document.getElementById(id)?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); connect(); }
+      });
     }
+
     // Auto-connect as soon as the URL is known: the server hands this page a
-    // short-lived signed HttpOnly session cookie, so read-only data loads with
-    // NO key entry at all. A pasted key remains optional and only adds the
-    // ability to run paid proxy test calls; if the gateway rejects the session
-    // (ADMIN_AUTOAUTH=0 or expired), the 401 path re-opens the key bar.
+    // short-lived signed HttpOnly session cookie (invisible to JavaScript and
+    // to DevTools), so read-only data loads with NO key entry at all. The key
+    // field exists only for deployments running ADMIN_AUTOAUTH=0; if the
+    // session is rejected or expired, the 401 path re-opens it.
     if (baseUrl) {
       document.getElementById('gwUrl').value = baseUrl;
-      // With no injected key, hide the whole URL/key bar too: the signed
-      // session cookie does everything on its own and there is nothing for
-      // the visitor to type. The 401 path in fetchAll() re-shows the bar if
-      // the session was rejected or expired (ADMIN_AUTOAUTH=0), so manual
-      // key entry always remains possible.
+      // Hide the key field on auto-connected pages: there is nothing for the
+      // visitor to type. The 401 path re-shows it when a key is actually
+      // needed.
       const bar = document.getElementById('conn-bar');
-      if (apiKey) { if (bar) bar.style.display = 'none'; }
-      else if (bar) { bar.querySelector('#gwKey')?.closest('.field')?.classList.add('hidden'); }
+      const keyField = bar?.querySelector('#gwKey')?.closest('.field');
+      if (bar && keyField) keyField.classList.add('hidden');
       connect();
     }
+    })();
   </script>
 </body>
 </html>
