@@ -18,34 +18,33 @@ Self-hosted, config-driven native-protocol AI gateway. Clients use one gateway A
 
 No payload translation is performed. A request is routed only to upstreams configured for the same native protocol. Duplicate models use ascending `priority` and fall back to the next compatible upstream after retryable upstream failures.
 
+### Public model ids: ":free" suffix stripping
+
+Provider free tiers are often configured with ids like `qwen3.8-flash:free`. Clients should never see that suffix: the gateway **strips a trailing `:free` (case-insensitive) from every configured route id** and exposes the clean id publicly — in `/v1/models`, routing, metrics, and circuit-breaker keys — while calling the upstream with the **real** id (kept internally as the route's `upstreamModel`; an explicit `upstreamModel` in your config still wins). Legacy clients that still send the `:free` id keep working: the request-side alias resolves to the same stripped model. These are genuinely different models from their paid namesakes, not duplicates — a stripped free route and an explicit paid route for the same public id coexist as priority-ordered fallback candidates.
+
 ## Admin Dashboard
 
 The dashboard is a static page served at `/admin` (the domain root `/` is the public landing page). By design, opening it creates a signed, read-only session with access to `/metrics`, `/v1/models`, and `/v1/debug/routes`, so those operational views are public when `ADMIN_AUTOAUTH` is enabled (the default). The session cannot call paid proxy routes, which always require a real gateway key.
 
-### Auto-detection
+### Zero credentials in the page
 
-When the server serves `/admin`, it injects meta tags into the HTML:
+The page is hardened so that a user watching DevTools sees **no credential anywhere**:
 
-| Meta tag | Source | Injected when |
-|---|---|---|
-| `gateway-url` | request origin | always (the URL is not a secret) |
-| `gateway-key` | First key from `ADMIN_API_KEYS` (falls back to `GATEWAY_API_KEYS`) | **only when the request already presents a valid Bearer token** |
-
-The `gateway-key` is deliberately **not** embedded for anonymous visitors. An earlier version injected the live admin/gateway key into the page for *anyone* who could reach the URL. Now the key is only auto-injected when the request itself is already authenticated. A normal browser visit uses the read-only session automatically; a real key is only needed for paid proxy calls or when `ADMIN_AUTOAUTH=0`.
+- The server injects exactly one meta tag — `gateway-url` (the public URL, not a secret). No API key is ever embedded in the HTML, in any form, for any visitor. (An earlier version echoed a validated Bearer token back into a `<meta>` tag for authenticated requests — removed: the credential then sat in View Source for the whole session.)
+- Authentication for the read-only endpoints flows through the short-lived signed session cookie, which is `HttpOnly` — JavaScript, the DevTools console, and the page's network inspector (no `Authorization` header is even sent) never see it.
+- All dashboard JavaScript runs inside an IIFE: no connection state, keys, or payloads are reachable as `window.*` globals from the console.
+- The optional key input (only needed when `ADMIN_AUTOAUTH=0`) is a masked password field; after Connect the value is cleared from the DOM and kept only in the script closure.
+- `/admin` and `/` ship a strict Content-Security-Policy (`default-src 'none'`, no external script/style/network origins) so even an injected script could not exfiltrate anything off-origin.
+- The page is served with `Cache-Control: no-store`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`.
 
 ### Accessing the dashboard
 
 ```bash
 # Open in a browser — read-only dashboard data loads automatically
 open https://your-gateway.vercel.app/admin
-
-# Or pass the key as a URL hash so the page auto-connects on load
-open https://your-gateway.vercel.app/admin#your-admin-key
 ```
 
-The `#your-admin-key` hash is read client-side and never sent to the server in the request line, so it isn't logged by the gateway or intermediaries.
-
-Set `ADMIN_AUTOAUTH=0` to require an admin or gateway Bearer key for the read-only endpoints.
+Set `ADMIN_AUTOAUTH=0` to require an admin or gateway Bearer key for the read-only endpoints; the dashboard then shows the key input bar (paste, connect — the value never leaves your browser's closure).
 
 ### What the dashboard shows
 
@@ -89,12 +88,50 @@ Set `ADMIN_API_KEYS` for separate admin-only access. Falls back to `GATEWAY_API_
 
 ## Circuit Breakers
 
-Each `provider:model` pair has a circuit breaker that:
+Each model has a circuit breaker (identity `model:<id>`, shared by every provider route serving it, so a primary outage cannot cascade into the backup's circuit too):
+
 - Opens after 5 consecutive upstream failures (5xx, 429, timeout)
 - Transitions to half-open after 30s cooldown, allowing a probe request
 - Closes on success, resets failure count
 - Skips open circuits during fallback when alternatives exist
+- While a breaker is open, requests that cannot fall back elsewhere answer **503 ServiceUnavailableError** with `Retry-After: 30` — a gateway-side rejection, distinct from a 502 (an upstream was actually called and failed)
 - Logs state transitions as `circuit_opened` / `circuit_recovered`
+
+Legacy `provider:model` rows from before the per-model hardening may linger in the metrics store; they are inert and flagged `identity: "legacy"` in `/metrics`.
+
+## Metric definitions (as produced by the gateway)
+
+The `/metrics` response carries a `definitions` object repeating these rules, so consumers never have to guess:
+
+| Field | Definition |
+|---|---|
+| `requests` | **Upstream attempts** — one record per candidate tried; fallback retries count once per attempt. `requests - fallbacks` approximates client-visible requests. |
+| `statusBreakdown."0"` | Attempt produced **no upstream response**: client disconnect, timeout, circuit-open rejection, or gateway config error. |
+| `upstreamErrors` | Attempts that failed **against an actual upstream**: 5xx/429 responses, transport errors, timeouts. Excludes client disconnects, circuit-open rejections and config errors. |
+| `activeRequests` / `activeStreams` | Upstream attempts / streaming responses with a **live lease right now** (self-healing TTL rows; the old +/- gauge drifted permanently upward — production reached 1,124 phantom "active" requests). |
+| `latency` | p50/p95/p99 by **nearest-rank** plus arithmetic mean (`avg`), over the most recent **500 recorded attempts** per bucket (all-time cumulative buckets). A p95/p99 clustered at the upstream timeout means that share of attempts hits the hard timeout — a real population, not gradual slowness. |
+| `tokens` | `input` is **uncached-only** input; `cacheRead`/`cacheWrite` are separate buckets; `total = input + cacheRead + cacheWrite + output`. |
+| `estimatedSpend` | Estimate from each route's configured per-million `cost` prices × recorded tokens (times `billingMultiplier`). **Not a provider invoice.** |
+| daily rollups | Day boundary is **Africa/Lagos (WAT, UTC+1, no DST)** — each day starts at 12am WAT. Retention is **unbounded**; days with no traffic have no row. |
+| HTTP methods | The gateway records proxied **POST** traffic only; there is no per-method metric, and the dashboard no longer labels rows "GET". |
+
+`GET /metrics?daily=global` trims the `daily` array to `scope=global` rows (what the built-in dashboard renders); without the parameter the historical all-scopes shape is returned.
+
+## Cost protection
+
+- Per-key request rate limit (token bucket, per warm instance): `RATE_LIMIT_RPS` (default 50), `RATE_LIMIT_BURST` (default 100). Set `RATE_LIMIT_RPS=0` to disable.
+- **Optional daily spend ceiling**: set `MAX_DAILY_SPEND_USD` (e.g. `20`) and paid proxy routes answer `429 SpendLimitError` with `Retry-After` once the gateway's **recorded estimated spend** for the current WAT day reaches the ceiling; it resets at 12am WAT. This is a **best-effort brake, not a hard guarantee**: the check is cached (`SPEND_CHECK_TTL_MS`, default 15s) and a request's future output cost is unknowable, so in-flight traffic can overshoot within the window. A metrics-store failure degrades it to disabled (fail-open), consistent with "metrics must never block the proxy path".
+
+## Operations environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `METRICS_FLUSH_MS` | `200` | Micro-batch window for metrics writes: per-request events merge into per-bucket accumulators and flush as one statement per touched bucket. At 1000 rps this is ~40 statements per window instead of ~6000 single-row writes. Durability is preserved: each request registers the window flush with the serverless `waitUntil`, so a batch containing its events always persists. |
+| `ACTIVE_LEASE_TTL_MS` | `360000` | Lease lifetime for in-flight tracking. Must exceed the longest possible request (Vercel `maxDuration` is 300s); a dropped cleanup write self-heals after this TTL. |
+| `MAX_DAILY_SPEND_USD` | unset (off) | Daily estimated-spend ceiling, enforced server-side on paid routes (see above). |
+| `SPEND_CHECK_TTL_MS` | `15000` | Cache window for the spend-ceiling check. |
+| `ADMIN_STRICT_KEYS` | unset (off) | `1` rejects ordinary gateway keys on the admin surface (`/metrics`, `/v1/debug/routes`) — only `ADMIN_API_KEYS` or the dashboard session authorize them. Default off because single-key deployments and the entry-agents settings dashboard authenticate with the gateway key. `/v1/models` is ordinary OpenAI-compatible surface and is never affected. |
+| `DASHBOARD_SESSION_SECRET` | derived | Dedicated HMAC secret for the dashboard session cookie; strongly recommended over key derivation. |
 
 ## Required environment
 
