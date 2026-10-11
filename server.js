@@ -1,8 +1,6 @@
 import express from "express";
-import { readFileSync } from "fs";
-import { createHash, createHmac, timingSafeEqual } from "crypto";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import { createHash, timingSafeEqual } from "crypto";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import {
   recordRequest,
   recordUpstreamError,
@@ -50,45 +48,19 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "25mb" }));
 
 // CORS: the settings/gateway dashboard on entry-agents.vercel.app calls
-// /health, /metrics, /v1/models, /v1/debug/routes directly from the
-// browser (client component, no Next.js proxy route in between). Express
-// sends no CORS headers by default, so every one of those cross-origin
-// fetch() calls was silently blocked by the browser and surfaced to the
-// user as a generic "Failed to fetch" -- even with a correct gateway URL
-// and API key, since the request never actually reached this server for
-// GET requests, and for the CORS preflight OPTIONS it got a 404 with no
-// Access-Control-Allow-* headers. Reflecting a small allowlist of known
-// dashboard origins (plus localhost for local dev) fixes this without
-// opening the API itself to arbitrary origins.
+// CORS: the inference API is called SERVER-to-server by Entry Agents (no
+// browser consumer remains -- the old browser dashboard moved behind the new
+// authenticated dashboard app, which polls its own same-origin API). The
+// allowlist is therefore trimmed to localhost development only; everything
+// else gets no CORS headers, so browsers can never read the API cross-origin.
 const ALLOWED_ORIGINS = new Set([
-  "https://entry-agents.vercel.app",
-  "https://entry-agents-thirdbase1s-projects.vercel.app",
-  "https://entry-agents-oneshotsx-thirdbase1s-projects.vercel.app",
   "http://localhost:3000",
+  "http://localhost:8787",
 ]);
-// SECURITY FIX: the previous check was
-//   ALLOWED_ORIGINS.has(origin) || /\.vercel\.app$/.test(new URL(origin).hostname)
-// which had two problems:
-//   1. `new URL(origin)` THROWS on a malformed Origin header. An uncaught
-//      throw in middleware is routed to Express's default error handler ->
-//      a 500 on every request carrying a junk Origin. Trivially triggerable,
-//      so it's a cheap DoS / error-noise vector. Now wrapped so a bad origin
-//      simply means "not allowed".
-//   2. `/\.vercel\.app$/` reflected Access-Control-Allow-Origin for ANY
-//      vercel.app subdomain -- including attacker-owned deployments. Since
-//      the gateway authenticates with a Bearer token (not cookies), this
-//      doesn't directly leak the token, but it needlessly widens the CORS
-//      surface to the entire vercel.app namespace. Tightened to only the
-//      gateway's own `entry-agents*` dashboard family (covers production +
-//      Vercel preview deploys like `entry-agents-git-<branch>-<team>...`).
+// Malformed Origin headers must never throw middleware errors (cheap DoS
+// vector historically): a bad origin simply means "not allowed".
 function originAllowed(origin) {
-  if (ALLOWED_ORIGINS.has(origin)) return true;
-  try {
-    const url = new URL(origin);
-    return url.protocol === "https:" && /^entry-agents[a-z0-9-]*\.vercel\.app$/.test(url.hostname);
-  } catch {
-    return false; // malformed origin is never allowed
-  }
+  return ALLOWED_ORIGINS.has(origin);
 }
 app.use((req, res, next) => {
   // Baseline security response headers on every response.
@@ -188,7 +160,6 @@ function ttlCache(build, ttlMs = CONFIG_CACHE_MS) {
   };
 }
 const keys = ttlCache(() => new Set((process.env.GATEWAY_API_KEYS || "").split(",").map(x => x.trim()).filter(Boolean)));
-const adminKeys = ttlCache(() => new Set((process.env.ADMIN_API_KEYS || "").split(",").map(x => x.trim()).filter(Boolean)));
 // EXTRA_MODEL_ROUTES_JSON is a second, additive routes list -- kept
 // separate from MODEL_ROUTES_JSON (a Vercel "Sensitive" env var, which
 // Vercel makes permanently write-only/unreadable once set, by design) so
@@ -295,7 +266,21 @@ const safeEquals = (a, b) => {
 };
 const hashSet = list => new Set(list.map(k => createHash("sha256").update(k).digest("hex")));
 const keyHashes = ttlCache(() => hashSet((process.env.GATEWAY_API_KEYS || "").split(",").map(x => x.trim()).filter(Boolean)));
-const adminKeyHashes = ttlCache(() => hashSet((process.env.ADMIN_API_KEYS || "").split(",").map(x => x.trim()).filter(Boolean)));
+// Static metrics fallback key (non-Vercel/self-hosted path; never issued to browsers).
+const metricsKeyHashes = ttlCache(() => hashSet((process.env.METRICS_BEARER_KEY || "").split(",").map(x => x.trim()).filter(Boolean)));
+// Vercel OIDC verification config, read lazily so tests can toggle per request.
+// JWKS remote set is cached per URL; verification failures fail CLOSED.
+const metricsOidcConfig = () => {
+  const issuer = process.env.METRICS_OIDC_ISSUER;
+  const audience = process.env.METRICS_OIDC_AUDIENCE;
+  if (!issuer || !audience) return null;
+  const jwksUrl = process.env.METRICS_OIDC_JWKS_URL || `${issuer.replace(/\/$/, "")}/.well-known/jwks`;
+  if (!metricsOidcConfig.jwks || metricsOidcConfig.jwksUrl !== jwksUrl) {
+    metricsOidcConfig.jwks = createRemoteJWKSet(new URL(jwksUrl));
+    metricsOidcConfig.jwksUrl = jwksUrl;
+  }
+  return { issuer, audience, subject: process.env.METRICS_OIDC_SUBJECT || "", jwks: metricsOidcConfig.jwks };
+};
 const inHashSet = (set, value) => set.has(value) || [...set].some(h => safeEquals(h, createHash("sha256").update(value).digest("hex")));
 
 // ─── Per-key rate limiting ──────────────────────────────────────────────────
@@ -414,101 +399,69 @@ const bodySizeGuard = (req, res, next) => {
   }
   next();
 };
-// When ADMIN_STRICT_KEYS=1, ordinary gateway API keys are rejected on the
-// admin/read-only endpoints (everything below) -- only ADMIN_API_KEYS (or
-// the dashboard session cookie) authorize them. Default OFF: single-key
-// deployments and the entry-agents settings dashboard authenticate with the
-// gateway key, so flipping the default would lock operators out.
-const adminStrict = () => process.env.ADMIN_STRICT_KEYS === "1";
-const adminAuth = (req, res, next) => {
+// ─── metricsAuth: the metrics/configuration permission boundary ──────────────
+// The inference API key (GATEWAY_API_KEYS) authorizes ONLY /v1/* inference.
+// Metrics and route-configuration access require a separate credential:
+//   1. A platform workload identity (Vercel OIDC): the caller (the dashboard's
+//      server runtime) presents a Bearer JWT minted by Vercel; it is verified
+//      against Vercel's public JWKS for signature, issuer, audience, subject
+//      (which binds the dashboard PROJECT and ENVIRONMENT), and expiry. No
+//      shared secret exists anywhere for this path.
+//   2. A static fallback key (METRICS_BEARER_KEY) for non-Vercel/self-hosted
+//      deployments -- narrowly scoped to these routes, never issued to browsers.
+// Legacy privilege surfaces (gateway-key fallback, ADMIN_API_KEYS, the
+// auto-issued gw_dash session) were removed; the env vars are ignored with a
+// startup warning so stale deployments fail closed loudly, not silently open.
+const metricsAuth = async (req, res, next) => {
   const supplied = bearerToken(req);
-  const valid = keyHashes();
-  const admins = adminKeyHashes();
-  if (!valid.size && !admins.size) return res.status(500).json({ error: { type: "ConfigError", message: "No keys configured." } });
-  if (admins.size && inHashSet(admins, supplied)) return next();
-  if (!adminStrict() && inHashSet(valid, supplied)) return next();
-  // Read-only dashboard session: auto-issued by the dashboard page itself, so
-  // opening /admin authenticates the viewer with no key entry at all.
-  if (autoAuthEnabled() && dashTokenValid(cookieValue(req, DASH_COOKIE))) return next();
-  return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
-};
-
-// ─── Dashboard auto-auth (stateless signed session) ──────────────────────────
-// The dashboard is a read-only viewer for /health, /metrics, /v1/models and
-// /v1/debug/routes. Rather than embedding a live API key in the page (the
-// critical leak fixed in serveAdminDashboard) or forcing the operator to paste
-// a key, serving the dashboard sets a short-lived HttpOnly cookie signed with
-// a secret DERIVED FROM the configured keys -- never the keys themselves.
-// adminAuth and the read-only /v1/models route accept that cookie, so simply
-// opening the dashboard authenticates it. The paid proxy routes keep requiring
-// a real API key, so a stolen or forged cookie can never spend money.
-const DASH_COOKIE = "gw_dash";
-const DASH_TTL_MS = 8 * 60 * 60 * 1000; // one operator workday
-// Read lazily (not module-level) so tests can toggle it per request.
-const autoAuthEnabled = () => process.env.ADMIN_AUTOAUTH !== "0";
-const dashSecret = () => {
-  // A dedicated, high-entropy session secret is always preferred. Deriving it
-  // from the API keys (the fallback below) means the cookie is only as strong
-  // as the weakest configured key -- serveAdminDashboard refuses to issue the
-  // cookie at all when that fallback would run on short/low-entropy keys.
-  if (process.env.DASHBOARD_SESSION_SECRET) {
-    return createHash("sha256").update(`gw-dash-v2:${process.env.DASHBOARD_SESSION_SECRET}`).digest();
+  if (!supplied) {
+    console.error(JSON.stringify({ type: "metrics_authz_failed", reason: "missing_credential", path: req.path }));
+    return res.status(401).json({ error: { type: "AuthError", message: "Metrics access requires a metrics credential." } });
   }
-  const seed = process.env.ADMIN_API_KEYS || process.env.GATEWAY_API_KEYS || "";
-  return seed ? createHash("sha256").update(`gw-dash-v1:${seed}`).digest() : null;
-};
-const dashSign = (secret, exp) => createHmac("sha256", secret).update(`dash:${exp}`).digest("hex");
-const dashToken = () => {
-  const secret = dashSecret();
-  if (!secret || !autoAuthEnabled()) return null;
-  const exp = Date.now() + DASH_TTL_MS;
-  return `${exp}.${dashSign(secret, exp)}`;
-};
-const dashTokenValid = token => {
-  const secret = dashSecret();
-  if (!secret || !autoAuthEnabled() || !token) return false;
-  const dot = token.lastIndexOf(".");
-  if (dot <= 0) return false;
-  const exp = Number(token.slice(0, dot));
-  if (!Number.isFinite(exp) || exp < Date.now()) return false;
-  const expected = Buffer.from(dashSign(secret, exp), "hex");
-  let actual;
-  try { actual = Buffer.from(token.slice(dot + 1), "hex"); } catch { return false; }
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-};
-// Minimal single-purpose cookie reader -- avoids adding a cookie-parser
-// dependency just to read one value.
-const cookieValue = (req, name) => {
-  const header = req.headers.cookie;
-  if (!header) return null;
-  for (const part of header.split(";")) {
-    const eq = part.indexOf("=");
-    if (eq === -1) continue;
-    if (part.slice(0, eq).trim() === name) {
-      try { return decodeURIComponent(part.slice(eq + 1).trim()); } catch { return part.slice(eq + 1).trim(); }
+  // Path 1: static fallback key (only when configured).
+  const fallbackHashes = metricsKeyHashes();
+  if (fallbackHashes.size && inHashSet(fallbackHashes, supplied)) return next();
+  // Path 2: Vercel OIDC (only when configured). JWTs have the classic 3-part shape.
+  const oidc = metricsOidcConfig();
+  if (oidc && supplied.split(".").length === 3) {
+    try {
+      const { payload } = await jwtVerify(supplied, oidc.jwks, {
+        issuer: oidc.issuer,
+        audience: oidc.audience,
+        subject: oidc.subject || undefined,
+        clockTolerance: 5,
+      });
+      // Defense in depth: the subject must bind the dashboard project regardless
+      // of an over-broad METRICS_OIDC_SUBJECT configuration.
+      if (process.env.METRICS_OIDC_EXPECT_PROJECT && !String(payload.sub || "").includes(`project:${process.env.METRICS_OIDC_EXPECT_PROJECT}`)) {
+        throw new Error("subject does not bind the dashboard project");
+      }
+      return next();
+    } catch (e) {
+      console.error(JSON.stringify({ type: "metrics_authz_failed", reason: "oidc_rejected", detail: e instanceof Error ? e.message : String(e), path: req.path }));
+      return res.status(401).json({ error: { type: "AuthError", message: "Metrics credential rejected." } });
     }
   }
-  return null;
+  console.error(JSON.stringify({ type: "metrics_authz_failed", reason: "unknown_credential", path: req.path }));
+  return res.status(401).json({ error: { type: "AuthError", message: "Invalid metrics credential." } });
 };
 
-// /v1/models is read-only (no spend), so the auto-authed dashboard session may
-// call it too. Real API keys still go through `auth` so they keep their
-// per-key rate limiting and headers.
+// Deprecation notice for removed privilege env vars (fail closed, loudly).
+for (const legacy of ["ADMIN_API_KEYS", "ADMIN_AUTOAUTH", "ADMIN_STRICT_KEYS", "DASHBOARD_SESSION_SECRET"]) {
+  if (process.env[legacy]) {
+    console.error(JSON.stringify({ type: "deprecated_env_ignored", variable: legacy, note: "Privilege env removed: the inference key no longer grants metrics/admin access; use METRICS_BEARER_KEY / METRICS_OIDC_* for the dashboard." }));
+  }
+}
+
+// /v1/models is part of the OpenAI-compatible inference surface (SDK clients
+// list models with their inference key), and the dashboard also renders it.
+// Inference keys go through auth() so they keep per-key rate limiting and
+// headers; the metrics credential is accepted as the second path.
 const modelsAuth = (req, res, next) => {
   const supplied = bearerToken(req);
-  const valid = keyHashes();
-  const admins = adminKeyHashes();
-  if (!valid.size && !admins.size) return res.status(500).json({ error: { type: "ConfigError", message: "GATEWAY_API_KEYS is not configured." } });
-  // A dedicated admin key is valid for this read-only endpoint but is not a
-  // gateway key, so sending it through auth() would incorrectly reject it.
-  if (admins.size && inHashSet(admins, supplied)) return next();
-  // /v1/models is an ordinary OpenAI-compatible endpoint that gateway-key
-  // clients call with their own credentials, so it is deliberately NOT
-  // affected by ADMIN_STRICT_KEYS (which only hardens the admin/metrics
-  // surface). Gateway keys go through auth() so they keep per-key rate
-  // limiting and headers.
-  if (inHashSet(valid, supplied)) return auth(req, res, next);
-  if (autoAuthEnabled() && dashTokenValid(cookieValue(req, DASH_COOKIE))) return next();
+  if (!keyHashes().size) return res.status(500).json({ error: { type: "ConfigError", message: "GATEWAY_API_KEYS is not configured." } });
+  if (inHashSet(keyHashes(), supplied)) return auth(req, res, next);
+  if (inHashSet(metricsKeyHashes(), supplied) || metricsOidcConfig()) return metricsAuth(req, res, next);
   return res.status(401).json({ error: { type: "AuthError", message: "Invalid or missing API key." } });
 };
 // Case-insensitive match: Google's two action names differ only in the
@@ -1410,7 +1363,7 @@ app.get("/health", async (_req, res) => {
   });
 });
 
-app.get("/metrics", adminAuth, async (req, res) => {
+app.get("/metrics", metricsAuth, async (req, res) => {
   const allRoutes = routes();
   const configuredProviders = [...new Set(allRoutes.map(r => r.provider || r.upstreamApiKeyEnv || "unknown"))];
   const configuredModels = [...new Set(allRoutes.map(r => r.id))];
@@ -1532,7 +1485,7 @@ app.post("/v1/chat/completions", auth, spendLimitGuard, bodySizeGuard, handle);
 app.post("/v1/messages", auth, spendLimitGuard, bodySizeGuard, handle);
 app.post("/v1beta/models/:modelAction", auth, spendLimitGuard, bodySizeGuard, handle);
 
-app.get("/v1/debug/routes", adminAuth, (_req, res) => {
+app.get("/v1/debug/routes", metricsAuth, (_req, res) => {
   res.json({
     routes: routes().map(r => ({
       id: r.id,
@@ -1550,129 +1503,30 @@ app.get("/v1/debug/routes", adminAuth, (_req, res) => {
   });
 });
 
-// ─── Admin Dashboard ──────────────────────────────────────────────────────────
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-// Escapes a value for safe embedding inside an HTML attribute. Used for the
-// meta tags injected into the admin page below -- `req.get("host")` reflects
-// the raw Host header, which is attacker-controllable on any deployment that
-// isn't behind a host-validating proxy (self-hosted/Docker), so without this a
-// crafted `Host: x"><img src=y onerror=...>` would become reflected XSS in the
-// dashboard page.
-const escapeHtmlAttr = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-
-// The gateway URL injected into the admin page is built from req.get("host"),
-// which reflects the raw Host header. On Vercel the platform normalizes it,
-// but self-hosted/Docker deployments (the documented use case) sit behind no
-// such proxy, so an attacker who can get a victim to load /admin on an
-// arbitrary hostname -- or poison a shared cache -- could inject a hostile
-// gateway-url and redirect every dashboard fetch() (plus the operator's
-// pasted Bearer key) to an attacker host. Validate the host against a strict
-// hostname[:port] shape and fall back to the configured VERCEL_URL when the
-// request host is unusable.
-const HOST_RE = /^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(:\d{1,5})?$/;
-function safeGatewayUrl(req) {
-  const host = req.get("host") || "";
-  if (HOST_RE.test(host)) return `${req.protocol}://${host}`;
-  const vercel = process.env.VERCEL_URL;
-  return vercel && HOST_RE.test(vercel) ? `https://${vercel}` : null;
-}
-
-// When serving /admin, inject ONLY the gateway URL. No credential is ever
-// embedded in the page, in any form, for any visitor: the dashboard
-// auto-authenticates through the short-lived signed HttpOnly session cookie
-// (which JavaScript cannot read, so it is invisible even in DevTools), and
-// an operator who explicitly pastes a key into the page keeps it in a
-// closure variable that never touches the DOM after connect. The previous
-// behavior of echoing a validated Bearer token back into a <meta> tag meant
-// the credential sat in View Source / DevTools for the whole session -- a
-// shoulder-surf / screen-share / extension-read leak waiting to happen.
-const serveAdminDashboard = (req, res) => {
-  try {
-    let html = readFileSync(join(__dirname, "public", "admin.html"), "utf-8");
-    // Auto-detect gateway URL: always prefer the actual request host, not
-    // process.env.VERCEL_URL. VERCEL_URL resolves to this specific
-    // deployment's unique hash subdomain (e.g. entry-gateway-abc123...),
-    // which differs from the friendly alias (entry-gateway-six.vercel.app)
-    // the browser is actually on -- injecting the hash URL made every
-    // fetch() below a cross-origin request depending on CORS, when it
-    // could just be same-origin and need no CORS at all.
-    const gatewayUrl = safeGatewayUrl(req);
-    // Inject into HTML as a meta tag the frontend reads. Skipped entirely for
-    // a hostile/unparseable Host with no VERCEL_URL fallback -- admin.html
-    // then shows its manual URL-entry bar instead of a poisoned URL.
-    if (gatewayUrl) {
-      html = html.replace("</head>", `  <meta name="gateway-url" content="${escapeHtmlAttr(gatewayUrl)}" />\n</head>`);
-    } else {
-      res.setHeader("Cache-Control", "private, no-store");
-    }
-    // Never let a browser/proxy/CDN cache this page -- it reflects the
-    // request Host, so it must not be stored or shared.
-    res.setHeader("Cache-Control", gatewayUrl ? "no-store" : "private, no-store");
-    // HARDENING: strict CSP for the dashboard. Everything the page needs is
-    // inline (script/style) and same-origin fetches; `connect-src 'self'
-    // https:` keeps the cross-origin dashboard use case working while
-    // guaranteeing that even injected script could not exfiltrate anything
-    // to non-https origins. This is defense-in-depth on top of the escaping
-    // and no-credential-in-page guarantees, not a substitute for them.
-    res.setHeader("Content-Security-Policy",
-      "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-      + "connect-src 'self' https:; img-src 'self' data:; base-uri 'none'; "
-      + "form-action 'none'; frame-ancestors 'none'; object-src 'none'");
-
-    // Dashboard auto-auth: hand every visitor a short-lived, signed, HttpOnly
-    // session cookie so the page can load read-only admin data with NO key
-    // entry at all. Real API keys are still never embedded in the page, and
-    // this cookie is worthless against the paid proxy routes (they keep
-    // requiring a real key). Set ADMIN_AUTOAUTH=0 to revert to key-only.
-    //
-    // SECURITY: the cookie's signature secret is derived from the configured
-    // API keys (dashSecret), so if those keys are weak/guessable the "signed"
-    // session is forgeable by anyone. Refuse to issue the cookie when no
-    // dedicated DASHBOARD_SESSION_SECRET is set AND every candidate seed key
-    // looks low-entropy -- such deployments must run with ADMIN_AUTOAUTH=0 or
-    // configure a real secret to get auto-auth. The entropy floor is only
-    // enforced on Vercel, where platform TLS guarantees the cookie travels
-    // over https; self-hosted/Docker operators who deliberately run plain
-    // HTTP keep the historical short-key behavior (the cookie still carries
-    // Secure/SameSite=Strict/HttpOnly attributes whenever https is detected).
-    const sessionSecretConfigured = Boolean(process.env.DASHBOARD_SESSION_SECRET);
-    const weakKeysConfigured = !sessionSecretConfigured && Boolean(process.env.VERCEL) && [...keys(), ...adminKeys()].some(k => k.length < 16);
-    const token = (autoAuthEnabled() && !weakKeysConfigured) ? dashToken() : null;
-    if (token) {
-      const secure = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "; Secure" : "";
-      res.setHeader("Set-Cookie",
-        `${DASH_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(DASH_TTL_MS / 1000)}${secure}`);
-    }
-
-    res.set("Content-Type", "text/html").send(html);
-  } catch {
-    res.status(404).send("Admin dashboard not found.");
-  }
+// ─── Dashboard + landing redirect ─────────────────────────────────────────────
+// The admin dashboard and the public landing page moved to the dedicated
+// Next.js app (dashboard/, deployed as its own Vercel project with its own
+// OTP-based authentication). The gateway is an API surface only now: these
+// routes redirect humans to the dashboard (when DASHBOARD_PUBLIC_URL is
+// configured) and answer 410 Gone otherwise. No HTML is served from the
+// gateway anymore, and no session cookie is ever issued by it.
+const dashboardUrl = () => (process.env.DASHBOARD_PUBLIC_URL || "").replace(/\/+$/, "");
+const serveRedirectToDashboard = (_req, res) => {
+  const url = dashboardUrl();
+  if (!url) return res.status(410).json({ error: { type: "GoneError", message: "The gateway HTML dashboard was removed. Configure DASHBOARD_PUBLIC_URL to redirect to the new dashboard." } });
+  res.setHeader("Cache-Control", "no-store");
+  res.redirect(302, url + "/");
 };
 
-// Public landing page at the bare domain root. Fully static -- no request
-// data (Host, origin, path) is reflected into it, so unlike the admin page it
-// needs no escaping, no no-store, and can be cached by browsers/CDNs. The CSP
-// blocks every network operation from the page (it is purely presentational)
-// and only permits its two inline demo scripts.
-const serveLandingPage = (_req, res) => {
-  try {
-    res.setHeader("Content-Security-Policy",
-      "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-      + "img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'");
-    res.set("Content-Type", "text/html").send(readFileSync(join(__dirname, "public", "landing.html")));
-  } catch {
-    res.status(404).send("Landing page not found.");
-  }
-};
+app.get("/", serveRedirectToDashboard);
+app.get("/admin", serveRedirectToDashboard);
 
-// "/" is the public landing page; the operator dashboard lives at /admin.
-// The dashboard auto-authenticates via its signed session cookie (see
-// serveAdminDashboard), so /admin is still the only URL you need.
-app.get("/", serveLandingPage);
-app.get("/admin", serveAdminDashboard);
+// Catch-all 404 in JSON: no route serves HTML anymore, so Express's default
+// HTML 404 page must never appear on this API surface.
+app.use((_req, res) => {
+  res.status(404).json({ error: { type: "NotFoundError", message: "Unknown API route." } });
+});
+
 
 // ─── Error handling ─────────────────────────────────────────────────────────
 // Express's default error handler returns an HTML page (with a stack trace

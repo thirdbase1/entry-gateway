@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 
 const GW_KEY = "spend-guard-test-gateway-key-0123456789";
+const METRICS_KEY = "spend-guard-metrics-key-0123456789";
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, () => resolve(server.address().port)));
@@ -82,6 +83,7 @@ test.before(async () => {
 
   process.env.VERCEL = "1";
   process.env.GATEWAY_API_KEYS = GW_KEY;
+  process.env.METRICS_BEARER_KEY = METRICS_KEY;
   delete process.env.ADMIN_API_KEYS;
   process.env.MODEL_DISCOVERY_JSON = "[]";
   process.env.SPEND_UPSTREAM_KEY = "dummy";
@@ -122,7 +124,7 @@ test("2a. once the day's recorded spend is at/over the ceiling, paid routes answ
 });
 
 test("2b. the spend ceiling does not touch read-only endpoints", async () => {
-  const metrics = await request(gatewayPort, { path: "/metrics", headers: { Authorization: `Bearer ${GW_KEY}` } });
+  const metrics = await request(gatewayPort, { path: "/metrics", headers: { Authorization: `Bearer ${METRICS_KEY}` } });
   assert.equal(metrics.status, 200);
   const models = await request(gatewayPort, { path: "/v1/models", headers: { Authorization: `Bearer ${GW_KEY}` } });
   assert.equal(models.status, 200);

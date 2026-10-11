@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 
 const GW_KEY = "classification-test-gateway-key-0123456789";
+const METRICS_KEY = "classification-metrics-key-0123456789";
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, () => resolve(server.address().port)));
@@ -77,6 +78,7 @@ test.before(async () => {
 
   process.env.VERCEL = "1"; // don't app.listen()
   process.env.GATEWAY_API_KEYS = GW_KEY;
+  process.env.METRICS_BEARER_KEY = METRICS_KEY;
   delete process.env.ADMIN_API_KEYS;
   delete process.env.MAX_DAILY_SPEND_USD;
   process.env.MODEL_DISCOVERY_JSON = "[]";
@@ -108,7 +110,7 @@ const post = (model, extra = {}) => request(gatewayPort, {
 });
 
 async function metricsSnapshot() {
-  const r = await request(gatewayPort, { path: "/metrics", headers: { Authorization: `Bearer ${GW_KEY}` } });
+  const r = await request(gatewayPort, { path: "/metrics", headers: { Authorization: `Bearer ${METRICS_KEY}` } });
   assert.equal(r.status, 200, `metrics read failed: ${r.status} ${r.body}`);
   return JSON.parse(r.body);
 }

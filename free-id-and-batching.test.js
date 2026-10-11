@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 
 const GW_KEY = "free-id-test-gateway-key-0123456789";
+const METRICS_KEY = "free-id-metrics-key-0123456789";
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, () => resolve(server.address().port)));
@@ -53,6 +54,7 @@ test.before(async () => {
 
   process.env.VERCEL = "1";
   process.env.GATEWAY_API_KEYS = GW_KEY;
+  process.env.METRICS_BEARER_KEY = METRICS_KEY;
   delete process.env.ADMIN_API_KEYS;
   delete process.env.MAX_DAILY_SPEND_USD;
   process.env.MODEL_DISCOVERY_JSON = "[]";
@@ -128,7 +130,7 @@ test("1e. a paid route and a stripped free route coexist for one public id (prio
 test("1f. metrics and circuit breakers record under the stripped id", async () => {
   await post("qwen3.8-flash");
   await settle();
-  const m = await request(gatewayPort, { path: "/metrics?daily=global", headers: { Authorization: `Bearer ${GW_KEY}` } });
+  const m = await request(gatewayPort, { path: "/metrics?daily=global", headers: { Authorization: `Bearer ${METRICS_KEY}` } });
   const snap = JSON.parse(m.body);
   assert.ok(snap.byModel["qwen3.8-flash"], `metrics must use the stripped id, got: ${Object.keys(snap.byModel).join(",")}`);
   assert.ok(!Object.keys(snap.byModel).some((k) => /:free/i.test(k)), "no :free key may appear in metrics");

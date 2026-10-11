@@ -248,9 +248,4 @@ test("5a. NaN/Infinity usage cannot poison cumulative metric counters", async ()
   assert.equal(m.tokens.output, 3);
 });
 
-// ─── 6. admin.html DOM contract ─────────────────────────────────────────────
 
-test("6a. admin.html defines #conn-bar which its own script manipulates", () => {
-  const html = readFileSync(fileURLToPath(new URL("./public/admin.html", import.meta.url)), "utf-8");
-  assert.ok(/id="conn-bar"/.test(html), "the conn-bar element referenced by getElementById('conn-bar') does not exist");
-});
