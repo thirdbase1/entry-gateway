@@ -147,6 +147,15 @@ test("6. a token signed by a foreign key (bad signature) is rejected", async () 
   assert.equal(r.status, 401);
 });
 
+test("6b. a token with the platform GLOBAL issuer (federation mode toggle) is accepted", async () => {
+  // The operator can flip Vercel OIDC federation between team and global mode;
+  // the key sets are identical, and audience + subject still bind the token to
+  // the dashboard project, so both issuers must be accepted.
+  const token = await sign({ issuer: "https://oidc.vercel.com" });
+  const r = await metrics(token);
+  assert.equal(r.status, 200, "global-issuer token must be accepted");
+});
+
 test("7. the static fallback key still works alongside OIDC", async () => {
   const r = await metrics(METRICS_FALLBACK);
   assert.equal(r.status, 200);
