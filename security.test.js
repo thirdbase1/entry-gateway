@@ -118,11 +118,19 @@ test("1a. /admin does NOT leak the admin key to an unauthenticated visitor", asy
   assert.ok(/<meta name="gateway-url"/.test(body), "gateway-url meta should still be present");
 });
 
-test("1b. /admin DOES auto-inject the key when the request already has a valid Bearer token", async () => {
-  const { status, body } = await request(gatewayPort, { path: "/admin", headers: { Authorization: `Bearer ${ADMIN_KEY}` } });
+test("1b. /admin NEVER injects a key -- not even for a request with a valid Bearer token", async () => {
+  // 2026-10-10 hardening: the auto-auth session cookie covers all read-only
+  // access, so there is no reason for any credential to exist in the page.
+  // The old echo-back behavior put the operator's token into View Source /
+  // DevTools for the whole session.
+  const { status, body, headers } = await request(gatewayPort, { path: "/admin", headers: { Authorization: `Bearer ${ADMIN_KEY}` } });
   assert.equal(status, 200);
-  assert.ok(/<meta name="gateway-key"/.test(body), "authorized visitor should get the gateway-key meta");
-  assert.ok(body.includes(ADMIN_KEY), "authorized visitor should get the key auto-injected");
+  assert.ok(!/<meta name="gateway-key"/.test(body), "no gateway-key meta may be injected for authorized visitors either");
+  assert.ok(!body.includes(ADMIN_KEY), "the admin key itself must never appear in the page");
+  // URL auto-detection is unchanged.
+  assert.ok(/<meta name="gateway-url"/.test(body), "gateway-url meta should still be present");
+  // And the dashboard CSP must be present.
+  assert.match(headers["content-security-policy"] || "", /default-src 'none'/, "dashboard CSP header");
 });
 
 test("1c. /admin sends Cache-Control: no-store", async () => {
