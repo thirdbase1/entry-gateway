@@ -6,8 +6,7 @@ RUN apk add --no-cache tini
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
-COPY server.js metrics-store.js gemini-cache.js config-validation.js upstream-abort.js README.md ./
-COPY public ./public
+COPY server.js metrics-store.js gemini-cache.js config-validation.js upstream-abort.js spend-guard.js ./
 COPY api ./api
 ENV NODE_ENV=production PORT=8787
 EXPOSE 8787

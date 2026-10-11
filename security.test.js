@@ -19,7 +19,8 @@ import http from "node:http";
 const GW_KEY = "gw-secret-key-0123456789abcdef";
 const RL_KEY = "rl-key-0123456789abcdef-0123";
 const FAIL_KEY = "failure-test-key-0123456789ab";
-const ADMIN_KEY = "admin-secret-key-0123456789abcd";
+const ADMIN_KEY = "admin-secret-key-0123456789abcd"; // legacy: must be IGNORED by the gateway now
+const METRICS_KEY = "metrics-fallback-key-0123456789abcd";
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, () => resolve(server.address().port)));
@@ -81,7 +82,10 @@ test.before(async () => {
   // suite uses realistic-length keys (server.js refuses to mint a signed
   // session on Vercel when every configured key looks low-entropy).
   process.env.GATEWAY_API_KEYS = `${GW_KEY},${RL_KEY},${FAIL_KEY}`;
-  process.env.ADMIN_API_KEYS = ADMIN_KEY;
+  process.env.ADMIN_API_KEYS = ADMIN_KEY; // kept only to prove it is ignored
+  process.env.METRICS_BEARER_KEY = METRICS_KEY;
+  process.env.DASHBOARD_PUBLIC_URL = "https://admin.entry-agents.dev";
+  process.env.ADMIN_AUTOAUTH = "0"; // legacy env: also ignored, set to prove it
   process.env.MODEL_DISCOVERY_JSON = "[]";
   process.env.TEST_G_KEY = "dummy-g";
   process.env.TEST_A_KEY = "dummy-a";
@@ -106,36 +110,28 @@ test.after(async () => {
   }
 });
 
-test("1a. /admin does NOT leak the admin key to an unauthenticated visitor", async () => {
-  const { status, body } = await request(gatewayPort, { path: "/admin" });
-  assert.equal(status, 200);
-  assert.ok(!body.includes(ADMIN_KEY), "leaked the live admin key to an anonymous visitor");
-  assert.ok(!body.includes(GW_KEY), "leaked the live gateway key to an anonymous visitor");
-  // Match the injected TAG form, not admin.html's own JS selector string
-  // `meta[name="gateway-key"]` which legitimately appears in the page script.
-  assert.ok(!/<meta name="gateway-key"/.test(body), "injected a gateway-key meta tag for an anonymous visitor");
-  // URL is not a secret and should still be auto-injected for zero-config.
-  assert.ok(/<meta name="gateway-url"/.test(body), "gateway-url meta should still be present");
+test("1a. /admin no longer serves a dashboard -- it redirects or answers 410", async () => {
+  const { status, body, headers } = await request(gatewayPort, { path: "/admin" });
+  assert.ok(!body.includes("<html") && !body.includes("<!DOCTYPE"), "the gateway must not serve HTML anymore");
+  assert.ok(status === 302 || status === 410, `expected 302 redirect or 410 gone, got ${status}`);
+  if (status === 302) {
+    assert.match(headers.location || "", /admin\.entry-agents\.dev|^\//, "redirect target must be the configured dashboard URL");
+  }
+  assert.ok(!headers["set-cookie"], "the gateway must never issue a session cookie anymore");
+  assert.ok(!body.includes(ADMIN_KEY) && !body.includes(GW_KEY), "no key may appear in any response body");
 });
 
-test("1b. /admin NEVER injects a key -- not even for a request with a valid Bearer token", async () => {
-  // 2026-10-10 hardening: the auto-auth session cookie covers all read-only
-  // access, so there is no reason for any credential to exist in the page.
-  // The old echo-back behavior put the operator's token into View Source /
-  // DevTools for the whole session.
+test("1b. even a valid Bearer token gets no HTML dashboard and no cookie", async () => {
   const { status, body, headers } = await request(gatewayPort, { path: "/admin", headers: { Authorization: `Bearer ${ADMIN_KEY}` } });
-  assert.equal(status, 200);
-  assert.ok(!/<meta name="gateway-key"/.test(body), "no gateway-key meta may be injected for authorized visitors either");
-  assert.ok(!body.includes(ADMIN_KEY), "the admin key itself must never appear in the page");
-  // URL auto-detection is unchanged.
-  assert.ok(/<meta name="gateway-url"/.test(body), "gateway-url meta should still be present");
-  // And the dashboard CSP must be present.
-  assert.match(headers["content-security-policy"] || "", /default-src 'none'/, "dashboard CSP header");
+  assert.ok(status === 302 || status === 410);
+  assert.ok(!body.includes(ADMIN_KEY) && !body.includes(GW_KEY));
+  assert.ok(!headers["set-cookie"], "the legacy gw_dash session must not come back");
 });
 
-test("1c. /admin sends Cache-Control: no-store", async () => {
-  const { headers } = await request(gatewayPort, { path: "/admin" });
-  assert.equal(headers["cache-control"], "no-store");
+test("1c. the HTML dashboard files are gone from the repo and the response", async () => {
+  const { body } = await request(gatewayPort, { path: "/admin" });
+  assert.ok(!body.includes("Gateway Admin"), "old dashboard markup must not be served");
+  assert.ok(!body.includes("gw_dash"), "legacy session cookie name must not appear");
 });
 
 test("2. Host header is HTML-attribute-escaped (no reflected XSS)", async () => {
@@ -156,10 +152,10 @@ test("3b. a foreign *.vercel.app origin is not reflected back", async () => {
   assert.notEqual(headers["access-control-allow-origin"], "https://attacker-controlled.vercel.app");
 });
 
-test("3c. a first-party entry-agents vercel.app origin IS reflected back", async () => {
+test("3c. even first-party vercel.app origins are no longer reflected (no browser consumer remains)", async () => {
   const origin = "https://entry-agents-git-main-thirdbase1s-projects.vercel.app";
   const { headers } = await request(gatewayPort, { path: "/health", headers: { Origin: origin } });
-  assert.equal(headers["access-control-allow-origin"], origin);
+  assert.notEqual(headers["access-control-allow-origin"], origin, "CORS allowlist must be trimmed to localhost dev only");
 });
 
 test("4a. URL-encoded path-injection in the Gemini action is collapsed to a safe action", async () => {
@@ -214,31 +210,51 @@ test("5. per-key rate limiting returns 429 once the budget is exhausted", async 
   assert.match(limited.body, /RateLimitError/);
 });
 
-// ─── 6. Dashboard auto-auth (signed HttpOnly session, no key entry) ──────────
-// The dashboard page must authenticate itself with NO credential entry, via a
-// short-lived signed cookie that unlocks READ-ONLY endpoints only. The real
-// API keys must never appear in the page, and the paid proxy routes must keep
-// requiring a real key.
-test("6a. GET /admin hands out a signed session cookie without any key", async () => {
-  const res = await request(gatewayPort, { path: "/admin" });
-  assert.equal(res.status, 200);
-  const cookie = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash="));
-  assert.ok(cookie, "expected a gw_dash session cookie");
-  assert.match(cookie, /HttpOnly/i);
-  assert.match(cookie, /SameSite=Strict/i);
-  assert.match(cookie, /Max-Age=/);
-  // The cookie must not simply BE an API key.
-  assert.ok(!cookie.includes(ADMIN_KEY) && !cookie.includes(GW_KEY));
+// ─── 6. Metrics permission boundary (inference key restricted) ───────────────
+
+test("6a. the inference API key can no longer read /metrics or /v1/debug/routes", async () => {
+  for (const path of ["/metrics", "/v1/debug/routes"]) {
+    const { status, body } = await request(gatewayPort, { path, headers: { Authorization: `Bearer ${GW_KEY}` } });
+    assert.equal(status, 401, `${path} must reject the inference key (got ${status})`);
+    assert.match(body, /AuthError/);
+    assert.ok(!body.includes("upstreamBaseURL"), "route configuration must not leak on rejection");
+  }
 });
 
-test("6b. session cookie auto-auths read-only endpoints without a Bearer token", async () => {
-  const res = await request(gatewayPort, { path: "/admin" });
-  const cookie = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash="));
-  const pair = cookie.split(";")[0];
-  for (const path of ["/metrics", "/v1/debug/routes", "/v1/models"]) {
-    const r = await request(gatewayPort, { path, headers: { Cookie: pair } });
-    assert.equal(r.status, 200, `${path} should be auto-authed by the session cookie`);
+test("6b. a forged or stale gw_dash session cookie is rejected everywhere", async () => {
+  for (const path of ["/metrics", "/v1/debug/routes"]) {
+    const { status } = await request(gatewayPort, { path, headers: { Cookie: "gw_dash=1750000000000.abcdef0123456789" } });
+    assert.equal(status, 401, `${path} must reject the removed session cookie`);
   }
+});
+
+test("6b-2. the metrics fallback key reads /metrics and /v1/debug/routes", async () => {
+  for (const path of ["/metrics", "/v1/debug/routes"]) {
+    const { status, body } = await request(gatewayPort, { path, headers: { Authorization: `Bearer ${METRICS_KEY}` } });
+    assert.equal(status, 200, `${path} must accept METRICS_BEARER_KEY (got ${status}: ${body.slice(0, 120)})`);
+  }
+});
+
+test("6c. the metrics fallback key must NOT unlock paid proxy routes", async () => {
+  const { status } = await request(gatewayPort, {
+    method: "POST",
+    path: "/v1/chat/completions",
+    headers: { Authorization: `Bearer ${METRICS_KEY}`, "Content-Type": "application/json" },
+    body: { model: "test-model", messages: [{ role: "user", content: "hi" }] },
+  });
+  assert.equal(status, 401, "the metrics credential must never authorize inference");
+});
+
+test("6d. legacy ADMIN_API_KEYS are ignored entirely (deprecated privilege)", async () => {
+  const { status } = await request(gatewayPort, { path: "/metrics", headers: { Authorization: `Bearer ${ADMIN_KEY}` } });
+  assert.equal(status, 401, "ADMIN_API_KEYS must no longer grant metrics access");
+  const models = await request(gatewayPort, { path: "/v1/models", headers: { Authorization: `Bearer ${ADMIN_KEY}` } });
+  assert.equal(models.status, 401, "ADMIN_API_KEYS must not work on /v1/models either");
+});
+
+test("6e. a stale/legacy gw_dash-style admin session cannot reach /v1/models", async () => {
+  const { status } = await request(gatewayPort, { path: "/v1/models", headers: { Cookie: "gw_dash=1750000000000.deadbeefcafebabe" } });
+  assert.equal(status, 401);
 });
 
 test("5b. each retryable upstream response counts as one breaker failure", async () => {
@@ -262,85 +278,25 @@ test("5b. each retryable upstream response counts as one breaker failure", async
   assert.equal(cb.failures, 3, "each upstream response must increment the breaker exactly once");
 });
 
-test("6b-2. a dedicated admin key can read /v1/models", async () => {
-  const r = await request(gatewayPort, {
-    path: "/v1/models",
-    headers: { Authorization: `Bearer ${ADMIN_KEY}` },
-  });
-  assert.equal(r.status, 200);
-  assert.equal(JSON.parse(r.body).object, "list");
+
+// ─── 7. Root path: redirect, never HTML ──────────────────────────────────────
+
+test("7a. / redirects to the dashboard or answers 410 -- no HTML is served", async () => {
+  const { status, body, headers } = await request(gatewayPort, { path: "/" });
+  assert.ok(status === 302 || status === 410, `expected 302 or 410, got ${status}`);
+  assert.ok(!body.includes("<!DOCTYPE") && !body.includes("OpenAIThirdParty"), "the old landing page must be gone");
+  if (status === 302) assert.match(headers.location || "", /admin\.entry-agents\.dev|^\//);
 });
 
-test("6c. session cookie must NOT unlock the paid proxy routes", async () => {
-  const res = await request(gatewayPort, { path: "/admin" });
-  const pair = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash=")).split(";")[0];
-  const r = await request(gatewayPort, {
-    method: "POST",
-    path: "/v1/chat/completions",
-    headers: { "Content-Type": "application/json", Cookie: pair },
-    body: { model: "gemini-3.5-flash", messages: [{ role: "user", content: "hi" }] },
-  });
-  assert.equal(r.status, 401, "proxy routes keep requiring a real API key");
-  assert.match(r.body, /AuthError/);
-});
-
-test("6d. a tampered session cookie is rejected", async () => {
-  const res = await request(gatewayPort, { path: "/admin" });
-  const pair = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash=")).split(";")[0];
-  const [name, value] = pair.split("=");
-  const [exp, sig] = value.split(".");
-  const forged = `${name}=${exp}.${"0".repeat(sig.length)}`;
-  const r = await request(gatewayPort, { path: "/metrics", headers: { Cookie: forged } });
-  assert.equal(r.status, 401);
-  // And a forged far-future expiry with a bogus signature too.
-  const forged2 = `${name}=${Date.now() + 3.6e6}.${"f".repeat(sig.length)}`;
-  const r2 = await request(gatewayPort, { path: "/metrics", headers: { Cookie: forged2 } });
-  assert.equal(r2.status, 401);
-});
-
-test("6e. ADMIN_AUTOAUTH=0 disables the session entirely", async () => {
-  process.env.ADMIN_AUTOAUTH = "0";
-  try {
-    const res = await request(gatewayPort, { path: "/admin" });
-    assert.equal(res.status, 200);
-    const cookie = (res.headers["set-cookie"] || []).find((c) => c.startsWith("gw_dash="));
-    assert.ok(!cookie, "no session cookie should be issued when auto-auth is off");
-    const r = await request(gatewayPort, { path: "/metrics" });
-    assert.equal(r.status, 401);
-  } finally {
-    delete process.env.ADMIN_AUTOAUTH;
-  }
-});
-
-// ─── 7. Landing page at "/" ──────────────────────────────────────────────────
-// "/" is the public marketing page; the dashboard moved to /admin only. The
-// landing page must be fully static: it must never echo request data (the
-// Host header is attacker-controllable) and must never carry a credential.
-test("7a. / serves the landing page (not the dashboard)", async () => {
-  const res = await request(gatewayPort, { path: "/" });
-  assert.equal(res.status, 200);
-  assert.match(res.headers["content-type"] || "", /text\/html/);
-  assert.ok(res.body.includes("OpenAIThirdParty"), "expected the landing page brand");
-  assert.ok(!res.body.includes("gateway-key"), "landing page must not carry the dashboard's key meta");
-});
-
-test("7b. / is fully static -- Host header is never reflected", async () => {
-  const payload = 'x"><script>alert(1)</script>';
-  const res = await request(gatewayPort, { path: "/", headers: { Host: payload } });
-  assert.equal(res.status, 200);
-  assert.ok(!res.body.includes(payload), "Host header was reflected into the landing page");
+test("7b. / never reflects the Host header (no HTML surface remains)", async () => {
+  const { body, headers } = await request(gatewayPort, { path: "/", headers: { Host: 'x"><script>alert(1)</script>' } });
+  assert.ok(!body.includes("<script>alert(1)</script>"));
+  if (headers.location) assert.ok(!headers.location.includes("script"), "redirect target must not reflect the Host header");
 });
 
 test("7c. / never leaks any API key", async () => {
-  const res = await request(gatewayPort, { path: "/" });
-  assert.equal(res.status, 200);
-  assert.ok(!res.body.includes(ADMIN_KEY), "landing page leaked the admin key");
-  assert.ok(!res.body.includes(GW_KEY), "landing page leaked the gateway key");
+  const { body } = await request(gatewayPort, { path: "/" });
+  assert.ok(!body.includes(ADMIN_KEY) && !body.includes(GW_KEY) && !body.includes(METRICS_KEY));
 });
 
-test("7d. /admin still serves the dashboard after the landing page landed", async () => {
-  const res = await request(gatewayPort, { path: "/admin" });
-  assert.equal(res.status, 200);
-  assert.ok(!res.body.includes("OpenAIThirdParty — One API"), "admin route must not serve the landing page");
-});
 
