@@ -989,6 +989,15 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
       ? { ...req.body, model: r.upstreamModel }
       : req.body;
 
+  // DPHN's OpenAI-compatible endpoint rejects an empty `tools` array and
+  // rejects `tool_choice` when no tools are present. The AI SDK can emit
+  // those fields for a normal text-only turn, so normalize the no-tools
+  // shape before forwarding. Keep non-empty tool calls unchanged.
+  if (p === "openai-chat" && Array.isArray(outgoingBody?.tools) && outgoingBody.tools.length === 0) {
+    const { tools: _tools, tool_choice: _toolChoice, ...withoutEmptyTools } = outgoingBody;
+    outgoingBody = withoutEmptyTools;
+  }
+
   // Pin gpt-5.6-family FreeModel requests, AND every api.b.ai-hosted model
   // (deepseek-v4-flash-vision-exp, glm-5.3-flash, qwen3.8-flash -- added
   // 2026-08-28), to a stable per-session cache key so best-effort implicit
