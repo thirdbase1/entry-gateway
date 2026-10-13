@@ -669,3 +669,7 @@ Ran a defect-hunting pass against a live gateway instance (mock upstreams, real 
 ## Lessons learned (2026-10-13): Neon tagged-template API
 
 The metrics flush path built parameterized SQL strings and called the Neon client as `sql(text, params)`. The current `@neondatabase/serverless` client only accepts tagged-template calls in that form; conventional SQL text plus parameter arrays must use `sql.query(text, params)`. The incorrect call caused `metrics_store_db_degraded` and silently moved metrics and circuit-breaker state to the in-memory fail-open fallback. Fixed all bucket, daily, and active-lease flush calls in commit `7ef9c30`.
+
+## Lessons learned (2026-10-13): DPHN long-thinking timeout
+
+- DPHN DeepSeek V4.1 Flash can stream normally but some reasoning-heavy turns exceed two minutes. The Gateway's default 120,000 ms upstream abort caused requests to stop around 123 seconds even while the upstream route was healthy. The DPHN route now uses a 295,000 ms timeout, below Vercel's 300-second function limit.
