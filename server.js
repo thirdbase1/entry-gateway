@@ -200,6 +200,7 @@ const keys = ttlCache(() => new Set((process.env.GATEWAY_API_KEYS || "").split("
 // they follow the same env-driven configuration pattern as the B.AI routes.
 // Keep TOKEN_HARBOR_API_KEY server-side; never place the secret in route JSON.
 // EXTRA_MODEL_ROUTES_JSON_7: dedicated additive slot for StepFun routes.
+// EXTRA_MODEL_ROUTES_JSON_8: dedicated additive slot for DPHN routes.
 // Keep provider API keys server-side; never place secrets in route JSON.
 
 // ─── Public model ids: ":free" suffix stripping ──────────────────────────────
@@ -233,6 +234,7 @@ const configured = ttlCache(() => [
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_5", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_5", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_6", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_6", []) : []),
   ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_7", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_7", []) : []),
+  ...(Array.isArray(parseJson("EXTRA_MODEL_ROUTES_JSON_8", [])) ? parseJson("EXTRA_MODEL_ROUTES_JSON_8", []) : []),
 ].filter(r => r?.id && r?.upstreamBaseURL).map(r => ({ protocol: "openai-chat", priority: 100, enabled: true, ...r })).map(normalizeRouteFreeId));
 const routes = ttlCache(() => {
   const m = new Map();
@@ -1617,6 +1619,7 @@ validateStartupConfig({
     ["EXTRA_MODEL_ROUTES_JSON_5", parseJson("EXTRA_MODEL_ROUTES_JSON_5", [])],
     ["EXTRA_MODEL_ROUTES_JSON_6", parseJson("EXTRA_MODEL_ROUTES_JSON_6", [])],
     ["EXTRA_MODEL_ROUTES_JSON_7", parseJson("EXTRA_MODEL_ROUTES_JSON_7", [])],
+    ["EXTRA_MODEL_ROUTES_JSON_8", parseJson("EXTRA_MODEL_ROUTES_JSON_8", [])],
   ],
   discoverySources: parseJson("MODEL_DISCOVERY_JSON", []),
 });
