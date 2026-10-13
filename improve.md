@@ -665,3 +665,7 @@ Ran a defect-hunting pass against a live gateway instance (mock upstreams, real 
 - **Per-route request body size -- SHIPPED** as `maxBodyBytes`, enforced after auth by `bodySizeGuard` (tighter of route ceiling and global limit wins).
 - **Automated post-deploy route smoke test -- STILL OPEN.** The validator now catches config errors at startup, which makes this more valuable rather than less: config errors are covered, provider outages are not.
 - **Cost provenance flag (exact / provider-reported / estimated) -- STILL OPEN.** With cache-aware billing and per-route multipliers in play this is what makes a disputed bill debuggable.
+
+## Lessons learned (2026-10-13): Neon tagged-template API
+
+The metrics flush path built parameterized SQL strings and called the Neon client as `sql(text, params)`. The current `@neondatabase/serverless` client only accepts tagged-template calls in that form; conventional SQL text plus parameter arrays must use `sql.query(text, params)`. The incorrect call caused `metrics_store_db_degraded` and silently moved metrics and circuit-breaker state to the in-memory fail-open fallback. Fixed all bucket, daily, and active-lease flush calls in commit `7ef9c30`.
