@@ -621,14 +621,14 @@ async function performFlush() {
       ...buckets.map(([key, acc]) => {
         const [scope, name] = key.split("|");
         const stmt = buildBucketFlushStatement(scope, name, acc);
-        return sql(stmt.text, stmt.params);
+        return sql.query(stmt.text, stmt.params);
       }),
       ...daily.map(([key, acc]) => {
         const [day, scope, name] = key.split("|");
         const stmt = buildDailyFlushStatement(day, scope, name, acc);
-        return sql(stmt.text, stmt.params);
+        return sql.query(stmt.text, stmt.params);
       }),
-      ...buildLeaseFlushStatements(leaseUpserts, leaseDeletes).map((stmt) => sql(stmt.text, stmt.params)),
+      ...buildLeaseFlushStatements(leaseUpserts, leaseDeletes).map((stmt) => sql.query(stmt.text, stmt.params)),
     ]);
   } catch (error) {
     recordDbFailure(error);
