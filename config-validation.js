@@ -20,6 +20,7 @@
 
 export const KNOWN_PROTOCOLS = new Set(["openai-chat", "anthropic-messages", "gemini-generate"]);
 export const KNOWN_AUTH_STYLES = new Set(["bearer", "x-api-key", "x-goog-api-key"]);
+import { validateReasoningConfig } from "./reasoning.js";
 
 const isPlainObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 const isFiniteNumber = (v) => typeof v === "number" && Number.isFinite(v);
@@ -102,6 +103,7 @@ export function validateRoute(route, index) {
   if (route.headers !== undefined && !isPlainObject(route.headers)) {
     problems.push(`${where}: "headers" must be an object of header name/value pairs`);
   }
+  problems.push(...validateReasoningConfig(route.reasoning, route.protocol, `${where}.reasoning`));
   if (route.enabled !== undefined && typeof route.enabled !== "boolean") {
     problems.push(`${where}: "enabled" must be a boolean, got ${JSON.stringify(route.enabled)}`);
   }
