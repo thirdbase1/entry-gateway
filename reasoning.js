@@ -1,7 +1,7 @@
 // Canonical reasoning controls shared by Entry clients and protocol-native upstreams.
 // A route opts in explicitly: unknown model capabilities are never guessed.
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-const TYPES = new Set(["openai_effort", "anthropic_budget", "gemini_level"]);
+const TYPES = new Set(["openai_effort", "openai_responses_effort", "anthropic_budget", "gemini_level"]);
 
 export function validateReasoningConfig(config, protocol, where = "reasoning") {
   if (config === undefined) return [];
@@ -14,7 +14,7 @@ export function validateReasoningConfig(config, protocol, where = "reasoning") {
   if (config.default_effort !== undefined && (!Array.isArray(config.efforts) || !config.efforts.includes(config.default_effort))) errors.push(`${where}.default_effort must be one of reasoning.efforts`);
   if (!isObject(config.mapping) || !TYPES.has(config.mapping.type)) { errors.push(`${where}.mapping.type must be one of ${[...TYPES].join(", ")}`); return errors; }
   const effectiveProtocol = protocol || "openai-chat";
-  const expected = { "openai-chat": "openai_effort", "anthropic-messages": "anthropic_budget", "gemini-generate": "gemini_level" }[effectiveProtocol];
+  const expected = { "openai-chat": "openai_effort", "openai-responses": "openai_responses_effort", "anthropic-messages": "anthropic_budget", "gemini-generate": "gemini_level" }[effectiveProtocol];
   if (expected && config.mapping.type !== expected) errors.push(`${where}.mapping.type ${config.mapping.type} is incompatible with protocol ${protocol}; expected ${expected}`);
   if (config.mapping.type === "anthropic_budget") {
     const budgets = config.mapping.budgets;
@@ -49,6 +49,11 @@ export function applyReasoningConfig(body, route, protocol) {
   if (!config?.supported || validateReasoningConfig(config, protocol).length > 0 || !config.efforts?.includes(effort) || !config.mapping) { const { reasoning_effort: _ignored, ...rest } = body; return rest; }
   const mapping = config.mapping;
   if (protocol === "openai-chat" && mapping.type === "openai_effort") return { ...body, reasoning_effort: mapping.values?.[effort] ?? effort };
+  if (protocol === "openai-responses" && mapping.type === "openai_responses_effort") {
+    const { reasoning_effort: _ignored, ...rest } = body;
+    const reasoning = isObject(rest.reasoning) ? rest.reasoning : {};
+    return { ...rest, reasoning: { ...reasoning, effort: mapping.values?.[effort] ?? effort } };
+  }
   if (protocol === "anthropic-messages" && mapping.type === "anthropic_budget") {
     const { reasoning_effort: _ignored, ...rest } = body;
     const maxTokens = Number.isSafeInteger(body.max_tokens) ? body.max_tokens : null;
