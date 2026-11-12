@@ -18,7 +18,7 @@
 //
 // Zero dependencies, matching the rest of this repo (no zod, no ajv).
 
-export const KNOWN_PROTOCOLS = new Set(["openai-chat", "anthropic-messages", "gemini-generate"]);
+export const KNOWN_PROTOCOLS = new Set(["openai-chat", "openai-responses", "anthropic-messages", "gemini-generate"]);
 export const KNOWN_AUTH_STYLES = new Set(["bearer", "x-api-key", "x-goog-api-key"]);
 import { validateReasoningConfig } from "./reasoning.js";
 
