@@ -37,23 +37,52 @@ export function validateReasoningConfig(config, protocol, where = "reasoning") {
 export function reasoningMetadata(route) {
   const config = route?.reasoning;
   if (!config?.supported || validateReasoningConfig(config, route?.protocol).length > 0) return { supported: false, efforts: [], default_effort: null };
-  return { supported: true, efforts: [...config.efforts], default_effort: config.default_effort ?? null, request_parameter: "reasoning_effort" };
+  return {
+    supported: true,
+    efforts: [...config.efforts],
+    default_effort: config.default_effort ?? null,
+    // Stable gateway-side field accepted from Entry regardless of upstream protocol.
+    request_parameter: "reasoning_effort",
+    // Native parameter expected by the selected upstream protocol.
+    upstream_parameter: route?.protocol === "openai-responses" ? "reasoning.effort" : route?.protocol === "anthropic-messages" ? "thinking.budget_tokens" : route?.protocol === "gemini-generate" ? "generationConfig.thinkingConfig.thinkingLevel" : "reasoning_effort",
+  };
 }
 
-// Entry sends one stable reasoning_effort field. Translate it only when a route explicitly declares a protocol mapping.
-// Otherwise remove that canonical field so non-reasoning models are not sent an unknown parameter.
+// Entry may send the canonical reasoning_effort field. Native Responses API
+// clients may instead send reasoning.effort directly; normalize both paths and
+// strip unsupported native effort values on routes that explicitly lack support.
 export function applyReasoningConfig(body, route, protocol) {
-  if (!isObject(body) || typeof body.reasoning_effort !== "string") return body;
-  const effort = body.reasoning_effort;
+  if (!isObject(body)) return body;
   const config = route?.reasoning;
-  if (!config?.supported || validateReasoningConfig(config, protocol).length > 0 || !config.efforts?.includes(effort) || !config.mapping) { const { reasoning_effort: _ignored, ...rest } = body; return rest; }
-  const mapping = config.mapping;
-  if (protocol === "openai-chat" && mapping.type === "openai_effort") return { ...body, reasoning_effort: mapping.values?.[effort] ?? effort };
-  if (protocol === "openai-responses" && mapping.type === "openai_responses_effort") {
+  const configValid = Boolean(config?.supported && validateReasoningConfig(config, protocol).length === 0 && config.mapping);
+  const mapping = configValid ? config.mapping : null;
+
+  if (protocol === "openai-responses") {
+    const existingReasoning = isObject(body.reasoning) ? body.reasoning : {};
+    const canonicalEffort = typeof body.reasoning_effort === "string" ? body.reasoning_effort : null;
+    const nativeEffort = typeof existingReasoning.effort === "string" ? existingReasoning.effort : null;
+    const selectedEffort = canonicalEffort ?? nativeEffort;
     const { reasoning_effort: _ignored, ...rest } = body;
-    const reasoning = isObject(rest.reasoning) ? rest.reasoning : {};
-    return { ...rest, reasoning: { ...reasoning, effort: mapping.values?.[effort] ?? effort } };
+    if (selectedEffort === null) return rest;
+    const allowed = configValid && mapping.type === "openai_responses_effort" && config.efforts.includes(selectedEffort);
+    const mappedValues = mapping?.values || {};
+    const nativeAllowed = allowed
+      ? selectedEffort
+      : configValid && mapping.type === "openai_responses_effort"
+        ? Object.entries(mappedValues).find(([key, value]) => config.efforts.includes(key) && value === selectedEffort)?.[1]
+        : null;
+    if (nativeAllowed === null || nativeAllowed === undefined) {
+      const { effort: _drop, ...preservedReasoning } = existingReasoning;
+      return Object.keys(preservedReasoning).length ? { ...rest, reasoning: preservedReasoning } : rest;
+    }
+    const effort = canonicalEffort !== null ? (mappedValues[selectedEffort] ?? selectedEffort) : nativeAllowed;
+    return { ...rest, reasoning: { ...existingReasoning, effort } };
   }
+
+  if (typeof body.reasoning_effort !== "string") return body;
+  const effort = body.reasoning_effort;
+  if (!configValid || !config.efforts?.includes(effort)) { const { reasoning_effort: _ignored, ...rest } = body; return rest; }
+  if (protocol === "openai-chat" && mapping.type === "openai_effort") return { ...body, reasoning_effort: mapping.values?.[effort] ?? effort };
   if (protocol === "anthropic-messages" && mapping.type === "anthropic_budget") {
     const { reasoning_effort: _ignored, ...rest } = body;
     const maxTokens = Number.isSafeInteger(body.max_tokens) ? body.max_tokens : null;
@@ -79,5 +108,12 @@ export function aggregateReasoningMetadata(routeList) {
   const first = reasoningMetadata(routeList[0]);
   const efforts = first.efforts.filter((effort) => routeList.every((route) => reasoningMetadata(route).efforts.includes(effort)));
   if (!efforts.length) return { supported: false, efforts: [], default_effort: null };
-  return { supported: true, efforts, default_effort: efforts.includes(first.default_effort) ? first.default_effort : null, request_parameter: "reasoning_effort" };
+  const protocols = new Set(routeList.map((route) => route.protocol));
+  return {
+    supported: true,
+    efforts,
+    default_effort: efforts.includes(first.default_effort) ? first.default_effort : null,
+    request_parameter: "reasoning_effort",
+    upstream_parameter: protocols.size === 1 ? first.upstream_parameter : null,
+  };
 }
