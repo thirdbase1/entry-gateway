@@ -90,7 +90,7 @@ test("5. NaN and Infinity are rejected as numeric values", () => {
 
 test("6. unknown protocol and authStyle values are reported", () => {
   withEnv(GOOD_ENV, () => {
-    const problems = validateRoute({ ...goodRoute(), protocol: "openai-responses", authStyle: "magic" }, 0);
+    const problems = validateRoute({ ...goodRoute(), protocol: "openai-realtime", authStyle: "magic" }, 0);
     assert.equal(problems.length, 2);
     assert.match(problems[0], /unknown protocol/);
     assert.match(problems[1], /unknown authStyle/);
@@ -146,6 +146,8 @@ test("12. reasoning route metadata is validated against its native protocol", ()
   withEnv(GOOD_ENV, () => {
     const valid = { ...goodRoute(), reasoning: { supported: true, efforts: ["low", "high"], default_effort: "low", mapping: { type: "openai_effort" } } };
     assert.deepEqual(validateRoute(valid, 0), []);
+    const responses = { ...goodRoute(), protocol: "openai-responses", reasoning: { supported: true, efforts: ["low", "medium", "high"], default_effort: "medium", mapping: { type: "openai_responses_effort" } } };
+    assert.deepEqual(validateRoute(responses, 0), []);
     const invalid = { ...valid, reasoning: { ...valid.reasoning, mapping: { type: "anthropic_budget", budgets: { low: 512, high: 2048 } } } };
     assert.ok(validateRoute(invalid, 0).some((problem) => problem.includes("incompatible with protocol")));
     assert.ok(validateRoute({ ...valid, reasoning: { ...valid.reasoning, default_effort: "medium" } }, 0).some((problem) => problem.includes("default_effort")));
