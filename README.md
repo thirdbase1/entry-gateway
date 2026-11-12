@@ -256,7 +256,7 @@ The gateway keeps the route environment-driven; credentials and the active route
 
 Reasoning is opt-in per route. The gateway does not infer support from model names. GET /v1/models returns a conservative reasoning intersection across all enabled routes for the public model ID, plus reasoning_by_protocol intersections for each protocol. Each capability object contains supported, efforts, default_effort, and request_parameter when supported. Unsupported routes are explicitly represented as supported=false.
 
-Entry sends the canonical reasoning_effort field. The gateway translates it per selected upstream route: Chat Completions receives `reasoning_effort`, while Responses API receives `reasoning.effort`. Routes without explicit reasoning configuration have the canonical field removed, preventing accidental unsupported parameters from reaching providers. Existing provider-native fields are otherwise preserved.
+Entry sends the canonical reasoning_effort field. The gateway translates it per selected upstream route: Chat Completions receives `reasoning_effort`, while Responses API receives `reasoning.effort`. Routes without explicit reasoning configuration have canonical and native reasoning-effort fields removed where applicable, preventing unsupported parameters from reaching providers. Other provider-native reasoning options are preserved.
 
 Configure route reasoning with one of these protocol-specific mappings:
 
