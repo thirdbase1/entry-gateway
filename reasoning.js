@@ -64,19 +64,20 @@ export function applyReasoningConfig(body, route, protocol) {
     const selectedEffort = canonicalEffort ?? nativeEffort;
     const { reasoning_effort: _ignored, ...rest } = body;
     if (selectedEffort === null) return rest;
-    const allowed = configValid && mapping.type === "openai_responses_effort" && config.efforts.includes(selectedEffort);
+    const supportedResponsesMapping = configValid && mapping.type === "openai_responses_effort";
     const mappedValues = mapping?.values || {};
-    const nativeAllowed = allowed
-      ? selectedEffort
-      : configValid && mapping.type === "openai_responses_effort"
-        ? Object.entries(mappedValues).find(([key, value]) => config.efforts.includes(key) && value === selectedEffort)?.[1]
-        : null;
-    if (nativeAllowed === null || nativeAllowed === undefined) {
+    let upstreamEffort = null;
+    if (supportedResponsesMapping && canonicalEffort !== null && config.efforts.includes(canonicalEffort)) {
+      upstreamEffort = mappedValues[canonicalEffort] ?? canonicalEffort;
+    } else if (supportedResponsesMapping && nativeEffort !== null) {
+      const acceptedNativeValues = config.efforts.map((value) => mappedValues[value] ?? value);
+      if (acceptedNativeValues.includes(nativeEffort)) upstreamEffort = nativeEffort;
+    }
+    if (upstreamEffort === null) {
       const { effort: _drop, ...preservedReasoning } = existingReasoning;
       return Object.keys(preservedReasoning).length ? { ...rest, reasoning: preservedReasoning } : rest;
     }
-    const effort = canonicalEffort !== null ? (mappedValues[selectedEffort] ?? selectedEffort) : nativeAllowed;
-    return { ...rest, reasoning: { ...existingReasoning, effort } };
+    return { ...rest, reasoning: { ...existingReasoning, effort: upstreamEffort } };
   }
 
   if (typeof body.reasoning_effort !== "string") return body;
