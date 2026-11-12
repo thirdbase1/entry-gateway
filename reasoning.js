@@ -71,12 +71,11 @@ export function applyReasoningConfig(body, route, protocol) {
       return withoutReasoning;
     }
     if (selectedEffort === null) return rest;
-    const supportedResponsesMapping = true;
-    const mappedValues = mapping?.values || {};
+    const mappedValues = mapping.values || {};
     let upstreamEffort = null;
-    if (supportedResponsesMapping && canonicalEffort !== null && config.efforts.includes(canonicalEffort)) {
+    if (canonicalEffort !== null && config.efforts.includes(canonicalEffort)) {
       upstreamEffort = mappedValues[canonicalEffort] ?? canonicalEffort;
-    } else if (supportedResponsesMapping && nativeEffort !== null) {
+    } else if (nativeEffort !== null) {
       const acceptedNativeValues = config.efforts.map((value) => mappedValues[value] ?? value);
       if (acceptedNativeValues.includes(nativeEffort)) upstreamEffort = nativeEffort;
     }
