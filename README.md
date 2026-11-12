@@ -229,6 +229,20 @@ EXTRA_MODEL_ROUTES_JSON_7=[{"id":"step-5-preview","name":"Step 5 Preview","provi
 The gateway keeps the route environment-driven; credentials and the active route JSON are not committed to source control.
 
 [1] StepFun's platform currently lists Step 5 Preview; the $1.00/$2.70 pricing and cache discount are reported from the StepFun API by current independent model tracking. [2]
+### Reasoning capability metadata and request mapping
+
+Reasoning is opt-in per route. The gateway does not infer support from model names. GET /v1/models returns a conservative reasoning intersection across all enabled routes for the public model ID, plus reasoning_by_protocol intersections for each protocol. Each capability object contains supported, efforts, default_effort, and request_parameter when supported. Unsupported routes are explicitly represented as supported=false.
+
+Entry sends the canonical reasoning_effort field. The gateway translates it per selected upstream route. Routes without explicit reasoning configuration have the canonical field removed, preventing accidental unsupported parameters from reaching providers. Existing provider-native fields are otherwise preserved.
+
+Configure route reasoning with one of these protocol-specific mappings:
+
+- openai-chat: { "supported": true, "efforts": ["low", "medium", "high"], "default_effort": "medium", "mapping": { "type": "openai_effort" } }
+- anthropic-messages: { "supported": true, "efforts": ["low", "medium", "high"], "default_effort": "medium", "mapping": { "type": "anthropic_budget", "budgets": { "low": 1024, "medium": 4096, "high": 8192 } } }
+- gemini-generate: { "supported": true, "efforts": ["low", "medium", "high"], "default_effort": "medium", "mapping": { "type": "gemini_level", "levels": { "low": "LOW", "medium": "MEDIUM", "high": "HIGH" } } }
+
+The gateway validates that mapping types match the route protocol. Anthropic budgets are clamped below max_tokens when supplied. Route owners must configure only values supported by the exact upstream model; the gateway never invents capability support.
+
 ## Model discovery
 
 Set `MODEL_DISCOVERY_JSON` to discover models at startup and every six hours by default:
