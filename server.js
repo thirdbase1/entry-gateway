@@ -1610,7 +1610,7 @@ async function discover() {
       const upstreamModel = typeof item === "string" ? item : item.id || item.name;
       if (!upstreamModel) continue;
       for (const p of s.protocols || ["openai-chat"])
-        fresh.push(normalizeRouteFreeId({ id: s.aliases?.[upstreamModel] || upstreamModel, upstreamModel, protocol: p, provider: s.provider, upstreamBaseURL: s.baseURL, upstreamApiKeyEnv: s.apiKeyEnv, priority: s.priority ?? 100, cost: s.cost, context_window: item.context_window || s.context_window }));
+        fresh.push(normalizeRouteFreeId({ id: s.aliases?.[upstreamModel] || upstreamModel, upstreamModel, protocol: p, provider: s.provider, upstreamBaseURL: s.baseURL, upstreamApiKeyEnv: s.apiKeyEnv, priority: s.priority ?? 100, cost: s.cost, context_window: item.context_window || s.context_window, reasoning: item.reasoning ?? s.reasoning }));
     }
   } catch (e) { console.error(`Discovery failed for ${s.provider || s.url}: ${e.message}`); }
   // STABILITY: if EVERY source errored this round, treat it as a transient
