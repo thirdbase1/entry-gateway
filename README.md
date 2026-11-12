@@ -175,6 +175,28 @@ Example route configuration:
 ```
 
 Supported protocol values: `openai-chat`, `openai-responses`, `anthropic-messages`, `gemini-generate`. `openai-chat` targets `/chat/completions`; `openai-responses` targets `/responses`.
+
+Example Responses API route (the provider must implement OpenAI's `/v1/responses` contract):
+
+```json
+{
+  "id": "gpt-reasoning-model",
+  "name": "GPT Reasoning Model",
+  "protocol": "openai-responses",
+  "provider": "openai",
+  "upstreamBaseURL": "https://api.openai.com/v1",
+  "upstreamModel": "gpt-5.6",
+  "upstreamApiKeyEnv": "OPENAI_API_KEY",
+  "reasoning": {
+    "supported": true,
+    "efforts": ["low", "medium", "high"],
+    "default_effort": "medium",
+    "mapping": { "type": "openai_responses_effort" }
+  }
+}
+```
+
+The gateway exposes `POST /v1/responses` for response creation and forwards the Responses request/response format unchanged, apart from the explicitly configured reasoning-effort normalization. It does not emulate response retrieval, cancellation, or other Responses management endpoints.
 Optional route properties: `upstreamPath`, `authStyle` (`x-api-key` for providers that need it), `headers`, `timeoutMs`, `enabled`, and `maxBodyBytes` (per-route request-body ceiling in bytes; the tighter of this and the global body limit wins).
 
 ### Configuration validation
