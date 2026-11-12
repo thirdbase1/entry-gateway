@@ -21,6 +21,7 @@ import { evaluateSpendLimit, secondsUntilNextWatMidnight } from "./spend-guard.j
 import { getOrCreateCachedContent } from "./gemini-cache.js";
 import { createUpstreamAbort } from "./upstream-abort.js";
 import { validateStartupConfig } from "./config-validation.js";
+import { aggregateReasoningMetadata, applyReasoningConfig } from "./reasoning.js";
 
 const app = express();
 // Vercel (and most PaaS) terminate TLS upstream and forward to this
@@ -988,6 +989,8 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
     p !== "gemini-generate" && r.upstreamModel && r.upstreamModel !== model
       ? { ...req.body, model: r.upstreamModel }
       : req.body;
+  // Normalize the canonical reasoning_effort for this exact fallback route.
+  outgoingBody = applyReasoningConfig(outgoingBody, r, p);
 
   // DPHN's OpenAI-compatible endpoint rejects an empty `tools` array and
   // rejects `tool_choice` when no tools are present. The AI SDK can emit
@@ -1497,13 +1500,25 @@ function resolvedCostFor(r) {
 }
 
 app.get("/v1/models", modelsAuth, (_req, res) => {
-  const m = new Map();
-  for (const r of routes().filter((r) => r.enabled !== false)) {
-    const x = m.get(r.id) || { id: r.id, object: "model", name: r.name || r.id, owned_by: r.provider || "gateway", protocols: [], context_window: r.context_window, cost: resolvedCostFor(r) };
-    if (!x.protocols.includes(r.protocol)) x.protocols.push(r.protocol);
-    m.set(r.id, x);
+  const grouped = new Map();
+  for (const route of routes().filter((route) => route.enabled !== false)) {
+    let entry = grouped.get(route.id);
+    if (!entry) {
+      entry = { id: route.id, object: "model", name: route.name || route.id, owned_by: route.provider || "gateway", protocols: [], context_window: route.context_window, cost: resolvedCostFor(route), _routesByProtocol: new Map(), _allRoutes: [] };
+      grouped.set(route.id, entry);
+    }
+    if (!entry.protocols.includes(route.protocol)) entry.protocols.push(route.protocol);
+    const protocolRoutes = entry._routesByProtocol.get(route.protocol) || [];
+    protocolRoutes.push(route);
+    entry._routesByProtocol.set(route.protocol, protocolRoutes);
+    entry._allRoutes.push(route);
   }
-  res.json({ object: "list", data: [...m.values()] });
+  const data = [...grouped.values()].map((entry) => {
+    const reasoning_by_protocol = Object.fromEntries([...entry._routesByProtocol].map(([protocolName, protocolRoutes]) => [protocolName, aggregateReasoningMetadata(protocolRoutes)]));
+    const { _routesByProtocol, _allRoutes, ...publicEntry } = entry;
+    return { ...publicEntry, reasoning: aggregateReasoningMetadata(_allRoutes), reasoning_by_protocol };
+  });
+  res.json({ object: "list", data });
 });
 
 app.post("/v1/chat/completions", auth, spendLimitGuard, bodySizeGuard, handle);
@@ -1523,6 +1538,7 @@ app.get("/v1/debug/routes", metricsAuth, (_req, res) => {
       enabled: r.enabled !== false,
       cost: r.cost,
       context_window: r.context_window,
+      reasoning: r.reasoning,
       source: discovered.includes(r) ? "discovered" : "configured",
     })),
   });
