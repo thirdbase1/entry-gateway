@@ -491,7 +491,7 @@ const modelsAuth = (req, res, next) => {
 // through to the "openai-chat" branch instead, which then 400'd with "A
 // model is required" because Gemini-shaped bodies have no top-level
 // `model` field. Found 2026-08-13 while validating explicit caching.
-const protocol = path => path === "/v1/messages" ? "anthropic-messages" : /generatecontent/i.test(path) ? "gemini-generate" : "openai-chat";
+const protocol = path => path === "/v1/messages" ? "anthropic-messages" : path === "/v1/responses" ? "openai-responses" : /generatecontent/i.test(path) ? "gemini-generate" : "openai-chat";
 const modelFor = (req, p) => {
   if (p !== "gemini-generate") return req.body?.model;
   const raw = req.params.modelAction || "";
@@ -560,7 +560,7 @@ const upstreamUrl = (r, p, model, action) => {
   // so no crafted segment can ever escape the intended `/models/<id>:<action>`
   // shape regardless of how this function is called.
   const geminiAction = encodeURIComponent(action || "generateContent");
-  const path = r.upstreamPath || (p === "openai-chat" ? "/chat/completions" : p === "anthropic-messages" ? "/messages" : `/models/${encodeURIComponent(r.upstreamModel || model)}:${geminiAction}`);
+  const path = r.upstreamPath || (p === "openai-chat" ? "/chat/completions" : p === "openai-responses" ? "/responses" : p === "anthropic-messages" ? "/messages" : `/models/${encodeURIComponent(r.upstreamModel || model)}:${geminiAction}`);
   const url = `${base}${path.replace("{model}", encodeURIComponent(r.upstreamModel || model))}`;
   // Gemini's SSE framing (data: {...} lines, matching the OpenAI/Anthropic
   // shape this gateway's SSE parsing loop already understands) is opt-in
@@ -1522,6 +1522,7 @@ app.get("/v1/models", modelsAuth, (_req, res) => {
 });
 
 app.post("/v1/chat/completions", auth, spendLimitGuard, bodySizeGuard, handle);
+app.post("/v1/responses", auth, spendLimitGuard, bodySizeGuard, handle);
 app.post("/v1/messages", auth, spendLimitGuard, bodySizeGuard, handle);
 app.post("/v1beta/models/:modelAction", auth, spendLimitGuard, bodySizeGuard, handle);
 
