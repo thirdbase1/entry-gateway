@@ -7,12 +7,14 @@ export function validateReasoningConfig(config, protocol, where = "reasoning") {
   if (config === undefined) return [];
   const errors = [];
   if (!isObject(config)) return [`${where} must be an object`];
-  if (config.supported !== true) errors.push(`${where}.supported must be true when reasoning metadata is configured`);
+  if (config.supported === false) return [];
+  if (config.supported !== true) errors.push(`${where}.supported must be true or false`);
   if (!Array.isArray(config.efforts) || config.efforts.length === 0 || config.efforts.some((v) => typeof v !== "string" || !v.trim())) errors.push(`${where}.efforts must be a non-empty array of non-empty strings`);
   else if (new Set(config.efforts).size !== config.efforts.length) errors.push(`${where}.efforts must not contain duplicates`);
   if (config.default_effort !== undefined && (!Array.isArray(config.efforts) || !config.efforts.includes(config.default_effort))) errors.push(`${where}.default_effort must be one of reasoning.efforts`);
   if (!isObject(config.mapping) || !TYPES.has(config.mapping.type)) { errors.push(`${where}.mapping.type must be one of ${[...TYPES].join(", ")}`); return errors; }
-  const expected = { "openai-chat": "openai_effort", "anthropic-messages": "anthropic_budget", "gemini-generate": "gemini_level" }[protocol];
+  const effectiveProtocol = protocol || "openai-chat";
+  const expected = { "openai-chat": "openai_effort", "anthropic-messages": "anthropic_budget", "gemini-generate": "gemini_level" }[effectiveProtocol];
   if (expected && config.mapping.type !== expected) errors.push(`${where}.mapping.type ${config.mapping.type} is incompatible with protocol ${protocol}; expected ${expected}`);
   if (config.mapping.type === "anthropic_budget") {
     const budgets = config.mapping.budgets;
@@ -34,7 +36,7 @@ export function validateReasoningConfig(config, protocol, where = "reasoning") {
 
 export function reasoningMetadata(route) {
   const config = route?.reasoning;
-  if (!config?.supported || !Array.isArray(config.efforts) || !config.mapping) return { supported: false, efforts: [], default_effort: null };
+  if (!config?.supported || validateReasoningConfig(config, route?.protocol).length > 0) return { supported: false, efforts: [], default_effort: null };
   return { supported: true, efforts: [...config.efforts], default_effort: config.default_effort ?? null, request_parameter: "reasoning_effort" };
 }
 
@@ -44,7 +46,7 @@ export function applyReasoningConfig(body, route, protocol) {
   if (!isObject(body) || typeof body.reasoning_effort !== "string") return body;
   const effort = body.reasoning_effort;
   const config = route?.reasoning;
-  if (!config?.supported || !config.efforts?.includes(effort) || !config.mapping) { const { reasoning_effort: _ignored, ...rest } = body; return rest; }
+  if (!config?.supported || validateReasoningConfig(config, protocol).length > 0 || !config.efforts?.includes(effort) || !config.mapping) { const { reasoning_effort: _ignored, ...rest } = body; return rest; }
   const mapping = config.mapping;
   if (protocol === "openai-chat" && mapping.type === "openai_effort") return { ...body, reasoning_effort: mapping.values?.[effort] ?? effort };
   if (protocol === "anthropic-messages" && mapping.type === "anthropic_budget") {
