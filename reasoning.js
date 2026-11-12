@@ -26,7 +26,7 @@ export function validateReasoningConfig(config, protocol, where = "reasoning") {
     if (levels !== undefined && !isObject(levels)) errors.push(`${where}.mapping.levels must be an object when provided`);
     else for (const effort of config.efforts || []) { const level = levels?.[effort] ?? effort.toUpperCase(); if (typeof level !== "string" || !level.trim()) errors.push(`${where}.mapping.levels.${effort} must be a non-empty string`); }
   }
-  if (config.mapping.type === "openai_effort") {
+  if (config.mapping.type === "openai_effort" || config.mapping.type === "openai_responses_effort") {
     const values = config.mapping.values;
     if (values !== undefined && !isObject(values)) errors.push(`${where}.mapping.values must be an object when provided`);
     else for (const effort of config.efforts || []) { const value = values?.[effort] ?? effort; if (typeof value !== "string" || !value.trim()) errors.push(`${where}.mapping.values.${effort} must be a non-empty string`); }
