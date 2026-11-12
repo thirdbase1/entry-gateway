@@ -63,8 +63,15 @@ export function applyReasoningConfig(body, route, protocol) {
     const nativeEffort = typeof existingReasoning.effort === "string" ? existingReasoning.effort : null;
     const selectedEffort = canonicalEffort ?? nativeEffort;
     const { reasoning_effort: _ignored, ...rest } = body;
+    // If this route has not explicitly opted into reasoning, drop the entire
+    // Responses reasoning object. Leaving summary/context flags behind can
+    // still make a non-reasoning model reject the request.
+    if (!configValid || mapping.type !== "openai_responses_effort") {
+      const { reasoning: _drop, ...withoutReasoning } = rest;
+      return withoutReasoning;
+    }
     if (selectedEffort === null) return rest;
-    const supportedResponsesMapping = configValid && mapping.type === "openai_responses_effort";
+    const supportedResponsesMapping = true;
     const mappedValues = mapping?.values || {};
     let upstreamEffort = null;
     if (supportedResponsesMapping && canonicalEffort !== null && config.efforts.includes(canonicalEffort)) {
