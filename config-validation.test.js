@@ -142,6 +142,16 @@ test("10. validateStartupConfig aggregates route and discovery problems", () => 
   });
 });
 
+test("12. reasoning route metadata is validated against its native protocol", () => {
+  withEnv(GOOD_ENV, () => {
+    const valid = { ...goodRoute(), reasoning: { supported: true, efforts: ["low", "high"], default_effort: "low", mapping: { type: "openai_effort" } } };
+    assert.deepEqual(validateRoute(valid, 0), []);
+    const invalid = { ...valid, reasoning: { ...valid.reasoning, mapping: { type: "anthropic_budget", budgets: { low: 512, high: 2048 } } } };
+    assert.ok(validateRoute(invalid, 0).some((problem) => problem.includes("incompatible with protocol")));
+    assert.ok(validateRoute({ ...valid, reasoning: { ...valid.reasoning, default_effort: "medium" } }, 0).some((problem) => problem.includes("default_effort")));
+  });
+});
+
 test("11. a fully valid configuration reports zero problems", () => {
   withEnv(GOOD_ENV, () => {
     const count = validateStartupConfig({
