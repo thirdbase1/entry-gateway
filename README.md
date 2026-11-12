@@ -11,7 +11,8 @@ Self-hosted, config-driven native-protocol AI gateway. Clients use one gateway A
 - `GET /` — public landing page (static, no auth)
 - `GET /admin` — built-in public, read-only admin dashboard UI
 - `GET /v1/models` — deduplicated public models with protocol metadata
-- `POST /v1/chat/completions` — OpenAI-compatible passthrough
+- `POST /v1/chat/completions` — OpenAI Chat Completions passthrough
+- `POST /v1/responses` — OpenAI Responses API passthrough
 - `POST /v1/messages` — Anthropic Messages passthrough
 - `POST /v1beta/models/:model:generateContent` — Gemini-style passthrough
 - `GET /v1/debug/routes` — route configuration debug view (public through the read-only dashboard session by default)
@@ -173,7 +174,29 @@ Example route configuration:
 ]
 ```
 
-Supported protocol values: `openai-chat`, `anthropic-messages`, `gemini-generate`.
+Supported protocol values: `openai-chat`, `openai-responses`, `anthropic-messages`, `gemini-generate`. `openai-chat` targets `/chat/completions`; `openai-responses` targets `/responses`.
+
+Example Responses API route (the provider must implement OpenAI's `/v1/responses` contract):
+
+```json
+{
+  "id": "gpt-reasoning-model",
+  "name": "GPT Reasoning Model",
+  "protocol": "openai-responses",
+  "provider": "openai",
+  "upstreamBaseURL": "https://api.openai.com/v1",
+  "upstreamModel": "gpt-5.6",
+  "upstreamApiKeyEnv": "OPENAI_API_KEY",
+  "reasoning": {
+    "supported": true,
+    "efforts": ["low", "medium", "high"],
+    "default_effort": "medium",
+    "mapping": { "type": "openai_responses_effort" }
+  }
+}
+```
+
+The gateway exposes `POST /v1/responses` for response creation and forwards the Responses request/response format unchanged, apart from the explicitly configured reasoning-effort normalization. It does not emulate response retrieval, cancellation, or other Responses management endpoints.
 Optional route properties: `upstreamPath`, `authStyle` (`x-api-key` for providers that need it), `headers`, `timeoutMs`, `enabled`, and `maxBodyBytes` (per-route request-body ceiling in bytes; the tighter of this and the global body limit wins).
 
 ### Configuration validation
@@ -229,6 +252,21 @@ EXTRA_MODEL_ROUTES_JSON_7=[{"id":"step-5-preview","name":"Step 5 Preview","provi
 The gateway keeps the route environment-driven; credentials and the active route JSON are not committed to source control.
 
 [1] StepFun's platform currently lists Step 5 Preview; the $1.00/$2.70 pricing and cache discount are reported from the StepFun API by current independent model tracking. [2]
+### Reasoning capability metadata and request mapping
+
+Reasoning is opt-in per route. The gateway does not infer support from model names. GET /v1/models returns a conservative reasoning intersection across all enabled routes for the public model ID, plus reasoning_by_protocol intersections for each protocol. Each capability object contains supported, efforts, default_effort, and request_parameter when supported. Unsupported routes are explicitly represented as supported=false.
+
+Entry sends the canonical reasoning_effort field. The gateway translates it per selected upstream route: Chat Completions receives `reasoning_effort`, while Responses API receives `reasoning.effort`. Routes without explicit reasoning configuration have canonical and native reasoning-effort fields removed where applicable, preventing unsupported parameters from reaching providers. Other provider-native reasoning options are preserved.
+
+Configure route reasoning with one of these protocol-specific mappings:
+
+- openai-chat: { "supported": true, "efforts": ["low", "medium", "high"], "default_effort": "medium", "mapping": { "type": "openai_effort" } }
+- openai-responses: { "supported": true, "efforts": ["low", "medium", "high"], "default_effort": "medium", "mapping": { "type": "openai_responses_effort" } }
+- anthropic-messages: { "supported": true, "efforts": ["low", "medium", "high"], "default_effort": "medium", "mapping": { "type": "anthropic_budget", "budgets": { "low": 1024, "medium": 4096, "high": 8192 } } }
+- gemini-generate: { "supported": true, "efforts": ["low", "medium", "high"], "default_effort": "medium", "mapping": { "type": "gemini_level", "levels": { "low": "LOW", "medium": "MEDIUM", "high": "HIGH" } } }
+
+The gateway validates that mapping types match the route protocol. Anthropic budgets are clamped below max_tokens when supplied. Route owners must configure only values supported by the exact upstream model; the gateway never invents capability support.
+
 ## Model discovery
 
 Set `MODEL_DISCOVERY_JSON` to discover models at startup and every six hours by default:

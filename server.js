@@ -21,6 +21,7 @@ import { evaluateSpendLimit, secondsUntilNextWatMidnight } from "./spend-guard.j
 import { getOrCreateCachedContent } from "./gemini-cache.js";
 import { createUpstreamAbort } from "./upstream-abort.js";
 import { validateStartupConfig } from "./config-validation.js";
+import { aggregateReasoningMetadata, applyReasoningConfig } from "./reasoning.js";
 
 const app = express();
 // Vercel (and most PaaS) terminate TLS upstream and forward to this
@@ -490,7 +491,7 @@ const modelsAuth = (req, res, next) => {
 // through to the "openai-chat" branch instead, which then 400'd with "A
 // model is required" because Gemini-shaped bodies have no top-level
 // `model` field. Found 2026-08-13 while validating explicit caching.
-const protocol = path => path === "/v1/messages" ? "anthropic-messages" : /generatecontent/i.test(path) ? "gemini-generate" : "openai-chat";
+const protocol = path => { const normalizedPath = String(path || "").replace(/\/+$/, "").toLowerCase(); return normalizedPath === "/v1/messages" ? "anthropic-messages" : normalizedPath === "/v1/responses" ? "openai-responses" : /generatecontent/i.test(normalizedPath) ? "gemini-generate" : "openai-chat"; };
 const modelFor = (req, p) => {
   if (p !== "gemini-generate") return req.body?.model;
   const raw = req.params.modelAction || "";
@@ -559,7 +560,7 @@ const upstreamUrl = (r, p, model, action) => {
   // so no crafted segment can ever escape the intended `/models/<id>:<action>`
   // shape regardless of how this function is called.
   const geminiAction = encodeURIComponent(action || "generateContent");
-  const path = r.upstreamPath || (p === "openai-chat" ? "/chat/completions" : p === "anthropic-messages" ? "/messages" : `/models/${encodeURIComponent(r.upstreamModel || model)}:${geminiAction}`);
+  const path = r.upstreamPath || (p === "openai-chat" ? "/chat/completions" : p === "openai-responses" ? "/responses" : p === "anthropic-messages" ? "/messages" : `/models/${encodeURIComponent(r.upstreamModel || model)}:${geminiAction}`);
   const url = `${base}${path.replace("{model}", encodeURIComponent(r.upstreamModel || model))}`;
   // Gemini's SSE framing (data: {...} lines, matching the OpenAI/Anthropic
   // shape this gateway's SSE parsing loop already understands) is opt-in
@@ -988,6 +989,8 @@ async function proxy(req, res, r, p, model, action, id, isFallback, cbProvider) 
     p !== "gemini-generate" && r.upstreamModel && r.upstreamModel !== model
       ? { ...req.body, model: r.upstreamModel }
       : req.body;
+  // Normalize the canonical reasoning_effort for this exact fallback route.
+  outgoingBody = applyReasoningConfig(outgoingBody, r, p);
 
   // DPHN's OpenAI-compatible endpoint rejects an empty `tools` array and
   // rejects `tool_choice` when no tools are present. The AI SDK can emit
@@ -1497,16 +1500,29 @@ function resolvedCostFor(r) {
 }
 
 app.get("/v1/models", modelsAuth, (_req, res) => {
-  const m = new Map();
-  for (const r of routes().filter((r) => r.enabled !== false)) {
-    const x = m.get(r.id) || { id: r.id, object: "model", name: r.name || r.id, owned_by: r.provider || "gateway", protocols: [], context_window: r.context_window, cost: resolvedCostFor(r) };
-    if (!x.protocols.includes(r.protocol)) x.protocols.push(r.protocol);
-    m.set(r.id, x);
+  const grouped = new Map();
+  for (const route of routes().filter((route) => route.enabled !== false)) {
+    let entry = grouped.get(route.id);
+    if (!entry) {
+      entry = { id: route.id, object: "model", name: route.name || route.id, owned_by: route.provider || "gateway", protocols: [], context_window: route.context_window, cost: resolvedCostFor(route), _routesByProtocol: new Map(), _allRoutes: [] };
+      grouped.set(route.id, entry);
+    }
+    if (!entry.protocols.includes(route.protocol)) entry.protocols.push(route.protocol);
+    const protocolRoutes = entry._routesByProtocol.get(route.protocol) || [];
+    protocolRoutes.push(route);
+    entry._routesByProtocol.set(route.protocol, protocolRoutes);
+    entry._allRoutes.push(route);
   }
-  res.json({ object: "list", data: [...m.values()] });
+  const data = [...grouped.values()].map((entry) => {
+    const reasoning_by_protocol = Object.fromEntries([...entry._routesByProtocol].map(([protocolName, protocolRoutes]) => [protocolName, aggregateReasoningMetadata(protocolRoutes)]));
+    const { _routesByProtocol, _allRoutes, ...publicEntry } = entry;
+    return { ...publicEntry, reasoning: aggregateReasoningMetadata(_allRoutes), reasoning_by_protocol };
+  });
+  res.json({ object: "list", data });
 });
 
 app.post("/v1/chat/completions", auth, spendLimitGuard, bodySizeGuard, handle);
+app.post("/v1/responses", auth, spendLimitGuard, bodySizeGuard, handle);
 app.post("/v1/messages", auth, spendLimitGuard, bodySizeGuard, handle);
 app.post("/v1beta/models/:modelAction", auth, spendLimitGuard, bodySizeGuard, handle);
 
@@ -1523,6 +1539,7 @@ app.get("/v1/debug/routes", metricsAuth, (_req, res) => {
       enabled: r.enabled !== false,
       cost: r.cost,
       context_window: r.context_window,
+      reasoning: r.reasoning,
       source: discovered.includes(r) ? "discovered" : "configured",
     })),
   });
@@ -1594,7 +1611,7 @@ async function discover() {
       const upstreamModel = typeof item === "string" ? item : item.id || item.name;
       if (!upstreamModel) continue;
       for (const p of s.protocols || ["openai-chat"])
-        fresh.push(normalizeRouteFreeId({ id: s.aliases?.[upstreamModel] || upstreamModel, upstreamModel, protocol: p, provider: s.provider, upstreamBaseURL: s.baseURL, upstreamApiKeyEnv: s.apiKeyEnv, priority: s.priority ?? 100, cost: s.cost, context_window: item.context_window || s.context_window }));
+        fresh.push(normalizeRouteFreeId({ id: s.aliases?.[upstreamModel] || upstreamModel, upstreamModel, protocol: p, provider: s.provider, upstreamBaseURL: s.baseURL, upstreamApiKeyEnv: s.apiKeyEnv, priority: s.priority ?? 100, cost: s.cost, context_window: item.context_window || s.context_window, reasoning: item.reasoning ?? s.reasoning }));
     }
   } catch (e) { console.error(`Discovery failed for ${s.provider || s.url}: ${e.message}`); }
   // STABILITY: if EVERY source errored this round, treat it as a transient
