@@ -491,7 +491,7 @@ const modelsAuth = (req, res, next) => {
 // through to the "openai-chat" branch instead, which then 400'd with "A
 // model is required" because Gemini-shaped bodies have no top-level
 // `model` field. Found 2026-08-13 while validating explicit caching.
-const protocol = path => path === "/v1/messages" ? "anthropic-messages" : path === "/v1/responses" ? "openai-responses" : /generatecontent/i.test(path) ? "gemini-generate" : "openai-chat";
+const protocol = path => { const normalizedPath = String(path || "").replace(/\\/+$/, "").toLowerCase(); return normalizedPath === "/v1/messages" ? "anthropic-messages" : normalizedPath === "/v1/responses" ? "openai-responses" : /generatecontent/i.test(normalizedPath) ? "gemini-generate" : "openai-chat"; };
 const modelFor = (req, p) => {
   if (p !== "gemini-generate") return req.body?.model;
   const raw = req.params.modelAction || "";
